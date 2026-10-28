@@ -280,3 +280,89 @@ fn audit_leaves_the_verified_set_unchanged() {
 
     assert_eq!(snapshot(f.set.path()), before);
 }
+
+#[test]
+fn rom_listed_without_a_crc_is_matched_by_its_other_checksums() {
+    let f = Fixture::new();
+    let dat = f.dat(&[(
+        "Prototype (USA)",
+        vec![rom_without_crc("Prototype (USA).a26", b"proto")],
+    )]);
+    write_file(&f.set_path("Prototype (USA).a26"), b"proto");
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    assert_eq!(report.entries[0].finding, Finding::Matched);
+    assert_eq!(
+        report.entries[0].evidence.as_ref().unwrap().algorithms,
+        ["size", "sha1"]
+    );
+    assert_eq!(status_of(&report, "Prototype (USA)"), GameStatus::Complete);
+}
+
+#[test]
+fn identical_rom_shared_by_two_games_completes_both() {
+    let f = Fixture::new();
+    let dat = f.dat(&[
+        (
+            "Game A (USA)",
+            vec![rom("bios.bin", b"bios"), rom("a.bin", b"a")],
+        ),
+        (
+            "Game B (USA)",
+            vec![rom("bios.bin", b"bios"), rom("b.bin", b"b")],
+        ),
+    ]);
+    write_zip(
+        &f.set_path("Game A (USA).zip"),
+        &[("bios.bin", b"bios"), ("a.bin", b"a")],
+    );
+    write_zip(
+        &f.set_path("Game B (USA).zip"),
+        &[("bios.bin", b"bios"), ("b.bin", b"b")],
+    );
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    assert_eq!(status_of(&report, "Game A (USA)"), GameStatus::Complete);
+    assert_eq!(status_of(&report, "Game B (USA)"), GameStatus::Complete);
+}
+
+#[test]
+fn bad_entry_evidence_is_only_the_size_and_crc32_lookup() {
+    let f = Fixture::new();
+    let dat = f.dat(&[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])]);
+    write_file(&f.set_path("Pong (USA).a26"), b"gnop");
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    assert_eq!(report.entries[0].finding, Finding::Bad);
+    assert_eq!(
+        report.entries[0].evidence.as_ref().unwrap().algorithms,
+        ["size", "crc32"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_files_are_audited_and_an_unreadable_directory_is_unreadable_without_stopping_the_audit()
+ {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let dat = f.dat(&[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])]);
+    write_file(&f.dat_dir.path().join("elsewhere.a26"), b"pong");
+    std::os::unix::fs::symlink(
+        f.dat_dir.path().join("elsewhere.a26"),
+        f.set_path("Pong (USA).a26"),
+    )
+    .unwrap();
+    write_file(&f.set_path("locked/Homebrew.a26"), b"homebrew");
+    std::fs::set_permissions(f.set_path("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let report = audit(&dat, f.set.path());
+    std::fs::set_permissions(f.set_path("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let report = report.unwrap();
+
+    assert_eq!(finding_of(&report, "Pong (USA).a26"), Finding::Matched);
+    assert_eq!(finding_of(&report, "locked"), Finding::Unreadable);
+}

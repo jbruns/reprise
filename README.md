@@ -18,7 +18,8 @@ writes a JSON report to stdout, or to `--output`. It only reads: the Verified Se
   an Entry; any other file, including other archive formats, is one Entry. Nested archives are not opened.
 - A Finding is decided by payload before name (ADR 0002). A payload matches a ROM when every checksum the DAT
   supplies for it agrees.
-- An unreadable file, archive or member becomes an Unreadable Entry and the Audit continues.
+- An unreadable file, directory, archive or member becomes an Unreadable Entry and the Audit continues.
+  Symbolic links are followed.
 - Exits 0 when the Audit completes, whatever it found. Exits non-zero with a message on stderr when the DAT
   cannot be read or the Verified Set directory does not exist.
 
@@ -57,12 +58,13 @@ writes a JSON report to stdout, or to `--output`. It only reads: the Verified Se
 ```
 
 - `finding` is one of `matched`, `misnamed`, `conflicting`, `bad`, `extra` or `unreadable` (see the glossary).
-- `roms` lists the ROMs the payload matches. These ROMs count towards their Games, so a Misnamed or Conflicting
-  Entry completes the Game its payload belongs to. A Matched Entry counts only towards the ROM its name gives.
+- `roms` lists the ROMs the Entry counts towards. For a Matched Entry that is every ROM with its name and payload,
+  so an identical ROM shared by several Games counts for each. For a Misnamed or Conflicting Entry it is every
+  ROM the payload matches, so the Entry completes the Game its payload belongs to.
 - `named_rom` is the ROM the Entry's name gives, present when it differs from the payload's (Conflicting, Bad).
-- `evidence.algorithms` lists what the Finding rests on: size and CRC32 always, plus each checksum that every
-  ROM in question supplies. An Extra Entry has only size and CRC32. An Unreadable Entry has no Evidence and
-  a `reason` instead.
+- `evidence.algorithms` lists what the Finding rests on. For a payload match, it is size plus each checksum that
+  every ROM in `roms` supplies; all of them were compared and agreed. A Bad or Extra Entry has only size and
+  CRC32, the lookup that found no matching ROM. An Unreadable Entry has no Evidence and a `reason` instead.
 - A Game is `complete`, `incomplete` or `missing`; `missing_roms` lists its ROMs no Entry's payload matched.
 
 ## Licence

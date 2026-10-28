@@ -26,6 +26,8 @@ pub struct Dat {
     pub roms: Vec<Rom>,
     by_name: HashMap<String, Vec<usize>>,
     by_size_crc: HashMap<(u64, String), Vec<usize>>,
+    /// ROMs the DAT lists without a CRC, which the size-and-CRC index cannot find.
+    by_size_without_crc: HashMap<u64, Vec<usize>>,
 }
 
 fn attrs(e: &BytesStart) -> Result<HashMap<String, String>, Error> {
@@ -56,6 +58,7 @@ impl Dat {
             roms: Vec::new(),
             by_name: HashMap::new(),
             by_size_crc: HashMap::new(),
+            by_size_without_crc: HashMap::new(),
         };
         let mut stack: Vec<String> = Vec::new();
         let mut saw_root = false;
@@ -65,26 +68,12 @@ impl Dat {
                 .map_err(|err| Error::Dat(format!("{}: {err}", path.display())))?;
             match event {
                 Event::Start(e) => {
-                    let tag = e.local_name().as_ref().to_string();
-                    if tag == "datafile" {
-                        saw_root = true;
-                    }
-                    if tag == "game" || tag == "machine" {
-                        dat.start_game(&e)?;
-                    }
-                    if tag == "rom" {
-                        dat.add_rom(&e)?;
-                    }
+                    let tag = dat.open(&e)?;
+                    saw_root |= tag == "datafile";
                     stack.push(tag);
                 }
                 Event::Empty(e) => {
-                    let tag = e.local_name().as_ref().to_string();
-                    if tag == "rom" {
-                        dat.add_rom(&e)?;
-                    }
-                    if tag == "game" || tag == "machine" {
-                        dat.start_game(&e)?;
-                    }
+                    dat.open(&e)?;
                 }
                 Event::Text(t) => {
                     let in_header = stack.len() >= 2 && stack[stack.len() - 2] == "header";
@@ -109,6 +98,17 @@ impl Dat {
             )));
         }
         Ok(dat)
+    }
+
+    /// Handles an opening or empty tag and returns its name.
+    fn open(&mut self, e: &BytesStart) -> Result<String, Error> {
+        let tag = e.local_name().as_ref().to_string();
+        match tag.as_str() {
+            "game" | "machine" => self.start_game(e)?,
+            "rom" => self.add_rom(e)?,
+            _ => {}
+        }
+        Ok(tag)
     }
 
     fn start_game(&mut self, e: &BytesStart) -> Result<(), Error> {
@@ -147,11 +147,17 @@ impl Dat {
         };
         let idx = self.roms.len();
         self.by_name.entry(rom.name.clone()).or_default().push(idx);
-        if let Some(crc) = &rom.crc {
-            self.by_size_crc
+        match &rom.crc {
+            Some(crc) => self
+                .by_size_crc
                 .entry((rom.size, crc.clone()))
                 .or_default()
-                .push(idx);
+                .push(idx),
+            None => self
+                .by_size_without_crc
+                .entry(rom.size)
+                .or_default()
+                .push(idx),
         }
         self.roms.push(rom);
         Ok(())
@@ -161,9 +167,10 @@ impl Dat {
         self.by_name.get(name).map_or(&[], Vec::as_slice)
     }
 
-    pub fn roms_with_size_crc(&self, size: u64, crc: &str) -> &[usize] {
-        self.by_size_crc
-            .get(&(size, crc.to_string()))
-            .map_or(&[], Vec::as_slice)
+    /// The ROMs a payload of this size and CRC32 could match; each must still be compared in full.
+    pub fn candidates(&self, size: u64, crc: &str) -> impl Iterator<Item = usize> + '_ {
+        let with_crc = self.by_size_crc.get(&(size, crc.to_string()));
+        let without_crc = self.by_size_without_crc.get(&size);
+        with_crc.into_iter().chain(without_crc).flatten().copied()
     }
 }

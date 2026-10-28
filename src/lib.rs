@@ -153,33 +153,45 @@ pub fn audit(dat_path: &Path, root: &Path) -> Result<Report, Error> {
         )));
     }
     let dat = Dat::read(dat_path)?;
-    let mut audit = Audit {
+    let mut scan = Scan {
         covered: vec![false; dat.roms.len()],
         entries: Vec::new(),
         dat: &dat,
     };
-    for item in walkdir::WalkDir::new(root).sort_by_file_name() {
-        let item = item.map_err(|err| Error::VerifiedSet(err.to_string()))?;
+    let rel = |p: &Path| {
+        p.strip_prefix(root)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .into_owned()
+    };
+    for item in walkdir::WalkDir::new(root)
+        .follow_links(true)
+        .sort_by_file_name()
+    {
+        let item = match item {
+            Ok(item) => item,
+            Err(err) if err.depth() == 0 => return Err(Error::VerifiedSet(err.to_string())),
+            Err(err) => {
+                let path = err.path().map(rel).unwrap_or_default();
+                scan.unreadable(path, None, err.to_string());
+                continue;
+            }
+        };
         if !item.file_type().is_file() {
             continue;
         }
-        let rel = item
-            .path()
-            .strip_prefix(root)
-            .unwrap_or(item.path())
-            .to_string_lossy()
-            .into_owned();
+        let rel = rel(item.path());
         let is_zip = item
             .path()
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
-        if let Err(reason) = audit.read_file(item.path(), &rel, is_zip) {
-            audit.unreadable(rel, None, reason);
+        if let Err(reason) = scan.read_file(item.path(), &rel, is_zip) {
+            scan.unreadable(rel, None, reason);
         }
     }
-    let games = audit.games();
+    let games = scan.games();
     let mut findings: BTreeMap<_, _> = Finding::ALL.iter().map(|f| (*f, 0)).collect();
-    for e in &audit.entries {
+    for e in &scan.entries {
         *findings.entry(e.finding).or_default() += 1;
     }
     let mut statuses: BTreeMap<_, _> = GameStatus::ALL.iter().map(|g| (*g, 0)).collect();
@@ -204,18 +216,19 @@ pub fn audit(dat_path: &Path, root: &Path) -> Result<Report, Error> {
             findings,
             games: statuses,
         },
-        entries: audit.entries,
+        entries: scan.entries,
         games,
     })
 }
 
-struct Audit<'d> {
+/// What an Audit has found so far.
+struct Scan<'d> {
     dat: &'d Dat,
     covered: Vec<bool>,
     entries: Vec<Entry>,
 }
 
-impl Audit<'_> {
+impl Scan<'_> {
     /// Records the Entries of one file. An error is about the file as a whole; a member that fails to read
     /// is recorded as Unreadable here and the rest of the archive is still read.
     fn read_file(&mut self, path: &Path, rel: &str, is_zip: bool) -> Result<(), String> {
@@ -263,14 +276,7 @@ impl Audit<'_> {
             path,
             member,
             finding,
-            evidence: Some(evidence(
-                self.dat,
-                if payload.is_empty() {
-                    named.as_slice()
-                } else {
-                    &payload
-                },
-            )),
+            evidence: Some(evidence(self.dat, &payload)),
             roms: payload.iter().map(|r| rom_ref(self.dat, *r)).collect(),
             named_rom: named.map(|r| rom_ref(self.dat, r)),
             reason: None,
@@ -307,20 +313,26 @@ impl Audit<'_> {
     }
 }
 
-/// Size and crc32 are always compared, since candidates are found by them; each other algorithm counts
-/// only when every ROM the Finding rests on supplies it.
+/// For a payload match, size plus each checksum that every matched ROM supplies, since every supplied
+/// checksum was compared and agreed. Without one, only the size-and-CRC32 lookup that found no candidate.
 fn evidence(dat: &Dat, roms: &[usize]) -> Evidence {
-    let all_supply =
-        |has: fn(&dat::Rom) -> bool| !roms.is_empty() && roms.iter().all(|r| has(&dat.roms[*r]));
-    let mut algorithms = vec!["size", "crc32"];
-    if all_supply(|r| r.md5.is_some()) {
-        algorithms.push("md5");
+    if roms.is_empty() {
+        return Evidence {
+            level: EvidenceLevel::Payload,
+            algorithms: vec!["size", "crc32"],
+        };
     }
-    if all_supply(|r| r.sha1.is_some()) {
-        algorithms.push("sha1");
-    }
-    if all_supply(|r| r.sha256.is_some()) {
-        algorithms.push("sha256");
+    let all_supply = |has: fn(&dat::Rom) -> bool| roms.iter().all(|r| has(&dat.roms[*r]));
+    let mut algorithms = vec!["size"];
+    for (name, has) in [
+        ("crc32", (|r| r.crc.is_some()) as fn(&dat::Rom) -> bool),
+        ("md5", |r| r.md5.is_some()),
+        ("sha1", |r| r.sha1.is_some()),
+        ("sha256", |r| r.sha256.is_some()),
+    ] {
+        if all_supply(has) {
+            algorithms.push(name);
+        }
     }
     Evidence {
         level: EvidenceLevel::Payload,
@@ -340,8 +352,14 @@ fn rom_ref(dat: &Dat, r: usize) -> RomRef {
 fn classify(dat: &Dat, name: &str, sums: &Checksums) -> (Finding, Vec<usize>, Option<usize>) {
     let payload = matching_roms(dat, sums);
     let named = dat.roms_named(name);
-    if let Some(r) = named.iter().find(|r| payload.contains(r)) {
-        return (Finding::Matched, vec![*r], None);
+    // Every ROM with this name and payload, so an identical ROM shared by several Games counts for each.
+    let both: Vec<usize> = named
+        .iter()
+        .copied()
+        .filter(|r| payload.contains(r))
+        .collect();
+    if !both.is_empty() {
+        return (Finding::Matched, both, None);
     }
     match (payload.is_empty(), named.first()) {
         (false, None) => (Finding::Misnamed, payload, None),
@@ -353,9 +371,7 @@ fn classify(dat: &Dat, name: &str, sums: &Checksums) -> (Finding, Vec<usize>, Op
 
 /// The ROMs whose every supplied checksum equals the payload's.
 fn matching_roms(dat: &Dat, sums: &Checksums) -> Vec<usize> {
-    dat.roms_with_size_crc(sums.size, &sums.crc)
-        .iter()
-        .copied()
+    dat.candidates(sums.size, &sums.crc)
         .filter(|r| sums.matches(&dat.roms[*r]))
         .collect()
 }

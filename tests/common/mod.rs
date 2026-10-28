@@ -11,6 +11,7 @@ pub struct RomSpec {
     pub name: &'static str,
     pub payload: Vec<u8>,
     pub sha256: bool,
+    pub crc: bool,
 }
 
 pub fn rom(name: &'static str, payload: &[u8]) -> RomSpec {
@@ -18,6 +19,7 @@ pub fn rom(name: &'static str, payload: &[u8]) -> RomSpec {
         name,
         payload: payload.to_vec(),
         sha256: true,
+        crc: true,
     }
 }
 
@@ -26,6 +28,17 @@ pub fn rom_without_sha256(name: &'static str, payload: &[u8]) -> RomSpec {
         name,
         payload: payload.to_vec(),
         sha256: false,
+        crc: true,
+    }
+}
+
+/// A ROM listed with SHA-1 only, as some DATs do for ROMs whose CRC is unknown.
+pub fn rom_without_crc(name: &'static str, payload: &[u8]) -> RomSpec {
+    RomSpec {
+        name,
+        payload: payload.to_vec(),
+        sha256: false,
+        crc: false,
     }
 }
 
@@ -35,19 +48,19 @@ fn hex(bytes: &[u8]) -> String {
 
 fn rom_xml(r: &RomSpec) -> String {
     let p = &r.payload;
-    let sha256 = if r.sha256 {
-        format!(r#" sha256="{}""#, hex(&sha2::Sha256::digest(p)))
-    } else {
-        String::new()
-    };
-    format!(
-        r#"<rom name="{}" size="{}" crc="{:08x}" md5="{}" sha1="{}"{sha256}/>"#,
-        r.name,
-        p.len(),
-        crc32fast::hash(p),
-        hex(&md5::Md5::digest(p)),
-        hex(&sha1::Sha1::digest(p)),
-    )
+    let mut checksums = String::new();
+    if r.crc {
+        checksums += &format!(
+            r#" crc="{:08x}" md5="{}""#,
+            crc32fast::hash(p),
+            hex(&md5::Md5::digest(p))
+        );
+    }
+    checksums += &format!(r#" sha1="{}""#, hex(&sha1::Sha1::digest(p)));
+    if r.sha256 {
+        checksums += &format!(r#" sha256="{}""#, hex(&sha2::Sha256::digest(p)));
+    }
+    format!(r#"<rom name="{}" size="{}"{checksums}/>"#, r.name, p.len())
 }
 
 /// Writes a No-Intro style Logiqx DAT with the given Games and returns its path.

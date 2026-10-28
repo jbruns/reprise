@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-/// Audits and organizes ROM sets against DATs.
+/// Audits Verified Sets against DAT Revisions.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
