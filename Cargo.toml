@@ -1,0 +1,10 @@
+[package]
+name = "reprise"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Audits ROM collections against DAT revisions"
+license = "MIT"
+publish = false
+
+[dependencies]

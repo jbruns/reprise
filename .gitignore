@@ -1,0 +1,7 @@
+/target
+
+# Repository-managed agent skills (installed by tools/agent-skills/setup-agent-skills)
+.agents/skills/
+
+# Per-issue agent worktrees
+.worktrees/

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github>jbruns/homelab-components//renovate/repo-default#repo-ci-v1.1.0"
+  ],
+  "packageRules": [
+    {
+      "description": "The setup-agent-skills wrapper's own PR, apart from the repo-ci group the preset puts every Repo Tooling repo tag in",
+      "matchFileNames": [
+        "tools/agent-skills/setup-agent-skills"
+      ],
+      "groupName": "Repo Tooling agent-skills"
+    }
+  ]
+}
