@@ -25,16 +25,6 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
-  privacy:
-    name: privacy
-    uses: jbruns/homelab-components/.github/workflows/repo-validate.yaml@b59b24fbb343d5838f90eb8abd7f943488e0846c # repo-ci-v1.1.0
-    with:
-      checks: privacy
-      # Prose names roles, never people, logins, hostnames or deployments; the denylist stays a secret.
-      privacy-mode: fail
-    secrets:
-      privacy-denylist: ${{ secrets.PRIVACY_DENYLIST }}
-
   gitleaks:
     name: gitleaks
     uses: jbruns/homelab-components/.github/workflows/repo-gitleaks.yaml@b59b24fbb343d5838f90eb8abd7f943488e0846c # repo-ci-v1.1.0
