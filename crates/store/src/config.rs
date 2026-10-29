@@ -1,0 +1,314 @@
+//! The Operator's configuration: `title-select.toml` (ADR 0006).
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use ipnet::IpNet;
+use serde::Deserialize;
+use title_select_api::Workers;
+
+/// How many full Audits a Source Set keeps when the configuration does not say.
+pub const DEFAULT_AUDITS_KEPT: usize = 20;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// Named Roots: the folders Title Select may read.
+    #[serde(default)]
+    pub roots: BTreeMap<String, Root>,
+    #[serde(default)]
+    pub audits: Audits,
+    #[serde(default)]
+    pub auth: Auth,
+    #[serde(default)]
+    pub jobs: Jobs,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Root {
+    pub path: PathBuf,
+    /// Whether Title Select may write to this Root. Nothing writes yet, so every Root must be read-only.
+    #[serde(default)]
+    pub writable: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Audits {
+    /// The latest full Audits kept per Source Set; older ones are pruned to a summary.
+    #[serde(default = "default_keep")]
+    pub keep: usize,
+}
+
+fn default_keep() -> usize {
+    DEFAULT_AUDITS_KEPT
+}
+
+impl Default for Audits {
+    fn default() -> Self {
+        Audits {
+            keep: DEFAULT_AUDITS_KEPT,
+        }
+    }
+}
+
+/// How the Service knows a request comes from the Operator. The Operator token, read from the file named by
+/// `TITLE_SELECT_OPERATOR_TOKEN_FILE`, is the other way.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Auth {
+    /// The request header carrying the Operator's identity, set by an authenticating reverse proxy.
+    pub identity_header: Option<String>,
+    /// The only peers, as CIDRs, whose `identity_header` is trusted.
+    #[serde(default)]
+    pub trusted_proxies: Vec<IpNet>,
+    /// An identity given to every request with no other credential, for development. Only allowed while the
+    /// Service listens on a loopback address.
+    pub dev_identity: Option<String>,
+}
+
+/// How the Service runs Jobs.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Jobs {
+    /// How many Jobs run at once.
+    #[serde(default = "one")]
+    pub concurrent: usize,
+    /// How hard an Audit works the disks and CPUs; `readers` and `hashers` override its counts.
+    #[serde(default)]
+    pub pace: Pace,
+    /// Threads reading and decompressing payloads.
+    pub readers: Option<usize>,
+    /// Threads hashing payloads.
+    pub hashers: Option<usize>,
+}
+
+fn one() -> usize {
+    1
+}
+
+impl Default for Jobs {
+    fn default() -> Self {
+        Jobs {
+            concurrent: 1,
+            pace: Pace::default(),
+            readers: None,
+            hashers: None,
+        }
+    }
+}
+
+impl Jobs {
+    /// The worker counts for an Audit: the pace's, with each explicit count overriding.
+    pub fn workers(&self) -> Workers {
+        let pace = self.pace.workers();
+        Workers {
+            readers: self.readers.unwrap_or(pace.readers),
+            hashers: self.hashers.unwrap_or(pace.hashers),
+        }
+    }
+}
+
+/// A preset for an Audit's worker counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Pace {
+    /// One reader and one hasher: one file at a time, for a disk shared with other work.
+    Gentle,
+    /// Two readers and two hashers.
+    #[default]
+    Default,
+    /// One reader and one hasher per CPU.
+    Unthrottled,
+}
+
+impl Pace {
+    pub fn workers(self) -> Workers {
+        let n = match self {
+            Pace::Gentle => 1,
+            Pace::Default => 2,
+            Pace::Unthrottled => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        };
+        Workers {
+            readers: n,
+            hashers: n,
+        }
+    }
+}
+
+impl Default for Config {
+    /// No Roots, the default Audit history and Job limits, and no auth.
+    fn default() -> Self {
+        Config {
+            roots: BTreeMap::new(),
+            audits: Audits::default(),
+            auth: Auth::default(),
+            jobs: Jobs::default(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid configuration: {0}")]
+pub struct Error(String);
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Config, Error> {
+        let text =
+            std::fs::read_to_string(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
+        Config::parse(&text).map_err(|Error(e)| Error(format!("{}: {e}", path.display())))
+    }
+
+    pub fn parse(text: &str) -> Result<Config, Error> {
+        let config: Config = toml::from_str(text).map_err(|e| Error(e.to_string()))?;
+        if config.audits.keep == 0 {
+            return Err(Error("audits.keep must be at least 1".into()));
+        }
+        if config.jobs.concurrent == 0 {
+            return Err(Error("jobs.concurrent must be at least 1".into()));
+        }
+        if config.jobs.readers == Some(0) || config.jobs.hashers == Some(0) {
+            return Err(Error(
+                "jobs.readers and jobs.hashers must be at least 1".into(),
+            ));
+        }
+        let auth = &config.auth;
+        match (&auth.identity_header, auth.trusted_proxies.is_empty()) {
+            (Some(header), false) if is_header_name(header) => {}
+            (Some(header), false) => {
+                return Err(Error(format!(
+                    "auth.identity_header {header:?} is not a header name"
+                )));
+            }
+            (Some(_), true) => {
+                return Err(Error(
+                    "auth.identity_header needs auth.trusted_proxies".into(),
+                ));
+            }
+            (None, false) => {
+                return Err(Error(
+                    "auth.trusted_proxies needs auth.identity_header".into(),
+                ));
+            }
+            (None, true) => {}
+        }
+        if auth
+            .dev_identity
+            .as_deref()
+            .is_some_and(|i| i.trim().is_empty())
+        {
+            return Err(Error("auth.dev_identity is empty".into()));
+        }
+        for (name, root) in &config.roots {
+            if name.is_empty() {
+                return Err(Error("a Root has an empty name".into()));
+            }
+            if root.writable {
+                return Err(Error(format!(
+                    "Root {name} is writable; every Root is read-only until Change Plans exist"
+                )));
+            }
+        }
+        Ok(config)
+    }
+
+    pub fn root(&self, name: &str) -> Option<&Root> {
+        self.roots.get(name)
+    }
+}
+
+/// Whether `name` is a valid HTTP header name: a non-empty token.
+fn is_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pace_preset_sets_the_worker_counts() {
+        let config = Config::parse("[jobs]\npace = \"gentle\"").unwrap();
+
+        assert_eq!(
+            config.jobs.workers(),
+            Workers {
+                readers: 1,
+                hashers: 1
+            }
+        );
+        assert_eq!(
+            Config::default().jobs.workers(),
+            Workers {
+                readers: 2,
+                hashers: 2
+            }
+        );
+        assert_eq!(Config::default().jobs.concurrent, 1);
+    }
+
+    #[test]
+    fn an_explicit_worker_count_overrides_the_pace() {
+        let config = Config::parse("[jobs]\npace = \"gentle\"\nhashers = 6").unwrap();
+
+        assert_eq!(
+            config.jobs.workers(),
+            Workers {
+                readers: 1,
+                hashers: 6
+            }
+        );
+    }
+
+    #[test]
+    fn unthrottled_uses_every_cpu() {
+        let cpus = std::thread::available_parallelism().unwrap().get();
+
+        let config = Config::parse("[jobs]\npace = \"unthrottled\"").unwrap();
+
+        assert_eq!(
+            config.jobs.workers(),
+            Workers {
+                readers: cpus,
+                hashers: cpus
+            }
+        );
+    }
+
+    #[test]
+    fn zero_workers_or_jobs_are_refused() {
+        for text in [
+            "[jobs]\nconcurrent = 0",
+            "[jobs]\nreaders = 0",
+            "[jobs]\nhashers = 0",
+        ] {
+            assert!(Config::parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_identity_header_and_trusted_proxies_need_each_other() {
+        let both = "[auth]\nidentity_header = \"Remote-User\"\ntrusted_proxies = [\"10.0.0.0/8\", \"::1/128\"]";
+        let config = Config::parse(both).unwrap();
+        assert_eq!(config.auth.trusted_proxies.len(), 2);
+
+        assert!(Config::parse("[auth]\nidentity_header = \"Remote-User\"").is_err());
+        assert!(Config::parse("[auth]\ntrusted_proxies = [\"10.0.0.0/8\"]").is_err());
+        assert!(
+            Config::parse(
+                "[auth]\nidentity_header = \"Remote User\"\ntrusted_proxies = [\"10.0.0.0/8\"]"
+            )
+            .is_err()
+        );
+        assert!(
+            Config::parse(
+                "[auth]\nidentity_header = \"Remote-User\"\ntrusted_proxies = [\"nonsense\"]"
+            )
+            .is_err()
+        );
+    }
+}

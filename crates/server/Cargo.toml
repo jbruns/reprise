@@ -1,0 +1,31 @@
+[package]
+name = "title-select-server"
+description = "Title Select's Service: the /api/v1 JSON API, durable Jobs and Operator auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+title-select-api.workspace = true
+title-select-engine.workspace = true
+title-select-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+axum = { version = "0.8.9", features = ["multipart", "macros"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+subtle = "2.6.1"
+ipnet = "2.12.2"
+futures-util = "0.3.34"
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+
+[dev-dependencies]
+crc32fast.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+tempfile.workspace = true
+ureq = { version = "3.5.0", features = ["json"] }
+zip.workspace = true

@@ -1,18 +1,18 @@
 //! Audits a Source Set against a DAT Revision (see GLOSSARY.md and ADR 0002).
 
-pub mod config;
-mod dat;
+pub mod dat;
 mod payload;
-pub mod store;
+mod read;
 
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+pub use title_select_api::Workers;
+pub use title_select_api::report::*;
 
 use dat::Dat;
 use payload::Checksums;
+use read::FileRead;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -22,168 +22,30 @@ pub enum Error {
     SourceSet(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Finding {
-    Matched,
-    Misnamed,
-    Conflicting,
-    Mismatched,
-    Unmatched,
-    Unreadable,
+/// One payload reader and one hash worker: what the stateless Audit uses.
+pub const ONE_WORKER_EACH: Workers = Workers {
+    readers: 1,
+    hashers: 1,
+};
+
+/// How far an Audit has got: files whose Entries are read, of the files found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    pub files_done: usize,
+    pub files_total: usize,
 }
 
-impl Finding {
-    pub const ALL: [Finding; 6] = [
-        Finding::Matched,
-        Finding::Misnamed,
-        Finding::Conflicting,
-        Finding::Mismatched,
-        Finding::Unmatched,
-        Finding::Unreadable,
-    ];
-
-    /// The name the report uses.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Finding::Matched => "matched",
-            Finding::Misnamed => "misnamed",
-            Finding::Conflicting => "conflicting",
-            Finding::Mismatched => "mismatched",
-            Finding::Unmatched => "unmatched",
-            Finding::Unreadable => "unreadable",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Finding> {
-        Finding::ALL.into_iter().find(|f| f.as_str() == s)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GameStatus {
-    Complete,
-    Incomplete,
-    Missing,
-}
-
-impl GameStatus {
-    pub const ALL: [GameStatus; 3] = [
-        GameStatus::Complete,
-        GameStatus::Incomplete,
-        GameStatus::Missing,
-    ];
-
-    /// The name the report uses.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            GameStatus::Complete => "complete",
-            GameStatus::Incomplete => "incomplete",
-            GameStatus::Missing => "missing",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<GameStatus> {
-        GameStatus::ALL.into_iter().find(|g| g.as_str() == s)
-    }
-}
-
-/// Only Payload exists so far: every Entry's bytes are read and checksummed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EvidenceLevel {
-    Payload,
-}
-
-impl EvidenceLevel {
-    /// The name the report uses.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            EvidenceLevel::Payload => "payload",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<EvidenceLevel> {
-        (s == "payload").then_some(EvidenceLevel::Payload)
-    }
-}
-
-/// Every algorithm an Evidence can list, in report order.
-pub const ALGORITHMS: [&str; 5] = ["size", "crc32", "md5", "sha1", "sha256"];
-
-/// What the Audit actually checked for an Entry.
-#[derive(Debug, Serialize)]
-pub struct Evidence {
-    pub level: EvidenceLevel,
-    /// The size and checksum algorithms the Finding rests on, in the order size, crc32, md5, sha1, sha256.
-    pub algorithms: Vec<&'static str>,
-}
-
-/// The DAT Revision an Audit is pinned to.
-#[derive(Debug, Serialize)]
-pub struct DatRevision {
-    /// SHA-256 of the unmodified DAT file; the DAT Revision's identity.
-    pub sha256: String,
-    pub name: String,
-    pub version: String,
+/// How an Audit runs.
+pub struct Options<'a> {
+    /// The DAT Revision's original filename, as the report names it.
     pub file: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Summary {
-    pub findings: BTreeMap<Finding, usize>,
-    pub games: BTreeMap<GameStatus, usize>,
-}
-
-/// A ROM of a DAT Revision, by its Game and name.
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-pub struct RomRef {
-    pub game: String,
-    pub name: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Entry {
-    /// Path relative to the Source Set's root.
-    pub path: String,
-    /// The member's name, when the Entry is a member of a ZIP archive at `path`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub member: Option<String>,
-    pub finding: Finding,
-    /// The ROMs this Entry's payload matches.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub roms: Vec<RomRef>,
-    /// For a Conflicting or Mismatched Entry, the ROM its name gives.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub named_rom: Option<RomRef>,
-    /// Absent for an Unreadable Entry.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub evidence: Option<Evidence>,
-    /// Why an Unreadable Entry could not be read.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Game {
-    pub name: String,
-    pub status: GameStatus,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub missing_roms: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Report {
-    /// Version of this report's shape.
-    pub schema: u32,
-    pub dat_revision: DatRevision,
-    pub source_set: String,
-    pub started_at: jiff::Timestamp,
-    pub finished_at: jiff::Timestamp,
-    pub summary: Summary,
-    pub entries: Vec<Entry>,
-    pub games: Vec<Game>,
+    /// A canonical path every file and directory must resolve inside. One that resolves outside is an Unreadable
+    /// Entry and is not read, and the file read is the one its resolved path names.
+    pub confine: Option<&'a Path>,
+    /// At least one of each: `readers` files are read at once, and `hashers` threads checksum their payloads.
+    pub workers: Workers,
+    /// Called as each file's Entries are read, from the reader threads.
+    pub progress: Option<&'a (dyn Fn(Progress) + Sync)>,
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -196,18 +58,26 @@ pub fn audit(dat_path: &Path, root: &Path) -> Result<Report, Error> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    audit_as(dat_path, file, root, None)
+    audit_with(
+        dat_path,
+        root,
+        &Options {
+            file,
+            confine: None,
+            workers: ONE_WORKER_EACH,
+            progress: None,
+        },
+    )
 }
 
-/// Like [`audit`], but reports the DAT Revision under `file`, its original filename. With `confine`, a canonical
-/// path, every file and directory must resolve inside it: one that resolves outside is an Unreadable Entry and is
-/// not read, and the file read is the one its resolved path names.
-pub(crate) fn audit_as(
-    dat_path: &Path,
-    file: String,
-    root: &Path,
-    confine: Option<&Path>,
-) -> Result<Report, Error> {
+/// What the walk found, in report order.
+enum Item {
+    Unreadable { rel: String, reason: String },
+    File { rel: String },
+}
+
+/// Like [`audit`], with the DAT Revision's filename, confinement, worker counts and progress given by `options`.
+pub fn audit_with(dat_path: &Path, root: &Path, options: &Options) -> Result<Report, Error> {
     let started_at = jiff::Timestamp::now();
     if !root.is_dir() {
         return Err(Error::SourceSet(format!(
@@ -216,17 +86,14 @@ pub(crate) fn audit_as(
         )));
     }
     let dat = Dat::read(dat_path)?;
-    let mut scan = Scan {
-        covered: vec![false; dat.roms.len()],
-        entries: Vec::new(),
-        dat: &dat,
-    };
     let rel = |p: &Path| {
         p.strip_prefix(root)
             .unwrap_or(p)
             .to_string_lossy()
             .into_owned()
     };
+    let mut items = Vec::new();
+    let mut files: Vec<(PathBuf, bool)> = Vec::new();
     let mut walk = walkdir::WalkDir::new(root)
         .follow_links(true)
         .sort_by_file_name()
@@ -237,12 +104,15 @@ pub(crate) fn audit_as(
             Err(err) if err.depth() == 0 => return Err(Error::SourceSet(err.to_string())),
             Err(err) => {
                 let path = err.path().map(rel).unwrap_or_default();
-                scan.unreadable(path, None, err.to_string());
+                items.push(Item::Unreadable {
+                    rel: path,
+                    reason: err.to_string(),
+                });
                 continue;
             }
         };
         let mut path = item.path().to_path_buf();
-        if let Some(confine) = confine {
+        if let Some(confine) = options.confine {
             let refusal = match item.path().canonicalize() {
                 Ok(real) if real.starts_with(confine) => {
                     path = real;
@@ -258,20 +128,47 @@ pub(crate) fn audit_as(
                 if item.file_type().is_dir() {
                     walk.skip_current_dir();
                 }
-                scan.unreadable(rel(item.path()), None, reason);
+                items.push(Item::Unreadable {
+                    rel: rel(item.path()),
+                    reason,
+                });
                 continue;
             }
         }
         if !item.file_type().is_file() {
             continue;
         }
-        let rel = rel(item.path());
         let is_zip = item
             .path()
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
-        if let Err(reason) = scan.read_file(&path, &rel, is_zip) {
-            scan.unreadable(rel, None, reason);
+        items.push(Item::File {
+            rel: rel(item.path()),
+        });
+        files.push((path, is_zip));
+    }
+
+    let mut reads = read::read_files(&files, options.workers, options.progress).into_iter();
+    let mut scan = Scan {
+        covered: vec![false; dat.roms.len()],
+        entries: Vec::new(),
+        dat: &dat,
+    };
+    for item in items {
+        match item {
+            Item::Unreadable { rel, reason } => scan.unreadable(rel, None, reason),
+            Item::File { rel } => {
+                let FileRead { members, error } = reads.next().expect("one read per file");
+                for (member, sums) in members {
+                    match sums {
+                        Ok(sums) => scan.record(rel.clone(), member, &sums),
+                        Err(reason) => scan.unreadable(rel.clone(), member, reason),
+                    }
+                }
+                if let Some(reason) = error {
+                    scan.unreadable(rel, None, reason);
+                }
+            }
         }
     }
     let games = scan.games();
@@ -284,12 +181,12 @@ pub(crate) fn audit_as(
         *statuses.entry(g.status).or_default() += 1;
     }
     Ok(Report {
-        schema: 2,
+        schema: SCHEMA,
         dat_revision: DatRevision {
             sha256: dat.sha256.clone(),
             name: dat.name.clone(),
             version: dat.version.clone(),
-            file,
+            file: options.file.clone(),
         },
         source_set: root.display().to_string(),
         started_at,
@@ -311,30 +208,6 @@ struct Scan<'d> {
 }
 
 impl Scan<'_> {
-    /// Records the Entries of one file. An error is about the file as a whole; a member that fails to read
-    /// is recorded as Unreadable here and the rest of the archive is still read.
-    fn read_file(&mut self, path: &Path, rel: &str, is_zip: bool) -> Result<(), String> {
-        let file = File::open(path).map_err(|e| e.to_string())?;
-        if !is_zip {
-            let sums = Checksums::of_reader(file).map_err(|e| e.to_string())?;
-            self.record(rel.to_owned(), None, &sums);
-            return Ok(());
-        }
-        let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-        for i in 0..zip.len() {
-            let member = zip.by_index(i).map_err(|e| e.to_string())?;
-            if member.is_dir() {
-                continue;
-            }
-            let name = member.name().map_err(|e| e.to_string())?.into_owned();
-            match Checksums::of_reader(member) {
-                Ok(sums) => self.record(rel.to_owned(), Some(name), &sums),
-                Err(e) => self.unreadable(rel.to_owned(), Some(name), e.to_string()),
-            }
-        }
-        Ok(())
-    }
-
     fn unreadable(&mut self, path: String, member: Option<String>, reason: String) {
         self.entries.push(Entry {
             path,
@@ -401,11 +274,11 @@ fn evidence(dat: &Dat, roms: &[usize]) -> Evidence {
     if roms.is_empty() {
         return Evidence {
             level: EvidenceLevel::Payload,
-            algorithms: vec!["size", "crc32"],
+            algorithms: vec!["size".into(), "crc32".into()],
         };
     }
     let all_supply = |has: fn(&dat::Rom) -> bool| roms.iter().all(|r| has(&dat.roms[*r]));
-    let mut algorithms = vec!["size"];
+    let mut algorithms = vec!["size".into()];
     for (name, has) in [
         ("crc32", (|r| r.crc.is_some()) as fn(&dat::Rom) -> bool),
         ("md5", |r| r.md5.is_some()),
@@ -413,7 +286,7 @@ fn evidence(dat: &Dat, roms: &[usize]) -> Evidence {
         ("sha256", |r| r.sha256.is_some()),
     ] {
         if all_supply(has) {
-            algorithms.push(name);
+            algorithms.push(name.into());
         }
     }
     Evidence {

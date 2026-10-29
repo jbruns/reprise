@@ -1,0 +1,6 @@
+# Only the sources the build needs. The toolchain file is left out: the build image already is that toolchain.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+crates/*/tests/

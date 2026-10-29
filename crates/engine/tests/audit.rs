@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use sha2::Digest;
-use title_select::{EvidenceLevel, Finding, GameStatus, audit};
+use title_select_engine::{EvidenceLevel, Finding, GameStatus, audit};
 
 #[test]
 fn loose_file_whose_payload_matches_its_named_rom_is_matched() {
@@ -17,7 +17,7 @@ fn loose_file_whose_payload_matches_its_named_rom_is_matched() {
     assert_eq!(report.games[0].status, GameStatus::Complete);
 }
 
-fn finding_of(report: &title_select::Report, path: &str) -> Finding {
+fn finding_of(report: &title_select_engine::Report, path: &str) -> Finding {
     report
         .entries
         .iter()
@@ -26,7 +26,7 @@ fn finding_of(report: &title_select::Report, path: &str) -> Finding {
         .finding
 }
 
-fn status_of(report: &title_select::Report, game: &str) -> GameStatus {
+fn status_of(report: &title_select_engine::Report, game: &str) -> GameStatus {
     report.games.iter().find(|g| g.name == game).unwrap().status
 }
 
@@ -365,4 +365,52 @@ fn symlinked_files_are_audited_and_an_unreadable_directory_is_unreadable_without
 
     assert_eq!(finding_of(&report, "Pong (USA).a26"), Finding::Matched);
     assert_eq!(finding_of(&report, "locked"), Finding::Unreadable);
+}
+
+#[test]
+fn many_workers_produce_the_same_report_and_report_progress_for_every_file() {
+    let fx = Fixture::new();
+    let mut games = Vec::new();
+    for i in 0..12 {
+        let name: &'static str = Box::leak(format!("Game {i:02}.bin").into_boxed_str());
+        let payload = format!("payload {i}").repeat(10_000 * (i + 1));
+        games.push((name, vec![rom(name, payload.as_bytes())]));
+        if i % 2 == 0 {
+            write_file(&fx.set_path(name), payload.as_bytes());
+        } else {
+            let zip_name = format!("Game {i:02}.zip");
+            write_zip(&fx.set_path(&zip_name), &[(name, payload.as_bytes())]);
+        }
+    }
+    let games: Vec<(&str, Vec<RomSpec>)> = games;
+    let dat = fx.dat(&games);
+    let run = |workers: title_select_engine::Workers| {
+        let seen = std::sync::Mutex::new(Vec::new());
+        let progress = |p: title_select_engine::Progress| seen.lock().unwrap().push(p);
+        let options = title_select_engine::Options {
+            file: "test.dat".into(),
+            confine: None,
+            workers,
+            progress: Some(&progress),
+        };
+        let report = title_select_engine::audit_with(&dat, fx.set.path(), &options).unwrap();
+        (report, seen.into_inner().unwrap())
+    };
+
+    let (one, one_progress) = run(title_select_engine::ONE_WORKER_EACH);
+    let (many, many_progress) = run(title_select_engine::Workers {
+        readers: 4,
+        hashers: 3,
+    });
+
+    assert_eq!(one.entries, many.entries);
+    assert_eq!(one.games, many.games);
+    assert_eq!(many.summary.findings.get(&Finding::Matched), Some(&12));
+    for progress in [one_progress, many_progress] {
+        assert_eq!(progress.len(), 12);
+        assert!(progress.iter().all(|p| p.files_total == 12));
+        let mut done: Vec<_> = progress.iter().map(|p| p.files_done).collect();
+        done.sort();
+        assert_eq!(done, (1..=12).collect::<Vec<_>>());
+    }
 }

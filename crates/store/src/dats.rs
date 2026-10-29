@@ -6,41 +6,9 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::blobs::{remove_blob, write_blob};
 use super::{DATS, Error, Result, Store, io_error, now};
-use crate::dat::Dat;
+use title_select_engine::dat::Dat;
 
-/// A DAT Revision as the store records it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DatRevisionRecord {
-    /// SHA-256 of the unmodified DAT file; the DAT Revision's identity.
-    pub sha256: String,
-    pub provider: String,
-    /// The DAT's header name.
-    pub name: String,
-    pub version: String,
-    /// The original filename.
-    pub file: String,
-    pub imported_at: String,
-    pub source_url: Option<String>,
-    /// Whether the unmodified file is kept in the store.
-    pub blob_present: bool,
-}
-
-impl DatRevisionRecord {
-    /// The DAT this is a revision of, as `<provider>/<name>`.
-    pub fn dat(&self) -> String {
-        format!("{}/{}", self.provider, self.name)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImportOutcome {
-    /// A new DAT Revision.
-    Added,
-    /// The same bytes were already imported; nothing changed.
-    AlreadyImported,
-    /// The same bytes were already imported and their dropped blob is restored.
-    Restored,
-}
+pub use title_select_api::{DatRevisionRecord, ImportOutcome};
 
 pub(super) const REVISION_COLUMNS: &str = "r.id, r.sha256, d.provider, d.name, r.version, r.file_name, \
      r.imported_at, r.source_url, r.blob_dropped_at IS NULL";
@@ -59,6 +27,15 @@ pub(super) fn revision_from_row(row: &Row) -> rusqlite::Result<(i64, DatRevision
             blob_present: row.get(8)?,
         },
     ))
+}
+
+pub(super) fn revision_by_id(c: &Connection, id: i64) -> Result<(i64, DatRevisionRecord)> {
+    let sql = format!(
+        "SELECT {REVISION_COLUMNS} FROM dat_revisions r JOIN dats d ON d.id = r.dat_id WHERE r.id = ?1"
+    );
+    c.query_row(&sql, [id], revision_from_row)
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("no DAT Revision {id}")))
 }
 
 fn revision_by_sha(c: &Connection, sha256: &str) -> Result<Option<(i64, DatRevisionRecord)>> {
@@ -90,18 +67,33 @@ impl Store {
             )));
         }
         let bytes = std::fs::read(path).map_err(|e| io_error(path, e))?;
-        let dat = Dat::parse(&bytes, path)?;
-        if dat.name.is_empty() {
-            return Err(Error::Refused(format!(
-                "{}: the DAT header has no name",
-                path.display()
-            )));
-        }
-        let dats = self.dir.join(DATS);
         let file = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        self.import_dat_bytes(&bytes, &file, provider, source_url)
+    }
+
+    /// Imports the unmodified bytes of a DAT file whose original filename is `file`, like [`Store::import_dat`].
+    pub fn import_dat_bytes(
+        &self,
+        bytes: &[u8],
+        file: &str,
+        provider: &str,
+        source_url: Option<&str>,
+    ) -> Result<(DatRevisionRecord, ImportOutcome)> {
+        if provider.is_empty() || provider.contains('/') {
+            return Err(Error::Refused(format!(
+                "{provider:?}: a provider is a non-empty name without `/`"
+            )));
+        }
+        let dat = Dat::parse(bytes, Path::new(file))?;
+        if dat.name.is_empty() {
+            return Err(Error::Refused(format!(
+                "{file}: the DAT header has no name"
+            )));
+        }
+        let dats = self.dir.join(DATS);
         // Holding the writer keeps the blob and its row consistent against retention and garbage collection.
         let (record, outcome) = self.with_writer(|conn| {
             if let Some((id, existing)) = revision_by_sha(conn, &dat.sha256)? {
@@ -109,7 +101,7 @@ impl Store {
                 if existing.blob_present && blob.is_file() {
                     return Ok((existing, ImportOutcome::AlreadyImported));
                 }
-                write_blob(&dats, &dat.sha256, &bytes)?;
+                write_blob(&dats, &dat.sha256, bytes)?;
                 conn.execute(
                     "UPDATE dat_revisions SET blob_dropped_at = NULL, restored_at = ?2 WHERE id = ?1",
                     params![id, now()],
@@ -120,7 +112,7 @@ impl Store {
                 };
                 return Ok((restored, ImportOutcome::Restored));
             }
-            write_blob(&dats, &dat.sha256, &bytes)?;
+            write_blob(&dats, &dat.sha256, bytes)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
                 "INSERT INTO dats (provider, name) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
@@ -163,9 +155,9 @@ impl Store {
         })
     }
 
-    /// Drops the blob of every DAT Revision that no retained or running Audit refers to, that is not the
-    /// newest imported revision of its DAT (ADR 0003), and that is not held as restored. The row stays. Returns the SHA-256s whose blobs were
-    /// dropped.
+    /// Drops the blob of every DAT Revision that no retained or running Audit, and no Queued or Running Job, refers
+    /// to, that is not the newest imported revision of its DAT (ADR 0003), and that is not held as restored. The row
+    /// stays. Returns the SHA-256s whose blobs were dropped.
     pub fn retain_blobs(&self) -> Result<Vec<String>> {
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -177,6 +169,8 @@ impl Store {
                        AND r.id <> (SELECT max(n.id) FROM dat_revisions n WHERE n.dat_id = r.dat_id)
                        AND NOT EXISTS (
                            SELECT 1 FROM audits a WHERE a.dat_revision_id = r.id AND a.pruned_at IS NULL)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM jobs j WHERE j.dat_revision_id = r.id AND j.state IN ('queued', 'running'))
                      ORDER BY r.id",
                 )?
                 .query_map([], |r| r.get(0))?

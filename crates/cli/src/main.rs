@@ -1,11 +1,15 @@
+mod client;
+
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use title_select::config::Config;
-use title_select::store::{ImportOutcome, Store};
-use title_select::{Finding, GameStatus, Report};
+use title_select_engine::{Finding, GameStatus, Report};
+use title_select_server::Settings;
+use title_select_store::config::Config;
+use title_select_store::{ImportOutcome, Store};
 
 /// Audits Source Sets against DAT Revisions.
 #[derive(Parser)]
@@ -17,6 +21,9 @@ struct Cli {
     /// The configuration file (`title-select.toml`) that declares the Roots.
     #[arg(long, global = true, env = "TITLE_SELECT_CONFIG")]
     config: Option<PathBuf>,
+    /// The file holding the Operator token: the Service accepts it, and `audit --server` sends it.
+    #[arg(long, global = true, env = "TITLE_SELECT_OPERATOR_TOKEN_FILE")]
+    token_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -27,7 +34,8 @@ enum Command {
     /// Reads only; never changes the Source Set.
     ///
     /// With `--dat <file> <dir>` the Audit is stateless. With `--set <name>` it audits a registered Source Set
-    /// and records the Audit in the store.
+    /// and records the Audit in the store. With `--server <url> --set <name>` the Service at `<url>` runs it as a
+    /// Job, which this follows to completion, showing progress and a summary on stderr.
     Audit {
         /// The Logiqx XML DAT file to audit against.
         #[arg(long, required_unless_present = "set", conflicts_with = "set")]
@@ -39,6 +47,9 @@ enum Command {
         /// Audit's DAT Revision, else the newest imported revision of the Source Set's DAT.
         #[arg(long, requires = "set")]
         revision: Option<String>,
+        /// The Service to run the Audit, such as `http://127.0.0.1:8080`. Sends the Operator token.
+        #[arg(long, requires = "set")]
+        server: Option<String>,
         /// Write the report to this file instead of stdout.
         #[arg(long)]
         output: Option<PathBuf>,
@@ -55,6 +66,12 @@ enum Command {
     Set {
         #[command(subcommand)]
         command: SetCommand,
+    },
+    /// Run the Service: the `/api/v1` JSON API and the Audit Jobs. It holds the store until it stops.
+    Serve {
+        /// The address to listen on.
+        #[arg(long, env = "TITLE_SELECT_LISTEN", default_value = "127.0.0.1:8080")]
+        listen: SocketAddr,
     },
 }
 
@@ -130,12 +147,28 @@ fn run(cli: Cli) -> Result<(), String> {
     let config = cli.config.as_deref();
     match cli.command {
         Command::Audit {
+            set: Some(set),
+            revision,
+            server: Some(server),
+            output,
+            ..
+        } => {
+            let report = client::audit(client::Request {
+                server: &server,
+                set,
+                revision,
+                token_file: cli.token_file.as_deref(),
+            })?;
+            write_report(&report, output)
+        }
+        Command::Audit {
             dat: Some(dat),
             source_set: Some(source_set),
             output,
             ..
         } => {
-            let report = title_select::audit(&dat, &source_set).map_err(|e| e.to_string())?;
+            let report =
+                title_select_engine::audit(&dat, &source_set).map_err(|e| e.to_string())?;
             write_report(&report, output)
         }
         Command::Audit {
@@ -151,6 +184,17 @@ fn run(cli: Cli) -> Result<(), String> {
             write_report(&audit.report, output)
         }
         Command::Audit { .. } => unreachable!("clap requires --dat with a directory, or --set"),
+        Command::Serve { listen } => {
+            let store = store.ok_or("no store: pass --store <dir> or set TITLE_SELECT_STORE")?;
+            title_select_server::run(Settings {
+                store: store.to_path_buf(),
+                config: load_config(config)?,
+                listen,
+                token_file: cli.token_file,
+                hold_jobs: false,
+            })
+            .map_err(|e| e.to_string())
+        }
         Command::Dat {
             command:
                 DatCommand::Import {

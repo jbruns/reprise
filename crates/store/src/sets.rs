@@ -8,26 +8,7 @@ use super::dats::split_dat;
 use super::{Error, Result, Store, now};
 use crate::config::Config;
 
-/// The DAT Revision a Source Set was last verified against: its latest Audit's.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LastVerified {
-    pub sha256: String,
-    pub version: String,
-    pub finished_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceSetRecord {
-    /// The Source Set's folder name, which identifies it.
-    pub name: String,
-    pub root: String,
-    /// Relative to the Root, with `/` separators.
-    pub path: String,
-    /// The bound DAT, as `<provider>/<name>`.
-    pub dat: String,
-    pub added_at: String,
-    pub last_verified_against: Option<LastVerified>,
-}
+pub use title_select_api::{LastVerified, SourceSetRecord};
 
 pub(super) struct SourceSetRow {
     pub id: i64,
@@ -76,7 +57,13 @@ pub(super) fn set_by_name(c: &Connection, name: &str) -> Result<SourceSetRow> {
         set_from_row,
     )
     .optional()?
-    .ok_or_else(|| Error::Refused(format!("no Source Set named {name}")))
+    .ok_or_else(|| Error::NotFound(format!("no Source Set named {name}")))
+}
+
+pub(super) fn set_by_id(c: &Connection, id: i64) -> Result<SourceSetRow> {
+    c.query_row(&format!("{SET_QUERY} WHERE s.id = ?1"), [id], set_from_row)
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("no Source Set {id}")))
 }
 
 /// A Source Set's folder, checked to lie inside its Root.

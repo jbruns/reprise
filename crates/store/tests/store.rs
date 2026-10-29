@@ -1,11 +1,12 @@
+#[path = "../../engine/tests/common/mod.rs"]
 mod common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use common::*;
-use title_select::config::Config;
-use title_select::store::{Error, ImportOutcome, Store};
+use title_select_store::config::Config;
+use title_select_store::{Error, ImportOutcome, Store};
 
 const SET: &str = "No-Intro/Test - System";
 
@@ -84,7 +85,7 @@ impl Env {
         self.add_set();
     }
 
-    fn audit(&self, revision: Option<&str>) -> title_select::store::StoredAudit {
+    fn audit(&self, revision: Option<&str>) -> title_select_store::StoredAudit {
         self.store
             .audit_source_set(&self.config, "Test - System", revision)
             .unwrap()
@@ -277,9 +278,9 @@ fn a_stored_audits_report_equals_the_stateless_audits_apart_from_times() {
     write_file(&set.join("Broken.zip"), b"not a zip");
 
     let stored = env.audit(None).report;
-    let stateless = title_select::audit(&env.dat(2), &set).unwrap();
+    let stateless = title_select_engine::audit(&env.dat(2), &set).unwrap();
 
-    let without_times = |report: &title_select::Report| {
+    let without_times = |report: &title_select_engine::Report| {
         let mut json = serde_json::to_value(report).unwrap();
         let obj = json.as_object_mut().unwrap();
         obj.remove("started_at").unwrap();
@@ -349,8 +350,8 @@ fn pruning_keeps_the_latest_audits_and_leaves_summaries() {
         vec![false, false, true]
     );
     let summary = &history[2];
-    assert_eq!(summary.findings[&title_select::Finding::Matched], 1);
-    assert_eq!(summary.games[&title_select::GameStatus::Complete], 1);
+    assert_eq!(summary.findings[&title_select_engine::Finding::Matched], 1);
+    assert_eq!(summary.games[&title_select_engine::GameStatus::Complete], 1);
     assert!(matches!(env.store.report(ids[0]), Err(Error::Refused(_))));
     assert_eq!(env.store.report(ids[2]).unwrap().entries.len(), 1);
 }
@@ -541,21 +542,21 @@ fn a_stored_audit_does_not_follow_symlinks_out_of_the_root() {
         (entry.finding, entry.reason.clone())
     };
     let escaped = (
-        title_select::Finding::Unreadable,
+        title_select_engine::Finding::Unreadable,
         Some("resolves outside the Root".to_owned()),
     );
     assert_eq!(finding("Pong (USA).a26"), escaped);
     assert_eq!(finding("elsewhere"), escaped);
     assert_eq!(
         finding("shared/Combat (USA).a26").0,
-        title_select::Finding::Matched,
+        title_select_engine::Finding::Matched,
         "a symlink inside the Root is followed"
     );
     assert_eq!(stored.entries.len(), 3, "nothing under `elsewhere` is read");
 
-    let stateless = title_select::audit(&env.dat(1), &env.set_dir()).unwrap();
+    let stateless = title_select_engine::audit(&env.dat(1), &env.set_dir()).unwrap();
     assert_eq!(
-        stateless.summary.findings[&title_select::Finding::Matched],
+        stateless.summary.findings[&title_select_engine::Finding::Matched],
         3
     );
 }
@@ -590,4 +591,166 @@ fn an_ambiguous_revision_prefix_is_refused() {
         panic!("expected a refusal: {refused:?}");
     };
     assert!(message.contains("more than one"), "{message}");
+}
+
+const WORKERS: title_select_store::Workers = title_select_store::Workers {
+    readers: 2,
+    hashers: 2,
+};
+
+#[test]
+fn an_audit_job_moves_from_queued_through_running_to_succeeded() {
+    use title_select_store::JobState;
+    let env = Env::new(20);
+    env.add_dat_and_set();
+    let (sha256, _) = env.import(2);
+
+    let queued = env
+        .store
+        .enqueue_audit("Test - System", Some(&sha256[..12]), "Operator", WORKERS)
+        .unwrap();
+    assert_eq!(queued.state, JobState::Queued);
+    assert_eq!(queued.dat_revision, sha256);
+    assert_eq!((queued.actor.as_str(), queued.attempt), ("Operator", 1));
+
+    let running = env.store.claim_job().unwrap().unwrap();
+    assert_eq!((running.id, running.state), (queued.id, JobState::Running));
+    assert!(env.store.claim_job().unwrap().is_none());
+
+    let files = std::sync::Mutex::new(0);
+    let progress = |_: title_select_engine::Progress| *files.lock().unwrap() += 1;
+    let done = env
+        .store
+        .run_audit_job(&env.config, running.id, Some(&progress))
+        .unwrap();
+
+    assert_eq!(done.state, JobState::Succeeded);
+    let audit = env.store.audit(done.audit.unwrap()).unwrap();
+    assert_eq!(audit.dat_revision_sha256, sha256);
+    assert_eq!(audit.source_set, "Test - System");
+    assert_eq!(env.store.jobs(10).unwrap(), vec![done]);
+}
+
+#[test]
+fn a_second_audit_of_the_same_source_set_is_refused_naming_the_active_job() {
+    let env = Env::new(20);
+    env.add_dat_and_set();
+    let first = env
+        .store
+        .enqueue_audit("Test - System", None, "Operator", WORKERS)
+        .unwrap();
+
+    let second = env
+        .store
+        .enqueue_audit("Test - System", None, "Operator", WORKERS);
+    assert!(
+        matches!(second, Err(Error::JobActive { job, .. }) if job == first.id),
+        "{second:?}"
+    );
+
+    env.store.claim_job().unwrap();
+    let third = env
+        .store
+        .enqueue_audit("Test - System", None, "Operator", WORKERS);
+    assert!(matches!(third, Err(Error::JobActive { job, .. }) if job == first.id));
+
+    env.store
+        .run_audit_job(&env.config, first.id, None)
+        .unwrap();
+    env.store
+        .enqueue_audit("Test - System", None, "Operator", WORKERS)
+        .unwrap();
+}
+
+#[test]
+fn a_restart_interrupts_a_running_job_and_queues_it_once_more_then_fails_it() {
+    use title_select_store::JobState;
+    let env = Env::new(20);
+    env.add_dat_and_set();
+    let first = env
+        .store
+        .enqueue_audit("Test - System", None, "Operator", WORKERS)
+        .unwrap();
+    env.store.claim_job().unwrap();
+    // A Running Job's Audit row, as a stop part way through would leave it.
+    database(&env.store)
+        .execute(
+            "INSERT INTO audits (source_set_id, dat_revision_id, status, source_set_path, started_at)
+             SELECT source_set_id, dat_revision_id, 'running', 'set', 'now' FROM jobs",
+            [],
+        )
+        .unwrap();
+
+    let (tmp, store) = env.reopen();
+    let gentle = title_select_store::Workers {
+        readers: 1,
+        hashers: 1,
+    };
+    let recovered = store.recover_jobs(gentle).unwrap();
+
+    assert_eq!(recovered.len(), 1);
+    let interrupted = &recovered[0].job;
+    assert_eq!(
+        (interrupted.id, interrupted.state),
+        (first.id, JobState::Interrupted)
+    );
+    assert!(interrupted.error.is_some());
+    let again = recovered[0].requeued.clone().unwrap();
+    assert_eq!(again.state, JobState::Queued);
+    assert_eq!((again.attempt, again.requeued_from), (2, Some(first.id)));
+    assert_eq!(again.workers, gentle);
+    assert_eq!(again.dat_revision, first.dat_revision);
+    assert!(store.history("Test - System").unwrap().is_empty());
+
+    assert_eq!(store.claim_job().unwrap().unwrap().id, again.id);
+    let dir = store.dir().to_path_buf();
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    let recovered = store.recover_jobs(gentle).unwrap();
+
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].job.state, JobState::Failed);
+    assert!(recovered[0].requeued.is_none());
+    assert!(store.claim_job().unwrap().is_none());
+    assert!(store.recover_jobs(gentle).unwrap().is_empty());
+    drop(tmp);
+}
+
+#[test]
+fn an_audit_job_that_cannot_read_its_source_set_fails() {
+    use title_select_store::JobState;
+    let env = Env::new(20);
+    env.add_dat_and_set();
+    let job = env
+        .store
+        .enqueue_audit("Test - System", None, "Operator", WORKERS)
+        .unwrap();
+    env.store.claim_job().unwrap();
+    std::fs::remove_dir_all(env.set_dir()).unwrap();
+
+    let done = env.store.run_audit_job(&env.config, job.id, None).unwrap();
+
+    assert_eq!(done.state, JobState::Failed);
+    assert!(done.error.is_some() && done.audit.is_none());
+    assert!(env.store.history("Test - System").unwrap().is_empty());
+}
+
+#[test]
+fn a_queued_job_holds_its_dat_revision_until_it_runs() {
+    use title_select_store::JobState;
+    let env = Env::new(20);
+    let (first, _) = env.import(1);
+    env.add_set();
+    let job = env
+        .store
+        .enqueue_audit("Test - System", None, "Operator", WORKERS)
+        .unwrap();
+    assert_eq!(job.dat_revision, first);
+
+    env.import(2);
+
+    assert!(env.blob_present(&first), "the queued Job holds it");
+    env.store.claim_job().unwrap();
+    let done = env.store.run_audit_job(&env.config, job.id, None).unwrap();
+    assert_eq!(done.state, JobState::Succeeded);
 }

@@ -1,0 +1,12 @@
+[package]
+name = "title-select-api"
+description = "Title Select's versioned JSON API types, shared by the Service, its clients and the UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+jiff = { workspace = true, features = ["serde"] }
+serde.workspace = true
