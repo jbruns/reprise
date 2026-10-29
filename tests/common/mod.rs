@@ -112,7 +112,7 @@ fn write_zip_with(path: &Path, members: &[(&str, &[u8])], method: zip::Compressi
     zip.finish().unwrap();
 }
 
-/// Two temp dirs: one for the DAT, one for the Verified Set.
+/// Two temp dirs: one for the DAT, one for the Source Set.
 pub struct Fixture {
     pub dat_dir: tempfile::TempDir,
     pub set: tempfile::TempDir,

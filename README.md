@@ -8,11 +8,11 @@ Vocabulary is defined in [GLOSSARY.md](GLOSSARY.md), decisions in [docs/adr/](do
 ## Audit
 
 ```sh
-title-select audit --dat <DAT file> <Verified Set directory> [--output <report file>]
+title-select audit --dat <DAT file> <Source Set directory> [--output <report file>]
 ```
 
-Audits every file under the Verified Set directory against a Logiqx XML DAT (for example a No-Intro DAT) and
-writes a JSON report to stdout, or to `--output`. It only reads: the Verified Set is never changed.
+Audits every file under the Source Set directory against a Logiqx XML DAT (for example a No-Intro DAT) and
+writes a JSON report to stdout, or to `--output`. It only reads: the Source Set is never changed.
 
 - Every payload is read and checksummed (size, CRC32, MD5, SHA-1, SHA-256). Each member of a `.zip` archive is
   an Entry; any other file, including other archive formats, is one Entry. Nested archives are not opened.
@@ -21,29 +21,29 @@ writes a JSON report to stdout, or to `--output`. It only reads: the Verified Se
 - An unreadable file, directory, archive or member becomes an Unreadable Entry and the Audit continues.
   Symbolic links are followed.
 - Exits 0 when the Audit completes, whatever it found. Exits non-zero with a message on stderr when the DAT
-  cannot be read or the Verified Set directory does not exist.
+  cannot be read or the Source Set directory does not exist.
 
 ### Report
 
 ```jsonc
 {
-  "schema": 1,                       // version of this report's shape
+  "schema": 2,                       // version of this report's shape
   "dat_revision": {                  // the DAT Revision the Audit is pinned to
     "sha256": "254e…",               // SHA-256 of the unmodified DAT file: its identity
     "name": "Atari - Atari 2600",    // from the DAT header
     "version": "20261027-195049",
     "file": "Atari - Atari 2600 (20261027-195049).dat"
   },
-  "verified_set": "/path/to/set",
+  "source_set": "/path/to/set",
   "started_at": "2026-10-28T22:45:46.539Z",
   "finished_at": "2026-10-28T22:45:46.942Z",
   "summary": {
-    "findings": { "matched": 786, "misnamed": 19, "conflicting": 3, "bad": 0, "extra": 41, "unreadable": 0 },
+    "findings": { "matched": 786, "misnamed": 19, "conflicting": 3, "mismatched": 0, "unmatched": 41, "unreadable": 0 },
     "games": { "complete": 802, "incomplete": 0, "missing": 70 }
   },
   "entries": [
     {
-      "path": "Breakout (Europe).zip",           // relative to the Verified Set
+      "path": "Breakout (Europe).zip",           // relative to the Source Set
       "member": "Breakout (Europe).a26",         // present for a ZIP member
       "finding": "conflicting",
       "roms": [{ "game": "Breakout (Europe) (Rev 1)", "name": "Breakout (Europe) (Rev 1).a26" }],
@@ -57,13 +57,14 @@ writes a JSON report to stdout, or to `--output`. It only reads: the Verified Se
 }
 ```
 
-- `finding` is one of `matched`, `misnamed`, `conflicting`, `bad`, `extra` or `unreadable` (see the glossary).
+- `finding` is one of `matched`, `misnamed`, `conflicting`, `mismatched`, `unmatched` or `unreadable` (see the
+  glossary).
 - `roms` lists the ROMs the Entry counts towards. For a Matched Entry that is every ROM with its name and payload,
   so an identical ROM shared by several Games counts for each. For a Misnamed or Conflicting Entry it is every
   ROM the payload matches, so the Entry completes the Game its payload belongs to.
-- `named_rom` is the ROM the Entry's name gives, present when it differs from the payload's (Conflicting, Bad).
+- `named_rom` is the ROM the Entry's name gives, present when it differs from the payload's (Conflicting, Mismatched).
 - `evidence.algorithms` lists what the Finding rests on. For a payload match, it is size plus each checksum that
-  every ROM in `roms` supplies; all of them were compared and agreed. A Bad or Extra Entry has only size and
+  every ROM in `roms` supplies; all of them were compared and agreed. A Mismatched or Unmatched Entry has only size and
   CRC32, the lookup that found no matching ROM. An Unreadable Entry has no Evidence and a `reason` instead.
 - A Game is `complete`, `incomplete` or `missing`; `missing_roms` lists its ROMs no Entry's payload matched.
 

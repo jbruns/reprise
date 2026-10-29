@@ -33,7 +33,7 @@ fn audit_prints_a_json_report_to_stdout() {
         String::from_utf8_lossy(&out.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(report["schema"], 1);
+    assert_eq!(report["schema"], 2);
     assert_eq!(report["dat_revision"]["name"], "Test - System");
     assert_eq!(report["summary"]["findings"]["matched"], 1);
     assert_eq!(report["entries"][0]["finding"], "matched");
@@ -68,7 +68,7 @@ fn audit_writes_the_report_to_the_output_file() {
 }
 
 #[test]
-fn audit_fails_with_a_message_for_an_unreadable_dat_or_a_missing_verified_set() {
+fn audit_fails_with_a_message_for_an_unreadable_dat_or_a_missing_source_set() {
     let (f, dat) = pong_fixture();
     let not_xml = f.dat_dir.path().join("not.dat");
     std::fs::write(&not_xml, "<datafile><game name=\"x\"></datafile>").unwrap();

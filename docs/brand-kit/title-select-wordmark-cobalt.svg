@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1376" height="616" viewBox="579 86 1376 616" role="img" aria-labelledby="title desc">
+  <title id="title">Title Select wordmark - cobalt</title>
+  <desc id="desc">Production vector reconstruction of the approved Title Select identity. Closed paths only; transparent background; no fonts or embedded images.</desc>
+  <g id="wordmark">
+    <path id="title-t-1" fill="#1847D1" d="M745 182 L982 182 L965 244 L892 244 L850 390 L755 390 L797 244 L728 244 Z"/>
+    <path id="title-i" fill="#1847D1" d="M996 182 L1088 182 L1029 390 L936 390 Z"/>
+    <path id="title-t-2" fill="#1847D1" d="M1101 182 L1326 182 L1309 244 L1243 244 L1201 390 L1106 390 L1148 244 L1084 244 Z"/>
+    <path id="title-l" fill="#1847D1" d="M1340 182 L1433 182 L1392 326 L1514 326 L1496 390 L1280 390 Z"/>
+    <path id="title-e" fill="#1847D1" d="M1591 182 L1777 182 L1762 241 L1641 241 L1637 256 L1741 256 L1726 311 L1622 311 L1618 326 L1754 326 L1736 390 L1506 390 L1555 214 Z"/>
+    <path id="select-s" fill="#1847D1" d="M751 409 L928 409 L913 467 L787 467 L783 481 L871 481 L898 511 L880 577 L846 606 L675 606 L692 546 L813 546 L817 531 L726 531 L702 501 L720 438 Z"/>
+    <path id="select-e-1" fill="#1847D1" d="M960 409 L1124 409 L1108 467 L999 467 L995 481 L1084 481 L1070 531 L981 531 L977 545 L1086 545 L1069 606 L911 606 L888 578 L928 438 Z"/>
+    <path id="select-l" fill="#1847D1" d="M1132 409 L1210 409 L1173 545 L1264 545 L1248 606 L1109 606 L1084 578 Z"/>
+    <path id="select-e-2" fill="#1847D1" d="M1332 409 L1493 409 L1477 467 L1371 467 L1367 481 L1454 481 L1440 531 L1354 531 L1350 545 L1456 545 L1439 606 L1287 606 L1262 578 L1300 438 Z"/>
+    <path id="select-c" fill="#1847D1" d="M1525 409 L1668 409 L1652 467 L1562 467 L1540 545 L1636 545 L1621 606 L1478 606 L1454 578 L1493 438 Z"/>
+    <path id="select-t" fill="#1847D1" d="M1673 409 L1859 409 L1843 467 L1788 467 L1749 606 L1667 606 L1706 467 L1657 467 Z"/>
+  </g>
+</svg>

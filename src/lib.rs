@@ -1,4 +1,4 @@
-//! Audits a Verified Set against a DAT Revision (see GLOSSARY.md and ADR 0002).
+//! Audits a Source Set against a DAT Revision (see GLOSSARY.md and ADR 0002).
 
 mod dat;
 mod payload;
@@ -16,8 +16,8 @@ use payload::Checksums;
 pub enum Error {
     #[error("cannot read DAT: {0}")]
     Dat(String),
-    #[error("cannot read Verified Set: {0}")]
-    VerifiedSet(String),
+    #[error("cannot read Source Set: {0}")]
+    SourceSet(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -26,8 +26,8 @@ pub enum Finding {
     Matched,
     Misnamed,
     Conflicting,
-    Bad,
-    Extra,
+    Mismatched,
+    Unmatched,
     Unreadable,
 }
 
@@ -36,8 +36,8 @@ impl Finding {
         Finding::Matched,
         Finding::Misnamed,
         Finding::Conflicting,
-        Finding::Bad,
-        Finding::Extra,
+        Finding::Mismatched,
+        Finding::Unmatched,
         Finding::Unreadable,
     ];
 }
@@ -98,7 +98,7 @@ pub struct RomRef {
 
 #[derive(Debug, Serialize)]
 pub struct Entry {
-    /// Path relative to the Verified Set's root.
+    /// Path relative to the Source Set's root.
     pub path: String,
     /// The member's name, when the Entry is a member of a ZIP archive at `path`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,7 +107,7 @@ pub struct Entry {
     /// The ROMs this Entry's payload matches.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub roms: Vec<RomRef>,
-    /// For a Conflicting or Bad Entry, the ROM its name gives.
+    /// For a Conflicting or Mismatched Entry, the ROM its name gives.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub named_rom: Option<RomRef>,
     /// Absent for an Unreadable Entry.
@@ -131,7 +131,7 @@ pub struct Report {
     /// Version of this report's shape.
     pub schema: u32,
     pub dat_revision: DatRevision,
-    pub verified_set: String,
+    pub source_set: String,
     pub started_at: jiff::Timestamp,
     pub finished_at: jiff::Timestamp,
     pub summary: Summary,
@@ -143,11 +143,11 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Audits the Verified Set at `root` against the DAT Revision at `dat_path`, reading every payload.
+/// Audits the Source Set at `root` against the DAT Revision at `dat_path`, reading every payload.
 pub fn audit(dat_path: &Path, root: &Path) -> Result<Report, Error> {
     let started_at = jiff::Timestamp::now();
     if !root.is_dir() {
-        return Err(Error::VerifiedSet(format!(
+        return Err(Error::SourceSet(format!(
             "{}: not a directory",
             root.display()
         )));
@@ -170,7 +170,7 @@ pub fn audit(dat_path: &Path, root: &Path) -> Result<Report, Error> {
     {
         let item = match item {
             Ok(item) => item,
-            Err(err) if err.depth() == 0 => return Err(Error::VerifiedSet(err.to_string())),
+            Err(err) if err.depth() == 0 => return Err(Error::SourceSet(err.to_string())),
             Err(err) => {
                 let path = err.path().map(rel).unwrap_or_default();
                 scan.unreadable(path, None, err.to_string());
@@ -199,7 +199,7 @@ pub fn audit(dat_path: &Path, root: &Path) -> Result<Report, Error> {
         *statuses.entry(g.status).or_default() += 1;
     }
     Ok(Report {
-        schema: 1,
+        schema: 2,
         dat_revision: DatRevision {
             sha256: dat.sha256.clone(),
             name: dat.name.clone(),
@@ -209,7 +209,7 @@ pub fn audit(dat_path: &Path, root: &Path) -> Result<Report, Error> {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         },
-        verified_set: root.display().to_string(),
+        source_set: root.display().to_string(),
         started_at,
         finished_at: jiff::Timestamp::now(),
         summary: Summary {
@@ -364,8 +364,8 @@ fn classify(dat: &Dat, name: &str, sums: &Checksums) -> (Finding, Vec<usize>, Op
     match (payload.is_empty(), named.first()) {
         (false, None) => (Finding::Misnamed, payload, None),
         (false, Some(n)) => (Finding::Conflicting, payload, Some(*n)),
-        (true, Some(n)) => (Finding::Bad, payload, Some(*n)),
-        (true, None) => (Finding::Extra, payload, None),
+        (true, Some(n)) => (Finding::Mismatched, payload, Some(*n)),
+        (true, None) => (Finding::Unmatched, payload, None),
     }
 }
 

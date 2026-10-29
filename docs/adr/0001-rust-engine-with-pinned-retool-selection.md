@@ -8,7 +8,7 @@ Accepted. The Rust port is planned for a milestone after the pilot. It is still 
 
 ## Context
 
-Title Select needs fast, explainable Audits of large Verified Sets, durable jobs and a service. It also needs a 1G1R
+Title Select needs fast, explainable Audits of large Source Sets, durable jobs and a service. It also needs a 1G1R
 Selection that explains each choice. Existing tools leave gaps: igir has no DAT Revision store, no Change Plans, no
 bad, conflicting or unreadable Findings and no jobs; ClrMamePro and RomVault use region-priority parent/clone
 selection with no rule trace. Retool's filter-pipeline Selection is the best available, but it is unmaintained Python
