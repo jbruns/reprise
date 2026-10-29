@@ -4,7 +4,7 @@ Date: 2026-10-28
 
 ## Status
 
-Accepted
+Accepted. The Rust port is planned for a milestone after the pilot. It is still gated on the conformance suite.
 
 ## Context
 

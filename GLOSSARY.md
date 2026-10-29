@@ -31,8 +31,18 @@ _Avoid_: Archive, romset, dump folder
 **Library**:
 The curated collection that players and front ends read. reprise publishes Selections into it.
 
+**Root**:
+A named folder the Operator configures for reprise to read, or later to write, such as the one holding Verified Sets.
+A Verified Set or a Library folder is identified by its Root and a path relative to it.
+_Avoid_: Mount, share
+
 **Operator**:
 The person who runs reprise and approves its Change Plans.
+
+**Job**:
+A durable unit of work that reprise runs for the Operator, such as an Audit. It is Queued, Running, Succeeded, Failed
+or Interrupted, and it survives a browser disconnecting or the Service restarting.
+_Avoid_: Task, run
 
 **Operator Addition**:
 An item the Operator approves for management in a Library independently of an official DAT, such as a ROM hack. Its
@@ -71,7 +81,8 @@ Misnamed or Conflicting Entry counts towards the Game its payload matches.
 ## Selection and change
 
 **Selection Profile**:
-The Operator's rules for including or excluding releases and choosing preferred releases of a Game.
+The Operator's rules for including or excluding releases and choosing preferred releases of a Game: global settings
+with per-system settings. It holds no DAT content and is reusable across DATs. Each saved version is immutable.
 _Avoid_: Filtered DAT (when meaning the rules)
 
 **Selection**:
