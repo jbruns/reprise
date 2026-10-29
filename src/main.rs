@@ -32,7 +32,7 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("reprise: {message}");
+            eprintln!("title-select: {message}");
             ExitCode::FAILURE
         }
     }
@@ -45,7 +45,7 @@ fn run(cli: Cli) -> Result<(), String> {
             output,
             verified_set,
         } => {
-            let report = reprise::audit(&dat, &verified_set).map_err(|e| e.to_string())?;
+            let report = title_select::audit(&dat, &verified_set).map_err(|e| e.to_string())?;
             let mut json = serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?;
             json.push(b'\n');
             match output {

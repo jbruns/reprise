@@ -1,4 +1,4 @@
-# reprise
+# Title Select
 
 Audits ROM collections against DAT files, and records exactly what was verified and against which DAT revision.
 
@@ -8,7 +8,7 @@ Vocabulary is defined in [GLOSSARY.md](GLOSSARY.md), decisions in [docs/adr/](do
 ## Audit
 
 ```sh
-reprise audit --dat <DAT file> <Verified Set directory> [--output <report file>]
+title-select audit --dat <DAT file> <Verified Set directory> [--output <report file>]
 ```
 
 Audits every file under the Verified Set directory against a Logiqx XML DAT (for example a No-Intro DAT) and
