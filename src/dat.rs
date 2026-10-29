@@ -47,8 +47,13 @@ impl Dat {
     pub fn read(path: &Path) -> Result<Dat, Error> {
         let bytes =
             std::fs::read(path).map_err(|err| Error::Dat(format!("{}: {err}", path.display())))?;
-        let sha256 = crate::hex(&sha2::Sha256::digest(&bytes));
-        let mut reader = quick_xml::Reader::from_reader(bytes.as_slice());
+        Dat::parse(&bytes, path)
+    }
+
+    /// Parses the bytes of the DAT file at `path`; the path only labels errors.
+    pub fn parse(bytes: &[u8], path: &Path) -> Result<Dat, Error> {
+        let sha256 = crate::hex(&sha2::Sha256::digest(bytes));
+        let mut reader = quick_xml::Reader::from_reader(bytes);
         let mut buf = Vec::new();
         let mut dat = Dat {
             sha256,

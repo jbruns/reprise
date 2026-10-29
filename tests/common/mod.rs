@@ -65,14 +65,24 @@ fn rom_xml(r: &RomSpec) -> String {
 
 /// Writes a No-Intro style Logiqx DAT with the given Games and returns its path.
 pub fn write_dat(dir: &Path, games: &[(&str, Vec<RomSpec>)]) -> PathBuf {
-    let mut xml = String::from(
+    write_dat_version(dir, "test.dat", "20260101-000000", games)
+}
+
+/// Writes a revision of the `Test - System` DAT, with its header `version`, to `dir/file`.
+pub fn write_dat_version(
+    dir: &Path,
+    file: &str,
+    version: &str,
+    games: &[(&str, Vec<RomSpec>)],
+) -> PathBuf {
+    let mut xml = format!(
         r#"<?xml version="1.0"?>
 <datafile>
   <header>
     <name>Test - System</name>
-    <version>20260101-000000</version>
+    <version>{version}</version>
   </header>
-"#,
+"#
     );
     for (game, roms) in games {
         xml.push_str(&format!("  <game name=\"{game}\">\n"));
@@ -82,7 +92,7 @@ pub fn write_dat(dir: &Path, games: &[(&str, Vec<RomSpec>)]) -> PathBuf {
         xml.push_str("  </game>\n");
     }
     xml.push_str("</datafile>\n");
-    let path = dir.join("test.dat");
+    let path = dir.join(file);
     fs::write(&path, xml).unwrap();
     path
 }

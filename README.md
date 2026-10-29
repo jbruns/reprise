@@ -2,7 +2,8 @@
 
 Audits ROM collections against DAT files, and records exactly what was verified and against which DAT revision.
 
-Status: early pilot. The first slice is a headless Audit command; Selection, Change Plans and a service follow.
+Status: early pilot. A headless Audit command and a store of DAT Revisions, Source Sets and Audits; Selection,
+Change Plans and a service follow.
 Vocabulary is defined in [GLOSSARY.md](GLOSSARY.md), decisions in [docs/adr/](docs/adr/).
 
 ## Audit
@@ -10,6 +11,9 @@ Vocabulary is defined in [GLOSSARY.md](GLOSSARY.md), decisions in [docs/adr/](do
 ```sh
 title-select audit --dat <DAT file> <Source Set directory> [--output <report file>]
 ```
+
+This Audit is stateless: it needs no store or configuration. `audit --set` (below) audits a registered Source Set
+and records the Audit in the store; its report has the same shape.
 
 Audits every file under the Source Set directory against a Logiqx XML DAT (for example a No-Intro DAT) and
 writes a JSON report to stdout, or to `--output`. It only reads: the Source Set is never changed.
@@ -67,6 +71,68 @@ writes a JSON report to stdout, or to `--output`. It only reads: the Source Set 
   every ROM in `roms` supplies; all of them were compared and agreed. A Mismatched or Unmatched Entry has only size and
   CRC32, the lookup that found no matching ROM. An Unreadable Entry has no Evidence and a `reason` instead.
 - A Game is `complete`, `incomplete` or `missing`; `missing_roms` lists its ROMs no Entry's payload matched.
+
+## Store
+
+The store is one directory: a SQLite database (`title-select.sqlite`), the unmodified DAT files under
+`dats/<sha256>`, and `backups/` (ADR 0003). Pass it with `--store <dir>` or `TITLE_SELECT_STORE`; it is created on
+first use.
+
+- The database runs in WAL mode. Every connection uses `synchronous=FULL`, `foreign_keys=ON` and a busy timeout.
+- A DAT file is written to a temp file, fsynced and renamed into place before its row is inserted. Files under
+  `dats/` that no DAT Revision holds are deleted each time the store opens.
+- Migrations are embedded and forward-only. Before one runs on a store that already has a schema, the database is
+  copied with `VACUUM INTO` to `backups/schema-<version>-<time>.sqlite`. A store from a newer Title Select is refused.
+- A DAT Revision's file is kept while a retained Audit refers to it or while it is the newest imported revision of
+  its DAT. Otherwise the file is deleted; the DAT Revision's row stays, so history still names it. Importing the
+  same file again restores it.
+
+## Configuration
+
+`title-select.toml`, passed with `--config <file>` or `TITLE_SELECT_CONFIG`, declares the Roots Title Select may
+read (ADR 0006). Without it there are no Roots.
+
+```toml
+[roots.sets]                # a Root called `sets`
+path = "/data/source-sets"
+writable = false            # the default; every Root is read-only until Change Plans exist
+
+[audits]
+keep = 20                   # full Audits kept per Source Set (the default)
+```
+
+## Commands
+
+```sh
+title-select dat import <DAT file> --provider <name> [--source-url <url>]
+```
+
+Imports an unmodified DAT file as a DAT Revision, recording its SHA-256, header `name` and `version`, original
+filename, import time, provider and source URL. A DAT is identified by its provider and header name, written
+`<provider>/<name>`; each import of new bytes adds a DAT Revision of it. Importing the same bytes again changes
+nothing and prints the existing DAT Revision, restoring its file if the store had dropped it.
+
+```sh
+title-select set add <Root> <relative path> --dat <provider>/<name>
+title-select set list
+title-select set history <Source Set>
+```
+
+`set add` registers a folder in a Root, such as `sets "No-Intro/Atari - 2600"`, as a Source Set bound to an imported
+DAT. The Source Set is named by its folder (`Atari - 2600`). An absolute path, `..`, or a symlink that resolves
+outside the Root is refused. `set list` prints each Source Set with the DAT Revision it was last verified against:
+its latest Audit's. `set history` lists a Source Set's Audits, newest first, with the time, DAT Revision, counts, and
+whether the full Audit is kept or only its summary.
+
+```sh
+title-select audit --set <Source Set> [--revision <sha256 prefix>] [--output <report file>]
+```
+
+Audits a registered Source Set, read-only, and records it. Without `--revision`, the DAT Revision is the latest
+Audit's, else the newest imported revision of the bound DAT, so a newer DAT Revision is adopted only by naming it.
+The Entries and Game Statuses are written in one transaction when the Audit finishes, and the report below is
+generated from them. Afterwards, Audits beyond the newest `audits.keep` are pruned to a one-row summary; the latest
+Audit, and any Audit cited as provenance, are never pruned.
 
 ## Licence
 
