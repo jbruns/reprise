@@ -180,9 +180,9 @@ download folders exist yet.
   ([DiskTransferService.cs L473-L520](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Common/Disk/DiskTransferService.cs#L473-L520)).
   There is no hashing stage to show.
 
-### What reprise needs instead (inference)
+### What Title Select needs instead (inference)
 
-In Sonarr, waiting for a person is a failure state (ImportBlocked). In reprise it is the normal resting state,
+In Sonarr, waiting for a person is a failure state (ImportBlocked). In Title Select it is the normal resting state,
 because every change needs an approved Change Plan. Hashing also adds a long, measurable stage that Sonarr does not
 have. So the unit of progress is a durable **incoming item**: one file or folder seen in a registered source. It
 outlives the jobs that act on it.

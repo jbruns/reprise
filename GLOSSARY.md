@@ -1,7 +1,7 @@
-# reprise
+# Title Select
 
-reprise audits Verified Sets against DAT Revisions and, later, publishes explained Selections from them into a
-Library.
+Title Select audits Verified Sets against DAT Revisions and, later, publishes explained Selections from them into a
+Library. "Title Select" is the product's name, not a domain term.
 
 ## Inventory
 
@@ -14,8 +14,9 @@ One particular edition of a DAT, identified by the SHA-256 of its unmodified fil
 the reference used by an earlier Audit or Selection.
 
 **Game**:
-An entry in a DAT Revision: one release, made of one or more ROMs.
-_Avoid_: Title (when meaning a DAT entry), set
+An entry in a DAT Revision: one release, made of one or more ROMs. The product says Game; Title is an accepted
+synonym in conversation.
+_Avoid_: set
 
 **ROM**:
 One expected file of a Game, with its name, size and checksums as the DAT Revision gives them. Also used for any
@@ -29,19 +30,19 @@ which a Library is curated. It changes only through an approved repair Change Pl
 _Avoid_: Archive, romset, dump folder
 
 **Library**:
-The curated collection that players and front ends read. reprise publishes Selections into it.
+The curated collection that players and front ends read. Title Select publishes Selections into it.
 
 **Root**:
-A named folder the Operator configures for reprise to read, or later to write, such as the one holding Verified Sets.
-A Verified Set or a Library folder is identified by its Root and a path relative to it.
+A named folder the Operator configures for Title Select to read, or later to write, such as the one holding Verified
+Sets. A Verified Set or a Library folder is identified by its Root and a path relative to it.
 _Avoid_: Mount, share
 
 **Operator**:
-The person who runs reprise and approves its Change Plans.
+The person who runs Title Select and approves its Change Plans.
 
 **Job**:
-A durable unit of work that reprise runs for the Operator, such as an Audit. It is Queued, Running, Succeeded, Failed
-or Interrupted, and it survives a browser disconnecting or the Service restarting.
+A durable unit of work that Title Select runs for the Operator, such as an Audit. It is Queued, Running, Succeeded,
+Failed or Interrupted, and it survives a browser disconnecting or the Service restarting.
 _Avoid_: Task, run
 
 **Operator Addition**:

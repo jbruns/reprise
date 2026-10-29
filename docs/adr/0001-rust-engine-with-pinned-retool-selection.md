@@ -8,7 +8,7 @@ Accepted. The Rust port is planned for a milestone after the pilot. It is still 
 
 ## Context
 
-reprise needs fast, explainable Audits of large Verified Sets, durable jobs and a service. It also needs a 1G1R
+Title Select needs fast, explainable Audits of large Verified Sets, durable jobs and a service. It also needs a 1G1R
 Selection that explains each choice. Existing tools leave gaps: igir has no DAT Revision store, no Change Plans, no
 bad, conflicting or unreadable Findings and no jobs; ClrMamePro and RomVault use region-priority parent/clone
 selection with no rule trace. Retool's filter-pipeline Selection is the best available, but it is unmaintained Python
@@ -23,5 +23,5 @@ approved option, gated on a conformance suite that uses the patched Retool as it
 ## Consequences
 
 - The image carries a Python runtime for Selection.
-- reprise maintains a small patch set against unmaintained upstream code, and shows clone-list and metadata drift
+- Title Select maintains a small patch set against unmaintained upstream code, and shows clone-list and metadata drift
   against each DAT Revision instead of hiding it.

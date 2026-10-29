@@ -4,8 +4,8 @@ use std::process::Command;
 
 use common::*;
 
-fn reprise() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_reprise"))
+fn title_select() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_title-select"))
 }
 
 fn pong_fixture() -> (Fixture, std::path::PathBuf) {
@@ -19,7 +19,7 @@ fn pong_fixture() -> (Fixture, std::path::PathBuf) {
 fn audit_prints_a_json_report_to_stdout() {
     let (f, dat) = pong_fixture();
 
-    let out = reprise()
+    let out = title_select()
         .arg("audit")
         .arg("--dat")
         .arg(&dat)
@@ -46,7 +46,7 @@ fn audit_writes_the_report_to_the_output_file() {
     let (f, dat) = pong_fixture();
     let output = f.dat_dir.path().join("report.json");
 
-    let out = reprise()
+    let out = title_select()
         .arg("audit")
         .arg("--dat")
         .arg(&dat)
@@ -78,7 +78,7 @@ fn audit_fails_with_a_message_for_an_unreadable_dat_or_a_missing_verified_set() 
         (not_xml.as_path(), f.set.path()),
         (dat.as_path(), missing_set.as_path()),
     ] {
-        let out = reprise()
+        let out = title_select()
             .arg("audit")
             .arg("--dat")
             .arg(dat)

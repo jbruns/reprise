@@ -37,7 +37,7 @@ if the Operator later wants ES-DE devices that read the Library directly to see 
 device, that would be a separately specified capability to publish ES-DE media and `gamelist.xml` into the Library.
 RomM cannot do it under `:ro` and must not be given write access. Nothing in #3 asks for this today.
 
-| | Organizer (reprise) | RomM (Media Server) |
+| | Organizer (Title Select) | RomM (Media Server) |
 | --- | --- | --- |
 | Library files and names | Publishes DAT-named files, loose or one ZIP per Game, into managed per-system folders | Reads only (`:ro`) |
 | Game identity | DAT Revision and Audit evidence | Its own match by folder, filename and hash, per provider |

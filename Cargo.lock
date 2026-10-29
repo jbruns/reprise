@@ -470,25 +470,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
-name = "reprise"
-version = "0.1.0"
-dependencies = [
- "clap",
- "crc32fast",
- "jiff",
- "md-5",
- "quick-xml",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "tempfile",
- "thiserror",
- "walkdir",
- "zip",
-]
-
-[[package]]
 name = "rustix"
 version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -646,6 +627,25 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "title-select"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "crc32fast",
+ "jiff",
+ "md-5",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "walkdir",
+ "zip",
 ]
 
 [[package]]

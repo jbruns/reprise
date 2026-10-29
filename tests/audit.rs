@@ -1,8 +1,8 @@
 mod common;
 
 use common::*;
-use reprise::{EvidenceLevel, Finding, GameStatus, audit};
 use sha2::Digest;
+use title_select::{EvidenceLevel, Finding, GameStatus, audit};
 
 #[test]
 fn loose_file_whose_payload_matches_its_named_rom_is_matched() {
@@ -17,7 +17,7 @@ fn loose_file_whose_payload_matches_its_named_rom_is_matched() {
     assert_eq!(report.games[0].status, GameStatus::Complete);
 }
 
-fn finding_of(report: &reprise::Report, path: &str) -> Finding {
+fn finding_of(report: &title_select::Report, path: &str) -> Finding {
     report
         .entries
         .iter()
@@ -26,7 +26,7 @@ fn finding_of(report: &reprise::Report, path: &str) -> Finding {
         .finding
 }
 
-fn status_of(report: &reprise::Report, game: &str) -> GameStatus {
+fn status_of(report: &title_select::Report, game: &str) -> GameStatus {
     report.games.iter().find(|g| g.name == game).unwrap().status
 }
 
