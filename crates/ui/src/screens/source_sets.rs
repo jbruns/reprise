@@ -1,0 +1,560 @@
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+use leptos::prelude::*;
+use leptos::tachys::view::any_view::AnyView;
+use leptos_router::components::A;
+use leptos_router::hooks::use_params_map;
+use leptos_struct_table::ColumnSort;
+use title_select_api::{
+    AddSourceSet, AuditSummary, Dat, Finding, GameStatus, Job, Root, SourceSetRecord, StartAudit,
+};
+
+use crate::api;
+use crate::app::{Loading, Problem, navigator};
+use crate::events::use_live;
+use crate::model::{
+    audit_choices, finding_label, game_status_label, needs_review_from_counts, short_sha, when,
+};
+use crate::screens::audit::{ReAudit, queued};
+use crate::table::{DataTable, Grid, Rows, rows_of, sort_of};
+
+#[derive(Clone, PartialEq)]
+struct SetItem {
+    set: SourceSetRecord,
+    latest: Option<AuditSummary>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SetCol {
+    Name,
+    Dat,
+    Location,
+    Latest,
+    LastVerified,
+}
+
+fn set_href(name: &str) -> String {
+    format!("/source-sets/{}", api::segment(name))
+}
+
+fn latest_view(latest: &Option<AuditSummary>) -> AnyView {
+    match latest {
+        Some(audit) => view! {
+            <A href=format!("/audits/{}", audit.id)>{format!("#{}", audit.id)}</A>
+            {format!(" · {}", when(&audit.finished_at))}
+        }
+        .into_any(),
+        None => "Never audited".into_any(),
+    }
+}
+
+impl Grid for SetItem {
+    type Col = SetCol;
+    const COLUMNS: &'static [SetCol] = &[
+        SetCol::Name,
+        SetCol::Dat,
+        SetCol::Location,
+        SetCol::Latest,
+        SetCol::LastVerified,
+    ];
+
+    fn header(col: SetCol) -> &'static str {
+        match col {
+            SetCol::Name => "Source Set",
+            SetCol::Dat => "DAT",
+            SetCol::Location => "Root and path",
+            SetCol::Latest => "Latest Audit",
+            SetCol::LastVerified => "Last verified against",
+        }
+    }
+
+    fn class(col: SetCol) -> &'static str {
+        match col {
+            SetCol::Location => "c-wide data",
+            _ => "c-wide",
+        }
+    }
+
+    fn sortable(col: SetCol) -> bool {
+        matches!(col, SetCol::Name | SetCol::Dat | SetCol::Latest)
+    }
+
+    fn cell(&self, col: SetCol) -> AnyView {
+        let set = &self.set;
+        match col {
+            SetCol::Name => {
+                let name = set.name.clone();
+                view! { <A href=set_href(&name)>{name}</A> }.into_any()
+            }
+            SetCol::Dat => set.dat.clone().into_any(),
+            SetCol::Location => format!("{}: {}", set.root, set.path).into_any(),
+            SetCol::Latest => latest_view(&self.latest),
+            SetCol::LastVerified => match &set.last_verified_against {
+                Some(last) => format!("{} ({})", last.version, short_sha(&last.sha256)).into_any(),
+                None => ().into_any(),
+            },
+        }
+    }
+}
+
+async fn sets_with_latest() -> Result<Vec<SetItem>, String> {
+    let sets: Vec<SourceSetRecord> = api::get("/source-sets").await?;
+    let mut items = Vec::with_capacity(sets.len());
+    for set in sets {
+        let history: Vec<AuditSummary> =
+            api::get(&format!("/source-sets/{}/history", api::segment(&set.name))).await?;
+        items.push(SetItem {
+            set,
+            latest: history.into_iter().next(),
+        });
+    }
+    Ok(items)
+}
+
+/// The registered Source Sets, and the form to register another.
+#[component]
+pub fn SourceSets() -> impl IntoView {
+    let live = use_live();
+    let sets = LocalResource::new(move || {
+        live.settled.track();
+        sets_with_latest()
+    });
+    let sorting = RwSignal::new(VecDeque::<(SetCol, ColumnSort)>::new());
+    let selected = RwSignal::new(None::<usize>);
+    let shown = Memo::new(move |_| {
+        let mut items = sets.get().and_then(Result::ok).unwrap_or_default();
+        if let Some(sort) = sorting.with(sort_of) {
+            items.sort_by(|a, b| {
+                let ord = match sort.column {
+                    SetCol::Dat => a.set.dat.cmp(&b.set.dat),
+                    SetCol::Latest => a
+                        .latest
+                        .as_ref()
+                        .map(|l| &l.finished_at)
+                        .cmp(&b.latest.as_ref().map(|l| &l.finished_at)),
+                    _ => a.set.name.cmp(&b.set.name),
+                };
+                if sort.descending { ord.reverse() } else { ord }
+            });
+        }
+        Arc::new(items)
+    });
+    let rows = Signal::derive(move || rows_of(shown.get().as_ref().clone()) as Rows<SetItem>);
+    let go = navigator();
+
+    view! {
+        <h1>"Source Sets"</h1>
+        <p class="lede">
+            "A Source Set is a folder in a Root, audited against its DAT. Open one to start an Audit or see its history."
+        </p>
+        {move || match sets.get() {
+            None => view! { <Loading what="the Source Sets" /> }.into_any(),
+            Some(Err(message)) => view! { <Problem message /> }.into_any(),
+            Some(Ok(_)) => ().into_any(),
+        }}
+        <DataTable
+            id="source-sets"
+            label="Source Sets".to_string()
+            rows
+            sorting
+            selected
+            on_open=Callback::new(move |item: SetItem| go.run(set_href(&item.set.name)))
+            empty="No Source Sets yet. Register a folder in a Root below.".to_string()
+        />
+        <Register on_added=Callback::new(move |name: String| go.run(set_href(&name))) />
+    }
+}
+
+#[component]
+fn Register(on_added: Callback<String>) -> impl IntoView {
+    let roots = LocalResource::new(|| api::get::<Vec<Root>>("/roots"));
+    let dats = LocalResource::new(|| api::get::<Vec<Dat>>("/dats"));
+    let root = RwSignal::new(String::new());
+    let path = RwSignal::new(String::new());
+    let dat = RwSignal::new(String::new());
+    let problem = RwSignal::new(None::<String>);
+    let busy = RwSignal::new(false);
+
+    let submit = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let request = AddSourceSet {
+            root: root.get_untracked(),
+            path: path.get_untracked().trim().to_string(),
+            dat: dat.get_untracked(),
+        };
+        busy.set(true);
+        leptos::task::spawn_local(async move {
+            let added = api::post::<_, SourceSetRecord>("/source-sets", &request).await;
+            busy.set(false);
+            match added {
+                Ok(set) => on_added.run(set.name),
+                Err(message) => problem.set(Some(message)),
+            }
+        });
+    };
+
+    Effect::new(move || {
+        if let Some(Ok(roots)) = roots.get()
+            && root.get_untracked().is_empty()
+            && let Some(first) = roots.first()
+        {
+            root.set(first.name.clone());
+        }
+    });
+    Effect::new(move || {
+        if let Some(Ok(dats)) = dats.get()
+            && dat.get_untracked().is_empty()
+            && let Some(first) = dats.first()
+        {
+            dat.set(first.dat.clone());
+        }
+    });
+
+    view! {
+        <section aria-labelledby="register-title">
+            <h2 id="register-title">"Register a Source Set"</h2>
+            <form class="form" on:submit=submit>
+                <label>
+                    "Root"
+                    <select required prop:value=root on:change=move |ev| root.set(event_target_value(&ev))>
+                        {move || {
+                            roots
+                                .get()
+                                .and_then(Result::ok)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|r| {
+                                    let label = format!("{} ({})", r.name, r.path);
+                                    view! { <option value=r.name>{label}</option> }
+                                })
+                                .collect_view()
+                        }}
+                    </select>
+                </label>
+                <label>
+                    "Path in the Root"
+                    <input
+                        type="text"
+                        required
+                        placeholder="Atari - 2600"
+                        prop:value=path
+                        on:input=move |ev| path.set(event_target_value(&ev))
+                    />
+                </label>
+                <label>
+                    "DAT"
+                    <select required prop:value=dat on:change=move |ev| dat.set(event_target_value(&ev))>
+                        {move || {
+                            dats.get()
+                                .and_then(Result::ok)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|d| view! { <option value=d.dat.clone()>{d.dat.clone()}</option> })
+                                .collect_view()
+                        }}
+                    </select>
+                </label>
+                <button type="submit" class="primary" disabled=busy>
+                    "Register"
+                </button>
+            </form>
+            {move || problem.get().map(|message| view! { <Problem message /> })}
+        </section>
+    }
+}
+
+#[derive(Clone)]
+struct HistoryItem {
+    audit: AuditSummary,
+    reaudit: ReAudit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum HistoryCol {
+    Audit,
+    Finished,
+    Revision,
+    Findings,
+    Games,
+    Action,
+}
+
+fn findings_text(audit: &AuditSummary) -> String {
+    Finding::ALL
+        .iter()
+        .filter_map(|f| {
+            audit
+                .findings
+                .get(f)
+                .filter(|n| **n > 0)
+                .map(|n| format!("{n} {}", finding_label(*f)))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn games_text(audit: &AuditSummary) -> String {
+    GameStatus::ALL
+        .iter()
+        .filter_map(|s| {
+            audit
+                .games
+                .get(s)
+                .map(|n| format!("{n} {}", game_status_label(*s)))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+impl Grid for HistoryItem {
+    type Col = HistoryCol;
+    const COLUMNS: &'static [HistoryCol] = &[
+        HistoryCol::Audit,
+        HistoryCol::Finished,
+        HistoryCol::Revision,
+        HistoryCol::Findings,
+        HistoryCol::Games,
+        HistoryCol::Action,
+    ];
+
+    fn header(col: HistoryCol) -> &'static str {
+        match col {
+            HistoryCol::Audit => "Audit",
+            HistoryCol::Finished => "Finished",
+            HistoryCol::Revision => "DAT Revision",
+            HistoryCol::Findings => "Findings",
+            HistoryCol::Games => "Game Statuses",
+            HistoryCol::Action => "Action",
+        }
+    }
+
+    fn class(col: HistoryCol) -> &'static str {
+        match col {
+            HistoryCol::Audit => "c-id",
+            HistoryCol::Finished => "c-time data",
+            HistoryCol::Revision => "c-revision",
+            HistoryCol::Findings => "c-wide",
+            HistoryCol::Games => "c-wide",
+            HistoryCol::Action => "c-action",
+        }
+    }
+
+    fn cell(&self, col: HistoryCol) -> AnyView {
+        let audit = &self.audit;
+        match col {
+            HistoryCol::Audit => view! {
+                <A href=format!("/audits/{}", audit.id)>{format!("#{}", audit.id)}</A>
+                {audit.pruned.then_some(view! { " " <span class="tag">"Pruned"</span> })}
+            }
+            .into_any(),
+            HistoryCol::Finished => when(&audit.finished_at).into_any(),
+            HistoryCol::Revision => format!(
+                "{} ({})",
+                audit.dat_revision_version,
+                short_sha(&audit.dat_revision_sha256)
+            )
+            .into_any(),
+            HistoryCol::Findings => {
+                let review = needs_review_from_counts(&audit.findings);
+                format!("{review} Needs Review · {}", findings_text(audit)).into_any()
+            }
+            HistoryCol::Games => games_text(audit).into_any(),
+            HistoryCol::Action => {
+                let reaudit = self.reaudit;
+                let label = format!(
+                    "Re-audit against DAT Revision {}",
+                    audit.dat_revision_version
+                );
+                view! {
+                    <button type="button" class="small" aria-label=label.clone() title=label on:click=move |_| reaudit.start()>
+                        "Re-audit"
+                    </button>
+                }
+                .into_any()
+            }
+        }
+    }
+}
+
+/// One Source Set: its latest Audit, starting an Audit, and its history.
+#[component]
+pub fn SourceSet() -> impl IntoView {
+    let params = use_params_map();
+    let name = Memo::new(move |_| params.read().get("name").unwrap_or_default());
+    let set = LocalResource::new(move || {
+        let name = name.get();
+        async move {
+            api::get::<SourceSetRecord>(&format!("/source-sets/{}", api::segment(&name))).await
+        }
+    });
+    move || match set.get() {
+        None => view! { <Loading what="the Source Set" /> }.into_any(),
+        Some(Err(message)) => view! {
+            <h1>"Source Set"</h1>
+            <Problem message />
+        }
+        .into_any(),
+        Some(Ok(set)) => view! { <SourceSetView set /> }.into_any(),
+    }
+}
+
+#[component]
+fn SourceSetView(set: SourceSetRecord) -> impl IntoView {
+    let live = use_live();
+    let name = StoredValue::new(set.name.clone());
+    let history = LocalResource::new(move || {
+        live.settled.track();
+        let path = format!("/source-sets/{}/history", api::segment(&name.get_value()));
+        async move { api::get::<Vec<AuditSummary>>(&path).await }
+    });
+    let dats = LocalResource::new(|| api::get::<Vec<Dat>>("/dats"));
+    let outcome = RwSignal::new(None::<Result<Job, String>>);
+    let sorting = RwSignal::new(VecDeque::<(HistoryCol, ColumnSort)>::new());
+    let selected = RwSignal::new(None::<usize>);
+    let items = Memo::new(move |_| {
+        let audits = history.get().and_then(Result::ok).unwrap_or_default();
+        let items: Vec<HistoryItem> = audits
+            .into_iter()
+            .map(|audit| HistoryItem {
+                reaudit: ReAudit::new(
+                    audit.source_set.clone(),
+                    audit.dat_revision_sha256.clone(),
+                    outcome,
+                ),
+                audit,
+            })
+            .collect();
+        Arc::new(ItemsById(items))
+    });
+    let rows = Signal::derive(move || rows_of(items.get().0.clone()) as Rows<HistoryItem>);
+    let go = navigator();
+
+    let bound = set.dat.clone();
+    let choices = Memo::new(move |_| {
+        let audits = history.get().and_then(Result::ok).unwrap_or_default();
+        let revisions = dats
+            .get()
+            .and_then(Result::ok)
+            .and_then(|dats| dats.into_iter().find(|d| d.dat == bound))
+            .map(|d| d.revisions)
+            .unwrap_or_default();
+        let (default, newer) = audit_choices(&audits, &revisions);
+        (
+            default.cloned(),
+            newer.into_iter().cloned().collect::<Vec<_>>(),
+        )
+    });
+    let revision = RwSignal::new(String::new());
+    let start = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let chosen = revision.get_untracked();
+        let request = StartAudit {
+            source_set: name.get_value(),
+            revision: (!chosen.is_empty()).then_some(chosen),
+        };
+        leptos::task::spawn_local(async move {
+            outcome.set(Some(api::post::<_, Job>("/audits", &request).await));
+        });
+    };
+
+    view! {
+        <h1>{set.name.clone()}</h1>
+        <dl class="facts">
+            <dt>"DAT"</dt>
+            <dd>{set.dat.clone()}</dd>
+            <dt>"Root and path"</dt>
+            <dd>
+                <code class="path">{format!("{}: {}", set.root, set.path)}</code>
+            </dd>
+            <dt>"Registered"</dt>
+            <dd>{when(&set.added_at)}</dd>
+            <dt>"Latest Audit"</dt>
+            <dd>
+                {move || {
+                    let latest = history.get().and_then(Result::ok).and_then(|h| h.into_iter().next());
+                    latest_view(&latest)
+                }}
+            </dd>
+            <dt>"Last verified against"</dt>
+            <dd>
+                {set
+                    .last_verified_against
+                    .clone()
+                    .map_or("Never".to_string(), |last| format!("{} ({})", last.version, when(&last.finished_at)))}
+                " "
+                {set.last_verified_against.clone().map(|last| view! { <code class="hash">{last.sha256}</code> })}
+            </dd>
+        </dl>
+
+        <section aria-labelledby="start-title">
+            <h2 id="start-title">"Start an Audit"</h2>
+            <form class="form" on:submit=start>
+                <label>
+                    "DAT Revision"
+                    <select prop:value=revision on:change=move |ev| revision.set(event_target_value(&ev))>
+                        {move || {
+                            let (default, newer) = choices.get();
+                            let default = match default {
+                                Some(r) => {
+                                    format!("{} ({}), the default", r.version, short_sha(&r.sha256))
+                                }
+                                None => "The default".to_string(),
+                            };
+                            view! {
+                                <option value="">{default}</option>
+                                {newer
+                                    .into_iter()
+                                    .map(|r| {
+                                        let label = format!("{} ({}), newer", r.version, short_sha(&r.sha256));
+                                        view! { <option value=r.sha256>{label}</option> }
+                                    })
+                                    .collect_view()}
+                            }
+                        }}
+                    </select>
+                </label>
+                <button type="submit" class="primary">
+                    "Start Audit"
+                </button>
+            </form>
+            {move || {
+                outcome
+                    .get()
+                    .map(|outcome| match outcome {
+                        Ok(job) => queued(&job).into_any(),
+                        Err(message) => view! { <Problem message /> }.into_any(),
+                    })
+            }}
+        </section>
+
+        <section aria-labelledby="history-title">
+            <h2 id="history-title">"History"</h2>
+            <p class="lede">"Latest first. A pruned Audit keeps only its summary."</p>
+            {move || match history.get() {
+                None => view! { <Loading what="the history" /> }.into_any(),
+                Some(Err(message)) => view! { <Problem message /> }.into_any(),
+                Some(Ok(_)) => ().into_any(),
+            }}
+            <DataTable
+                id="history"
+                label="History".to_string()
+                rows
+                sorting
+                selected
+                on_open=Callback::new(move |item: HistoryItem| go.run(format!("/audits/{}", item.audit.id)))
+                empty="Not audited yet.".to_string()
+            />
+        </section>
+    }
+}
+
+/// History items compare by Audit, so a refetch that changes nothing does not reload the table.
+struct ItemsById(Vec<HistoryItem>);
+
+impl PartialEq for ItemsById {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self.0.iter().zip(&other.0).all(|(a, b)| a.audit == b.audit)
+    }
+}
