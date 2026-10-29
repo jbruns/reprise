@@ -1,0 +1,29 @@
+[package]
+name = "title-select-ui"
+description = "Title Select's workbench: a Leptos client-side UI over the /api/v1 JSON API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# cargo-leptos builds the cdylib to WASM; the rlib lets the pure logic be tested on the host.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The `/bench` screen over synthetic Entries, for crates/ui/bench/filter.py. Never in a release or the image.
+bench = []
+
+[dependencies]
+title-select-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
+js-sys = "0.3.106"
+leptos = { version = "0.8.22", features = ["csr"] }
+leptos-struct-table = "0.19.1"
+leptos_router = "0.8.17"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = ["EventSource", "MessageEvent", "FormData", "HtmlInputElement", "HtmlFormElement", "File", "FileList", "KeyboardEvent", "Element", "HtmlElement", "Event", "EventTarget", "Window", "Document", "Performance"] }

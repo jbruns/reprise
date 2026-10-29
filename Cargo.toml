@@ -29,3 +29,22 @@ thiserror = "2.0.21"
 toml = "1.1.8"
 walkdir = "2.5.0"
 zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
+
+# `cargo leptos build --release` builds the workbench (crates/ui) to WebAssembly into target/site, which
+# `title-select serve --ui target/site` serves, and the Service binary beside it.
+[[workspace.metadata.leptos]]
+name = "title-select"
+bin-package = "title-select"
+lib-package = "title-select-ui"
+output-name = "title-select"
+site-root = "target/site"
+site-pkg-dir = "pkg"
+style-file = "crates/ui/style/main.css"
+assets-dir = "crates/ui/assets"
+browserquery = "defaults and fully supports wasm"
+lib-profile-release = "wasm-release"
+
+[profile.wasm-release]
+inherits = "release"
+lto = true
+codegen-units = 1

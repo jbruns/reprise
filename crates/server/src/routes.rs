@@ -7,10 +7,10 @@ use std::sync::Arc;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Extension, Json, Router, middleware};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -22,6 +22,8 @@ use title_select_store::config::Config;
 use title_select_store::{Error, Store, Workers};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
+use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::auth::{Actor, Auth, require_operator};
 use crate::jobs::Jobs;
@@ -41,7 +43,7 @@ pub struct AppState {
     pub workers: Workers,
 }
 
-pub fn router(state: AppState, auth: Arc<Auth>) -> Router {
+pub fn router(state: AppState, auth: Arc<Auth>, ui: Option<&std::path::Path>) -> Router {
     let operator = Router::new()
         .route("/roots", get(roots))
         .route("/dats", get(dats))
@@ -69,11 +71,50 @@ pub fn router(state: AppState, auth: Arc<Auth>) -> Router {
         .route("/health", get(health))
         .merge(operator)
         .fallback(not_found);
-    Router::new()
+    let app = Router::new()
         .nest(title_select_api::PREFIX, api)
-        .fallback(not_found)
-        .with_state(state)
+        .route("/api", any(not_found))
+        .route("/api/{*rest}", any(not_found))
+        .with_state(state);
+    match ui {
+        Some(dir) => app.merge(workbench(dir)),
+        None => app.fallback(not_found),
+    }
 }
+
+/// The workbench's bundle. Its assets are public; everything it shows comes from the API, which is not. Any path
+/// that is not an asset is a workbench screen, so it gets `workbench.html` (cargo-leptos reserves `index.html`).
+fn workbench(dir: &std::path::Path) -> Router {
+    let files = ServeDir::new(dir)
+        .append_index_html_on_directories(false)
+        .precompressed_br()
+        .precompressed_gzip()
+        .fallback(ServeFile::new(dir.join("workbench.html")));
+    Router::new()
+        .fallback_service(files)
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(WORKBENCH_CSP),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        ))
+}
+
+/// Same-origin only. WebAssembly needs `wasm-unsafe-eval`; the table library positions its placeholder rows with
+/// inline styles.
+const WORKBENCH_CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
+    style-src 'self' 'unsafe-inline'; img-src 'self'; font-src 'self'; connect-src 'self'; \
+    frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
 pub fn error_response(status: StatusCode, error: String, job: Option<i64>) -> Response {
     (status, Json(ErrorBody { error, job })).into_response()

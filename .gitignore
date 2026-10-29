@@ -5,3 +5,4 @@
 
 # Per-issue agent worktrees
 .worktrees/
+/.venv/

@@ -72,6 +72,9 @@ enum Command {
         /// The address to listen on.
         #[arg(long, env = "TITLE_SELECT_LISTEN", default_value = "127.0.0.1:8080")]
         listen: SocketAddr,
+        /// The workbench's built bundle (`target/site` after `cargo leptos build`), served at `/`.
+        #[arg(long, env = "TITLE_SELECT_UI")]
+        ui: Option<PathBuf>,
     },
 }
 
@@ -184,13 +187,14 @@ fn run(cli: Cli) -> Result<(), String> {
             write_report(&audit.report, output)
         }
         Command::Audit { .. } => unreachable!("clap requires --dat with a directory, or --set"),
-        Command::Serve { listen } => {
+        Command::Serve { listen, ui } => {
             let store = store.ok_or("no store: pass --store <dir> or set TITLE_SELECT_STORE")?;
             title_select_server::run(Settings {
                 store: store.to_path_buf(),
                 config: load_config(config)?,
                 listen,
                 token_file: cli.token_file,
+                ui,
                 hold_jobs: false,
             })
             .map_err(|e| e.to_string())
