@@ -2,8 +2,8 @@
 
 Audits ROM collections against DAT files, and records exactly what was verified and against which DAT revision.
 
-Status: early pilot. A headless Audit command and a store of DAT Revisions, Source Sets and Audits; Selection,
-Change Plans and a service follow.
+Status: early pilot. A headless Audit command, a store of DAT Revisions, Source Sets and Audits, and the Service: a
+JSON API that runs Audits as durable Jobs. Selection, Change Plans and a UI follow.
 Vocabulary is defined in [GLOSSARY.md](GLOSSARY.md), decisions in [docs/adr/](docs/adr/).
 
 ## Audit
@@ -101,6 +101,17 @@ writable = false            # the default; every Root is read-only until Change 
 
 [audits]
 keep = 20                   # full Audits kept per Source Set (the default)
+
+[auth]                      # how the Service knows the Operator; see "Service"
+identity_header = "Remote-User"
+trusted_proxies = ["10.0.0.0/8"]
+# dev_identity = "Developer"
+
+[jobs]
+concurrent = 1              # Jobs run at once (the default)
+pace = "default"            # gentle | default | unthrottled
+# readers = 2               # overrides the pace's payload readers
+# hashers = 2               # overrides the pace's hash workers
 ```
 
 ## Commands
@@ -136,6 +147,133 @@ Revision is the latest Audit's, else the newest imported revision of the bound D
 only by naming it. The Entries and Game Statuses are written in one transaction when the Audit finishes, and the report
 below is generated from them. Afterwards, Audits beyond the newest `audits.keep` are pruned to a one-row summary; the
 latest Audit, and any Audit cited as provenance, are never pruned.
+
+## Service
+
+```sh
+title-select serve [--listen <address:port>]
+```
+
+Runs the Service: the `/api/v1` JSON API, and the Jobs that run Audits (ADR 0003). It listens on `--listen` or
+`TITLE_SELECT_LISTEN`, by default `127.0.0.1:8080`, and holds the store, and its lock, until it stops on SIGTERM or
+Ctrl-C. While it runs, the store commands above fail with "the store is in use"; use the API, or the headless Audit
+below, instead. This is the supported way to operate Title Select on the Host.
+
+### Auth
+
+Every API path but `/api/v1/health` needs the Operator (ADR 0004). The Service refuses to start without a way to
+authenticate the Operator:
+
+- `[auth] identity_header` with `[auth] trusted_proxies`: an authenticating reverse proxy sets the header to the
+  Operator's identity. The header is trusted only from a peer inside one of the CIDRs, and a request carrying it from
+  any other peer is rejected. The identity is recorded as the actor of each Job the request starts.
+- The Operator token: a file named by `TITLE_SELECT_OPERATOR_TOKEN_FILE` (or `--token-file`) holds a secret, sent as
+  `Authorization: Bearer <token>`. The Service keeps only its SHA-256 and compares in constant time. Jobs it starts
+  record the actor `Operator token`.
+- `[auth] dev_identity`, for local development: a request with no credential is the Operator under that identity. The
+  Service refuses to start with it unless it listens on a loopback address.
+
+Any other request, or a wrong token, gets `401`.
+
+### Jobs
+
+An Audit started through the API is a Job: `queued`, `running`, then `succeeded` or `failed`. Each change of state is
+one transaction, and a Job runs to the end whether or not its client stays connected. The DAT Revision is chosen when
+the Job is queued, as for `audit --set`, and its file is kept until the Job ends. A Source Set has at most one queued
+or running Job; starting another is refused with `409`, naming the Job.
+
+A Job found running when the Service starts was cut off by a stop: its unfinished Audit is discarded, the Job becomes
+`interrupted`, and a fresh Job (attempt 2) is queued for it. If that Job is cut off too, it becomes `failed`.
+
+`[jobs] concurrent` Jobs run at once, 1 by default. Each Audit reads payloads on `readers` threads, which also
+decompress ZIP members, and checksums them on `hashers` threads. The pace sets both:
+
+| `pace`        | readers | hashers | for                                                          |
+|---------------|---------|---------|--------------------------------------------------------------|
+| `gentle`      | 1       | 1       | one file at a time, leaving disks and CPUs to other Services |
+| `default`     | 2       | 2       | the default: overlaps one file's reading with another's hash |
+| `unthrottled` | CPUs    | CPUs    | one of each per CPU, for an otherwise idle Host              |
+
+`[jobs] readers` or `hashers` overrides the pace's count. A Job records the counts it was queued with.
+
+### API
+
+Every body is JSON, and every error is `{"error": "...", "job": <id, when one is named>}`.
+
+| Method and path                                    | What                                                         |
+|----------------------------------------------------|--------------------------------------------------------------|
+| `GET /api/v1/health`                               | `{"status": "ok"}`, unauthenticated                          |
+| `GET /api/v1/roots`                                | the configured Roots                                         |
+| `GET /api/v1/dats`                                 | each DAT with its DAT Revisions                              |
+| `GET /api/v1/dat-revisions`                        | every DAT Revision                                           |
+| `POST /api/v1/dat-revisions`                       | import a DAT: multipart `provider`, `source_url`?, `file`    |
+| `GET /api/v1/source-sets`                          | the Source Sets, with the DAT Revision last verified against |
+| `POST /api/v1/source-sets`                         | register one: `{"root", "path", "dat"}`                      |
+| `GET /api/v1/source-sets/{name}`                   | one Source Set                                               |
+| `GET /api/v1/source-sets/{name}/history`           | its Audits, latest first                                     |
+| `POST /api/v1/audits`                              | queue an Audit Job: `{"source_set", "revision"?}`; `202`     |
+| `GET /api/v1/audits/{id}`                          | an Audit's summary                                           |
+| `GET /api/v1/audits/{id}/report`                   | the full `schema: 2` report                                  |
+| `GET /api/v1/audits/{id}/entries`                  | Entries, paged; `?finding=`                                  |
+| `GET /api/v1/audits/{id}/entries.ndjson`           | every Entry, one JSON object per line                        |
+| `GET /api/v1/audits/{id}/games`                    | Game Statuses, paged; `?status=`                             |
+| `GET /api/v1/jobs`                                 | the latest 100 Jobs, newest first                            |
+| `GET /api/v1/jobs/{id}`                            | one Job                                                      |
+| `GET /api/v1/jobs/{id}/events`                     | server-sent events for one Job, ending at its final state    |
+| `GET /api/v1/events`                               | server-sent events for every Job, opening with a `resync`    |
+
+A paged list is `{"items": [...], "next_cursor": "..."}`; pass `next_cursor` back as `?cursor=` for the next page, and
+`?limit=` (1 to 1000, default 100) for its size. Each item carries its `seq`, its position in the report. A DAT upload
+may be up to 512 MiB, and is `201` when it adds a DAT Revision, `200` when the bytes were already imported.
+
+Server-sent events carry JSON data, under one of these event names:
+
+| Event      | Data                                   | Sent                                                         |
+| ---------- | -------------------------------------- | ------------------------------------------------------------ |
+| `state`    | the Job                                | when a Job's state changes; first on a Job's own stream      |
+| `progress` | `{"job", "files_done", "files_total"}` | while a Job is Running, at most five times a second          |
+| `resync`   | `{"jobs": [...]}`, newest first        | by `/events` on connecting, and after the client fell behind |
+
+A `resync` lists every Queued or Running Job and the 50 most recently finished; it replaces what the client knew,
+since events in between may have been dropped. An idle stream sends a comment every 15 seconds.
+
+Every Job carries a `version` that goes up with each change of its state, and `progress` carries the `version` of the
+Running Job it belongs to. The Service drops events that a `resync` or a later `state` already superseded, and a
+client should do the same: ignore a `state` whose `version` is at or below the one it holds for that Job, and
+`progress` whose `version` is below it.
+
+### Headless Audit
+
+```sh
+title-select audit --server <url> --set <Source Set> [--revision <sha256 prefix>] [--output <report file>]
+```
+
+Starts an Audit Job on the Service at `<url>`, sending the Operator token from `TITLE_SELECT_OPERATOR_TOKEN_FILE` (or
+`--token-file`), and follows it to the end. Progress and a summary of the Findings and Game Statuses go to stderr; the
+report goes to stdout, or to `--output`. If the Job's event stream sends nothing, not even its keep-alive, for 45
+seconds, the client polls the Job's state instead. Exits 0 when the Audit completes, and non-zero when the Job fails,
+the token is refused or the Service cannot be reached.
+
+### Image
+
+`ghcr.io/jbruns/title-select` is a static binary on `gcr.io/distroless/static:nonroot`, for linux/amd64. It runs
+`serve` on `0.0.0.0:8080` as the nonroot user, with the store at the volume `/store`, and needs nothing else writable,
+so it runs with a read-only root filesystem:
+
+```sh
+docker run --read-only -p 8080:8080 -v title-select-store:/store \
+  -v /path/to/token:/run/operator-token:ro -e TITLE_SELECT_OPERATOR_TOKEN_FILE=/run/operator-token \
+  -v /path/to/title-select.toml:/etc/title-select.toml:ro -e TITLE_SELECT_CONFIG=/etc/title-select.toml \
+  -v /data/source-sets:/data/source-sets:ro ghcr.io/jbruns/title-select:sha-<commit>
+```
+
+CI publishes `sha-<commit>` (the full commit SHA) for each push to `main`, and `<version>` and `<major>.<minor>` for
+each `v<version>` tag.
+
+## Development
+
+A Cargo workspace: `crates/api` (the API's and the report's types), `crates/engine` (the Audit), `crates/store`
+(the store and configuration), `crates/server` (the Service) and `crates/cli` (the `title-select` binary).
 
 ## Licence
 

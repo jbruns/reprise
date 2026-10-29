@@ -1,3 +1,4 @@
+#[path = "../../engine/tests/common/mod.rs"]
 mod common;
 
 use std::process::Command;

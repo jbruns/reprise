@@ -8,7 +8,10 @@ use rusqlite::Connection;
 use super::{BACKUPS, Error, Result, io_error};
 
 /// Applied in order; `PRAGMA user_version` counts those already applied.
-pub(super) const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_initial.sql")];
+pub(super) const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_initial.sql"),
+    include_str!("migrations/0002_jobs.sql"),
+];
 
 pub(super) fn migrate(conn: &mut Connection, dir: &Path, migrations: &[&str]) -> Result<()> {
     let applied: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -21,7 +24,8 @@ pub(super) fn migrate(conn: &mut Connection, dir: &Path, migrations: &[&str]) ->
         )));
     }
     for (version, sql) in migrations.iter().enumerate().skip(applied) {
-        if version > 0 {
+        // A store opened with no schema has nothing to protect.
+        if applied > 0 {
             backup(conn, dir, version)?;
         }
         let tx = conn.transaction()?;

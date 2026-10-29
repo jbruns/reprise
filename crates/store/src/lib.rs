@@ -2,7 +2,9 @@
 
 mod audits;
 mod blobs;
+pub mod config;
 mod dats;
+mod jobs;
 mod migrations;
 mod sets;
 
@@ -13,9 +15,12 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
-pub use audits::{AuditSummary, StoredAudit};
-pub use dats::{DatRevisionRecord, ImportOutcome};
-pub use sets::{LastVerified, SourceSetRecord};
+pub use audits::StoredAudit;
+pub use jobs::Interruption;
+pub use title_select_api::{
+    AuditSummary, DatRevisionRecord, ImportOutcome, Job, JobState, LastVerified, SourceSetRecord,
+    Workers,
+};
 
 /// The database's file name in the store directory.
 pub const DATABASE: &str = "title-select.sqlite";
@@ -39,8 +44,14 @@ pub enum Error {
     /// The request cannot be carried out as asked.
     #[error("{0}")]
     Refused(String),
+    /// What the request names does not exist.
+    #[error("{0}")]
+    NotFound(String),
+    /// A Source Set already has an Audit Job Queued or Running.
+    #[error("Source Set {source_set} already has an active Audit: Job {job}")]
+    JobActive { source_set: String, job: i64 },
     #[error(transparent)]
-    Audit(#[from] crate::Error),
+    Audit(#[from] title_select_engine::Error),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -210,8 +221,8 @@ mod tests {
     #[test]
     fn a_migration_runs_after_backing_up_the_database() {
         let dir = tempfile::tempdir().unwrap();
-        let first = migrations::MIGRATIONS[0];
-        let store = Store::open_with(dir.path(), &[first]).unwrap();
+        let current = migrations::MIGRATIONS;
+        let store = Store::open_with(dir.path(), current).unwrap();
         let blob = store.dir().join("dat.dat");
         std::fs::write(&blob, DAT).unwrap();
         store.import_dat(&blob, "Test", None).unwrap();
@@ -219,7 +230,7 @@ mod tests {
         assert!(!dir.path().join(BACKUPS).exists());
 
         let second = "CREATE TABLE later (x INTEGER);";
-        let store = Store::open_with(dir.path(), &[first, second]).unwrap();
+        let store = Store::open_with(dir.path(), &[current, &[second]].concat()).unwrap();
 
         let backups: Vec<_> = std::fs::read_dir(dir.path().join(BACKUPS))
             .unwrap()
@@ -227,13 +238,14 @@ mod tests {
             .collect();
         assert_eq!(backups.len(), 1);
         let backup = Connection::open(&backups[0]).unwrap();
-        assert_eq!(pragma(&backup, "user_version"), "Integer(1)");
+        let before = format!("Integer({})", current.len());
+        assert_eq!(pragma(&backup, "user_version"), before);
         let revisions: i64 = backup
             .query_row("SELECT count(*) FROM dat_revisions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(revisions, 1);
         let version = store.read(|c| Ok(pragma(c, "user_version"))).unwrap();
-        assert_eq!(version, "Integer(2)");
+        assert_eq!(version, format!("Integer({})", current.len() + 1));
     }
 
     #[test]

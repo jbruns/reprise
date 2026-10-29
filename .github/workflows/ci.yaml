@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -24,6 +25,69 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  image:
+    name: image build, smoke test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: title-select:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # The Service must start with a read-only root filesystem, writing only to its store volume.
+      - name: smoke test
+        run: |
+          token="$(openssl rand -hex 32)"
+          printf '%s\n' "$token" > "$RUNNER_TEMP/token"
+          chmod 644 "$RUNNER_TEMP/token"
+          printf 'Authorization: Bearer %s' "$token" > "$RUNNER_TEMP/auth-header"
+          docker run --detach --name service --read-only -p 8080:8080 \
+            -v title-select-store:/store -v "$RUNNER_TEMP/token:/run/operator-token:ro" \
+            -e TITLE_SELECT_OPERATOR_TOKEN_FILE=/run/operator-token title-select:ci
+          for _ in $(seq 30); do curl -fsS localhost:8080/api/v1/health && break; sleep 1; done
+          curl -fsS -H @"$RUNNER_TEMP/auth-header" localhost:8080/api/v1/jobs
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/api/v1/jobs)" = 401
+      - if: always()
+        run: docker logs service
+
+  publish:
+    name: publish image
+    if: github.event_name == 'push'
+    needs: [rust, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/jbruns/title-select
+          tags: |
+            type=sha,format=long
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
 
   gitleaks:
     name: gitleaks
