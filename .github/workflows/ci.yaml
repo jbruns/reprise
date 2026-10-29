@@ -26,6 +26,7 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       # The workbench as the browser runs it; the image build compiles it the same way.
       - run: cargo clippy --package title-select-ui --target wasm32-unknown-unknown --locked -- -D warnings
+      - run: cargo clippy --package title-select-ui --target wasm32-unknown-unknown --features bench --locked -- -D warnings
       - run: cargo test --locked
 
   image:

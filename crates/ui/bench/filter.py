@@ -1,17 +1,28 @@
 """Keystroke-to-render time of the Audit screen's Entry filter over synthetic Entries, in headless Chromium.
 
-Not a CI gate. Needs a Service serving the workbench (see README, "Workbench") and Playwright for Python:
+Not a CI gate. Needs cargo-leptos, the wasm32-unknown-unknown target and Playwright for Python. Run it from the
+repository's root:
 
     python3 -m venv .venv && .venv/bin/pip install playwright && .venv/bin/playwright install chromium
-    .venv/bin/python crates/ui/bench/filter.py [--url http://127.0.0.1:8080] [--entries 100000] [--rounds 5]
+    .venv/bin/python crates/ui/bench/filter.py [--entries 100000] [--rounds 5]
 
-The workbench's `/bench` screen renders the Audit screen's Entries panel over deterministic synthetic Entries; it
-reads nothing from the Service. Each sample starts at the keydown's own timestamp and ends after the first frame
+The `/bench` screen exists only with the workbench's `bench` feature, which no release or image has. So the script
+builds the workbench with it into target/bench/site, runs the Service on a loopback port with a scratch store and
+`[auth] dev_identity` under target/bench, measures, and stops the Service. With `--url`, it measures a Service already
+serving a `bench` build instead. The screen renders the Audit screen's Entries panel over deterministic synthetic
+Entries; it reads nothing from the Service. Each sample starts at the keydown's own timestamp and ends after the first frame
 painted once the shown count reflects the new text and every rendered row is new and matches it.
 """
 
 import argparse
+import os
+import socket
 import statistics
+import subprocess
+import time
+import urllib.request
+from contextlib import contextmanager
+from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
@@ -60,19 +71,66 @@ def percentile(samples, p):
     return ordered[min(len(ordered) - 1, round(p / 100 * (len(ordered) - 1)))]
 
 
+@contextmanager
+def bench_service():
+    """Builds the workbench with the `bench` feature and serves it; yields the Service's URL."""
+    work = Path("target/bench").resolve()
+    site = work / "site"
+    subprocess.run(
+        ["cargo", "leptos", "build", "--release", "--lib-features", "bench"],
+        check=True,
+        env={**os.environ, "LEPTOS_SITE_ROOT": str(site)},
+    )
+    (work / "roots").mkdir(parents=True, exist_ok=True)
+    config = work / "title-select.toml"
+    config.write_text(f'[roots.bench]\npath = "{work / "roots"}"\n\n[auth]\ndev_identity = "Benchmark"\n')
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    url = f"http://127.0.0.1:{port}"
+    service = subprocess.Popen(
+        ["target/release/title-select", "--store", str(work / "store"), "--config", str(config),
+         "serve", "--listen", f"127.0.0.1:{port}", "--ui", str(site)]
+    )
+    try:
+        for _ in range(100):
+            try:
+                urllib.request.urlopen(f"{url}/api/v1/health")
+                break
+            except OSError:
+                time.sleep(0.1)
+        yield url
+    finally:
+        service.terminate()
+        service.wait()
+
+
+@contextmanager
+def given(url):
+    yield url
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--url", default="http://127.0.0.1:8080")
+    parser.add_argument("--url", help="a Service already serving a `bench` build of the workbench")
     parser.add_argument("--entries", type=int, default=100_000)
     parser.add_argument("--rounds", type=int, default=5)
     args = parser.parse_args()
 
+    with (given(args.url) if args.url else bench_service()) as url:
+        samples, version = measure(url, args)
+    print(f"{len(samples)} keystrokes after one warm-up round over {args.entries} Entries; {version}")
+    print(f"p50 {statistics.median(samples):.1f} ms, p95 {percentile(samples, 95):.1f} ms, max {max(samples):.1f} ms")
+
+
+def measure(url, args):
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1440, "height": 1000})
-        page.goto(f"{args.url}/bench?entries={args.entries}")
+        page.goto(f"{url}/bench?entries={args.entries}")
         page.wait_for_selector("tbody tr[id]", timeout=120_000)
-        print(f"{page.text_content('p.shown')} loaded; {browser.version}")
+        print(f"{page.text_content('p.shown')} loaded")
+        version = browser.version
         page.evaluate(SETUP)
         field = page.locator(".filter-text")
         field.focus()
@@ -90,9 +148,7 @@ def main():
                     if round_ > 0:
                         samples.append(sample)
         browser.close()
-
-    print(f"{len(samples)} keystrokes after one warm-up round over {args.entries} Entries")
-    print(f"p50 {statistics.median(samples):.1f} ms, p95 {percentile(samples, 95):.1f} ms, max {max(samples):.1f} ms")
+    return samples, version
 
 
 if __name__ == "__main__":

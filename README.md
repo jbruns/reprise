@@ -311,8 +311,17 @@ printf '[roots.sets]\npath = "/data/source-sets"\n\n[auth]\ndev_identity = "Deve
 target/release/title-select --store dev-store --config dev.toml serve --ui target/site
 ```
 
-Then open `http://127.0.0.1:8080/`. `crates/ui/bench/filter.py` measures the Audit screen's filtering over 100,000
-synthetic Entries in headless Chromium; its docstring says how to run it.
+Then open `http://127.0.0.1:8080/`.
+
+`crates/ui/bench/filter.py` measures the Audit screen's filtering over 100,000 synthetic Entries in headless Chromium.
+It builds the workbench with the `bench` feature, which adds a `/bench` screen of synthetic Entries that no release or
+image has, serves it on a loopback port with a scratch store under `target/bench`, and reports p50 and p95. It needs
+Playwright for Python; from the repository's root:
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install playwright && .venv/bin/playwright install chromium
+.venv/bin/python crates/ui/bench/filter.py
+```
 
 ## Development
 

@@ -4,7 +4,13 @@ use leptos_router::hooks::use_navigate;
 use leptos_router::path;
 
 use crate::events::{Stream, provide_live, use_live};
-use crate::screens::{AuditScreen, Bench, DatRevisions, Jobs, SourceSet, SourceSets};
+#[cfg(feature = "bench")]
+use crate::screens::Bench;
+use crate::screens::{AuditScreen, DatRevisions, Jobs, SourceSet, SourceSets};
+
+/// Without the `bench` feature, `/bench` is not a screen.
+#[cfg(not(feature = "bench"))]
+use NotFound as Bench;
 
 /// The workbench: a bar of screens over the routes.
 #[component]

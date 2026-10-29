@@ -11,6 +11,10 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# The `/bench` screen over synthetic Entries, for crates/ui/bench/filter.py. Never in a release or the image.
+bench = []
+
 [dependencies]
 title-select-api.workspace = true
 serde.workspace = true
