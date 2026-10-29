@@ -1,0 +1,29 @@
+Method: built-in image-generation tool, transparent backgrounds enabled.
+
+Primary logo edit prompt:
+Edit this logo with one specific brand-name change. Change the TOP word from "LEVEL" to exactly "TITLE". Keep the BOTTOM word exactly "SELECT". The final brand name must be TITLE SELECT, stacked on two lines. Preserve the left three-bar menu selector emblem, including its triangle cursor and four corner brackets, its proportions and styling. Preserve the forward-slanted bold geometric block lettering style, optical weight, flat cobalt blue #1847D1, comfortable word spacing, original relative layout, and generous transparent padding. Draw TITLE to match the same width and weight as the previous top word; use carefully balanced custom letter spacing. Keep the output genuinely transparent. Do not add any text, slogan, background, texture, gradients, shadow, extrusion or other graphic elements. One clean horizontal logo lockup, exactly "TITLE" above "SELECT", selector emblem at left.
+
+Simplified selector icon prompt:
+Edit the supplied LEVEL SELECT logo. Create a standalone small-size selector emblem only. Remove all wordmark letters. Use the left emblem as the design reference: three bold slanted menu bars with a right-pointing triangular selection cursor at the middle row. Make a simplified optical icon: retain the three bars and cursor, but omit the four small corner brackets so it reads crisply at 32 pixels. Preserve the strong forward-slanted bar geometry and the exact overall character. Center this compact emblem in a square canvas with approximately 18 percent transparent padding on every side. One perfectly flat cobalt blue #1847D1, genuinely transparent background. No words, no letters, no new shapes, no border, no background plaque, no shadows, no gradients, no textures. Crisp vector-like edges. This is a companion icon for the supplied logo, not a new design.
+
+
+V1.1 COLOR REFINEMENT
+
+Method: built-in image-generation tool, transparent backgrounds enabled.
+
+Primary logo color edit:
+Use case: precise-object-edit.
+Asset type: Title Select primary brand logo, transparent PNG.
+Edit target: the supplied existing Title Select logo.
+Make only this color refinement: top and bottom menu bars remain solid Cobalt #1847D1; the entire middle menu bar becomes Signal red #D62F29; the triangular selection cursor becomes Select yellow #F3CF3B. All four corner brackets stay Cobalt #1847D1. The entire wordmark stays solid Cobalt #1847D1.
+Preserve the exact words TITLE above SELECT, the letter shapes, forward lean, stacked layout, optical weight, symbol proportions, bar spacing, corner bracket geometry, generous transparent padding, and relative placement. Sharpen edges to clean flat artwork.
+Constraints: genuinely transparent background, no new objects or words, no pixel font, no gradients, texture, glow, outlines, shadow or extrusion. Only one horizontal logo lockup. Crisp flat three-color selector and single-color wordmark.
+
+Simplified icon color edit:
+Use case: precise-object-edit.
+Asset type: Title Select simplified selector icon, transparent PNG.
+Edit target: the existing supplied three-bar icon.
+Change only colors: top bar and bottom bar stay solid Cobalt #1847D1; middle bar becomes solid Signal red #D62F29; the right-pointing triangular cursor becomes solid Select yellow #F3CF3B.
+Preserve the same slanted three-bar geometry, scale, proportions, cursor location, gaps, balanced square composition and generous transparent padding. Crisp flat edges.
+Constraints: genuinely transparent background, exactly three bars and one triangle, no corner brackets, no lettering, no added objects, no gradient, texture, glow, shadow or outline.
+

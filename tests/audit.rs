@@ -77,14 +77,14 @@ fn payload_of_one_rom_under_another_roms_name_is_conflicting_and_completes_the_p
 }
 
 #[test]
-fn named_rom_whose_payload_matches_no_rom_is_bad() {
+fn named_rom_whose_payload_matches_no_rom_is_mismatched() {
     let f = Fixture::new();
     let dat = f.dat(&[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])]);
     write_file(&f.set_path("Pong (USA).a26"), b"pong, corrupted");
 
     let report = audit(&dat, f.set.path()).unwrap();
 
-    assert_eq!(report.entries[0].finding, Finding::Bad);
+    assert_eq!(report.entries[0].finding, Finding::Mismatched);
     assert_eq!(
         report.entries[0].named_rom.as_ref().unwrap().name,
         "Pong (USA).a26"
@@ -93,14 +93,14 @@ fn named_rom_whose_payload_matches_no_rom_is_bad() {
 }
 
 #[test]
-fn file_matching_no_rom_by_name_or_payload_is_extra() {
+fn file_matching_no_rom_by_name_or_payload_is_unmatched() {
     let f = Fixture::new();
     let dat = f.dat(&[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])]);
     write_file(&f.set_path("Homebrew.a26"), b"homebrew");
 
     let report = audit(&dat, f.set.path()).unwrap();
 
-    assert_eq!(report.entries[0].finding, Finding::Extra);
+    assert_eq!(report.entries[0].finding, Finding::Unmatched);
     assert!(report.entries[0].roms.is_empty());
 }
 
@@ -237,7 +237,7 @@ fn report_pins_the_dat_revision_and_summarises_findings_and_game_statuses() {
     assert_eq!(report.dat_revision.name, "Test - System");
     assert_eq!(report.dat_revision.version, "20260101-000000");
     assert_eq!(report.summary.findings.get(&Finding::Matched), Some(&1));
-    assert_eq!(report.summary.findings.get(&Finding::Extra), Some(&1));
+    assert_eq!(report.summary.findings.get(&Finding::Unmatched), Some(&1));
     assert_eq!(report.summary.games.get(&GameStatus::Complete), Some(&1));
     assert_eq!(report.summary.games.get(&GameStatus::Missing), Some(&1));
     assert!(report.started_at <= report.finished_at);
@@ -265,7 +265,7 @@ fn snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>, std::ti
 }
 
 #[test]
-fn audit_leaves_the_verified_set_unchanged() {
+fn audit_leaves_the_source_set_unchanged() {
     let f = Fixture::new();
     let dat = f.dat(&[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])]);
     write_zip(
@@ -329,14 +329,14 @@ fn identical_rom_shared_by_two_games_completes_both() {
 }
 
 #[test]
-fn bad_entry_evidence_is_only_the_size_and_crc32_lookup() {
+fn mismatched_entry_evidence_is_only_the_size_and_crc32_lookup() {
     let f = Fixture::new();
     let dat = f.dat(&[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])]);
     write_file(&f.set_path("Pong (USA).a26"), b"gnop");
 
     let report = audit(&dat, f.set.path()).unwrap();
 
-    assert_eq!(report.entries[0].finding, Finding::Bad);
+    assert_eq!(report.entries[0].finding, Finding::Mismatched);
     assert_eq!(
         report.entries[0].evidence.as_ref().unwrap().algorithms,
         ["size", "crc32"]

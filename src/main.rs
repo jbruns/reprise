@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-/// Audits Verified Sets against DAT Revisions.
+/// Audits Source Sets against DAT Revisions.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -14,8 +14,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Audit a Verified Set against a DAT Revision, reading every payload, and print a JSON report.
-    /// Reads only; never changes the Verified Set.
+    /// Audit a Source Set against a DAT Revision, reading every payload, and print a JSON report.
+    /// Reads only; never changes the Source Set.
     Audit {
         /// The Logiqx XML DAT file to audit against.
         #[arg(long)]
@@ -23,8 +23,8 @@ enum Command {
         /// Write the report to this file instead of stdout.
         #[arg(long)]
         output: Option<PathBuf>,
-        /// The Verified Set's directory.
-        verified_set: PathBuf,
+        /// The Source Set's directory.
+        source_set: PathBuf,
     },
 }
 
@@ -43,9 +43,9 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Audit {
             dat,
             output,
-            verified_set,
+            source_set,
         } => {
-            let report = title_select::audit(&dat, &verified_set).map_err(|e| e.to_string())?;
+            let report = title_select::audit(&dat, &source_set).map_err(|e| e.to_string())?;
             let mut json = serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?;
             json.push(b'\n');
             match output {

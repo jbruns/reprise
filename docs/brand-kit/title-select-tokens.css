@@ -1,0 +1,80 @@
+/* Title Select v1.1 — arcade, console and handheld campaign energy, legible working views. */
+:root {
+  --title-select-cobalt: #1847d1;
+  --title-select-signal: #d62f29;
+  --title-select-yellow: #f3cf3b;
+  --title-select-carbon: #171a22;
+  --title-select-paper: #f5f1e8;
+  --title-select-white: #ffffff;
+  --title-select-grey: #d8dce3;
+  --title-select-muted: #59606e;
+  --title-select-divider: #bbc1cb;
+  --title-select-blue-wash: #e6edff;
+  --title-select-verified: #237047;
+  --title-select-review: #805800;
+  --title-select-failure: #a42826;
+  --title-select-campaign-violet: #7043d7;
+  /* Decorative identity colors; these are not product state tokens. */
+  --logo-bar-outer: var(--title-select-cobalt);
+  --logo-bar-selected: var(--title-select-signal);
+  --logo-cursor: var(--title-select-yellow);
+  --logo-wordmark: var(--title-select-cobalt);
+  --title-select-campaign-gradient: linear-gradient(90deg, #1847d1, #7043d7);
+
+  --color-canvas: var(--title-select-paper);
+  --color-surface: var(--title-select-white);
+  --color-surface-subtle: var(--title-select-grey);
+  --color-text: var(--title-select-carbon);
+  --color-text-secondary: var(--title-select-muted);
+  --color-action: var(--title-select-cobalt);
+  --color-on-action: var(--title-select-white);
+  --color-focus: var(--title-select-cobalt);
+  --color-selected: var(--title-select-blue-wash);
+  --color-selected-text: var(--title-select-carbon);
+  --color-selected-edge: var(--title-select-cobalt);
+  --color-divider: var(--title-select-divider);
+  --color-control-border: var(--title-select-muted);
+  --color-verified: var(--title-select-verified);
+  --color-review: var(--title-select-review);
+  --color-failed: var(--title-select-failure);
+  --color-campaign-accent: var(--title-select-signal);
+  --color-campaign-highlight: var(--title-select-yellow);
+  --color-brand-selection: var(--title-select-yellow);
+  --color-on-brand-selection: var(--title-select-carbon);
+
+  --font-display: "Liberation Sans Narrow", "Arial Narrow", Arial, sans-serif;
+  --font-display-style: italic;
+  --font-display-weight: 700;
+  --font-ui: "Liberation Sans", Arial, sans-serif;
+  --font-data: "Liberation Mono", "Courier New", monospace;
+  --type-page: 2rem;
+  --line-page: 2.375rem;
+  --type-section: 1.25rem;
+  --line-section: 1.625rem;
+  --type-body: .875rem;
+  --line-body: 1.25rem;
+  --type-meta: .75rem;
+  --line-meta: 1rem;
+  --space-1: .25rem;
+  --space-2: .5rem;
+  --space-3: .75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --radius-control: .125rem;
+  --border-width: 1px;
+  --table-row-min-height: 2.5rem;
+  --focus-width: 2px;
+  --focus-offset: 3px;
+  --campaign-offset: 6px 6px 0 var(--title-select-carbon);
+  --motion-fast: 120ms;
+  --motion-standard: 160ms;
+  --motion-easing: ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0ms;
+    --motion-standard: 0ms;
+  }
+}

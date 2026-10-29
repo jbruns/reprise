@@ -8,7 +8,7 @@ Accepted
 
 ## Context
 
-The Service needs durable DAT Revisions, a Verified Set registry, Audits, jobs and, later, Selections and Change
+The Service needs durable DAT Revisions, a Source Set registry, Audits, jobs and, later, Selections and Change
 Plans. Jobs and Change Plans need transactional state changes that survive a restart. Imported DATs must stay
 byte-exact. The UI filters and pages Audit Entries in real time, and an Audit of a Redump or MAME set can hold over
 100,000 Entries. The alternatives were plain JSON files, which have no transactions or indexed queries, and an external
