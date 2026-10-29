@@ -408,6 +408,17 @@ fn SourceSetView(set: SourceSetRecord) -> impl IntoView {
         let path = format!("/source-sets/{}/history", api::segment(&name.get_value()));
         async move { api::get::<Vec<AuditSummary>>(&path).await }
     });
+    // The record's "last verified against" changes when an Audit of this Source Set settles.
+    let record = LocalResource::new(move || {
+        live.settled.track();
+        let path = format!("/source-sets/{}", api::segment(&name.get_value()));
+        async move { api::get::<SourceSetRecord>(&path).await }
+    });
+    let first_verified = set.last_verified_against.clone();
+    let last_verified = Memo::new(move |_| match record.get() {
+        Some(Ok(fresh)) => fresh.last_verified_against,
+        _ => first_verified.clone(),
+    });
     let dats = LocalResource::new(|| api::get::<Vec<Dat>>("/dats"));
     let outcome = RwSignal::new(None::<Result<Job, String>>);
     let sorting = RwSignal::new(VecDeque::<(HistoryCol, ColumnSort)>::new());
@@ -478,12 +489,13 @@ fn SourceSetView(set: SourceSetRecord) -> impl IntoView {
             </dd>
             <dt>"Last verified against"</dt>
             <dd>
-                {set
-                    .last_verified_against
-                    .clone()
-                    .map_or("Never".to_string(), |last| format!("{} ({})", last.version, when(&last.finished_at)))}
+                {move || {
+                    last_verified
+                        .get()
+                        .map_or("Never".to_string(), |last| format!("{} ({})", last.version, when(&last.finished_at)))
+                }}
                 " "
-                {set.last_verified_against.clone().map(|last| view! { <code class="hash">{last.sha256}</code> })}
+                {move || last_verified.get().map(|last| view! { <code class="hash">{last.sha256}</code> })}
             </dd>
         </dl>
 
