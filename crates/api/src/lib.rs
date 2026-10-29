@@ -12,6 +12,9 @@ pub use report::*;
 /// The path every API route is under.
 pub const PREFIX: &str = "/api/v1";
 
+/// How often the Service sends a comment on an idle event stream, so that a client can tell it from a stalled one.
+pub const SSE_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// The body of the unauthenticated health path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Health {
@@ -223,12 +226,21 @@ pub struct JobProgress {
     pub files_total: usize,
 }
 
-/// A server-sent event: the SSE event name is `state` or `progress`, and its data is this, as JSON.
+/// The Jobs a client of `/events` should know about: every Queued or Running Job and the most recently finished.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobSnapshot {
+    pub jobs: Vec<Job>,
+}
+
+/// A server-sent event: the SSE event name is `state`, `progress` or `resync`, and its data is this, as JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JobEvent {
     State(Box<Job>),
     Progress(JobProgress),
+    /// Sent by `/events` when a client connects and whenever it fell behind and missed events: the Jobs now, to
+    /// replace what the client knew.
+    Resync(JobSnapshot),
 }
 
 impl JobEvent {
@@ -237,13 +249,16 @@ impl JobEvent {
         match self {
             JobEvent::State(_) => "state",
             JobEvent::Progress(_) => "progress",
+            JobEvent::Resync(_) => "resync",
         }
     }
 
-    pub fn job_id(&self) -> i64 {
+    /// The Job the event is about; none for a `resync`.
+    pub fn job_id(&self) -> Option<i64> {
         match self {
-            JobEvent::State(job) => job.id,
-            JobEvent::Progress(p) => p.job,
+            JobEvent::State(job) => Some(job.id),
+            JobEvent::Progress(p) => Some(p.job),
+            JobEvent::Resync(_) => None,
         }
     }
 }

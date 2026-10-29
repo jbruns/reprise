@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
-use super::audits::{check_blob_present, choose_revision};
+use super::audits::{check_blob_present, choose_revision, delete_audits};
 use super::sets::set_by_name;
 use super::{Error, Result, Store, now};
 use crate::config::Config;
@@ -96,9 +96,11 @@ pub(super) fn succeed(tx: &Transaction, id: i64, audit_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Marks the Running Job `id` Failed with `error`.
+/// Marks the Running Job `id` Failed with `error`, and discards its running Audit, which releases its DAT Revision.
 pub(super) fn fail(tx: &Transaction, id: i64, error: &str) -> Result<()> {
-    finish_running(tx, id, JobState::Failed, Some(error))
+    finish_running(tx, id, JobState::Failed, Some(error))?;
+    delete_audits(tx, "job_id = ?1 AND status = 'running'", [id])?;
+    Ok(())
 }
 
 impl Store {
@@ -225,7 +227,8 @@ impl Store {
         }
     }
 
-    /// Marks the Running Job `id` Failed with `error`. Does nothing to a Job that is not Running.
+    /// Marks the Running Job `id` Failed with `error` and discards its running Audit, if any, in one transaction.
+    /// Does nothing to a Job that is not Running.
     pub fn fail_job(&self, id: i64, error: &str) -> Result<Job> {
         self.write(|tx| match fail(tx, id, error) {
             Err(Error::Io(_)) | Ok(()) => job_by_id(tx, id),
@@ -274,6 +277,19 @@ impl Store {
 
     pub fn job(&self, id: i64) -> Result<Job> {
         self.read(|c| job_by_id(c, id))
+    }
+
+    /// Every Queued or Running Job and the `recent` latest others, newest first, read in one query.
+    pub fn job_snapshot(&self, recent: usize) -> Result<Vec<Job>> {
+        self.read(|c| {
+            let mut stmt = c.prepare(&format!(
+                "{JOB_QUERY} WHERE j.state IN ('queued', 'running')
+                    OR j.id IN (SELECT id FROM jobs WHERE state NOT IN ('queued', 'running') ORDER BY id DESC LIMIT ?1)
+                 ORDER BY j.id DESC"
+            ))?;
+            let rows = stmt.query_map([recent as i64], job_from_row)?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
     }
 
     /// The latest `limit` Jobs, newest first.

@@ -12,10 +12,11 @@ use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router, middleware};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use title_select_api::{
-    AddSourceSet, Dat, ErrorBody, Finding, GameStatus, Health, ImportedDatRevision, JobEvent, Page,
-    Root, StartAudit,
+    AddSourceSet, Dat, ErrorBody, Finding, GameStatus, Health, ImportedDatRevision, JobEvent,
+    JobSnapshot, Page, Root, SSE_KEEP_ALIVE, StartAudit,
 };
 use title_select_store::config::Config;
 use title_select_store::{Error, Store, Workers};
@@ -425,13 +426,26 @@ async fn job(
     Ok(Json(blocking(&state, move |store| store.job(id)).await?))
 }
 
-type EventStream = Sse<KeepAliveStream<ReceiverStream<Result<Event, Infallible>>>>;
+type EventStream = Sse<
+    KeepAliveStream<
+        futures_util::stream::Map<
+            ReceiverStream<JobEvent>,
+            fn(JobEvent) -> Result<Event, Infallible>,
+        >,
+    >,
+>;
 
-fn sse_event(event: &JobEvent) -> Result<Event, Infallible> {
+fn sse_event(event: JobEvent) -> Result<Event, Infallible> {
     Ok(Event::default()
         .event(event.name())
-        .json_data(event)
+        .json_data(&event)
         .expect("a Job event serializes"))
+}
+
+fn event_stream(rx: mpsc::Receiver<JobEvent>) -> EventStream {
+    let to_event: fn(JobEvent) -> Result<Event, Infallible> = sse_event;
+    Sse::new(ReceiverStream::new(rx).map(to_event))
+        .keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE))
 }
 
 /// The Job's `state` now and as it changes, and its `progress` while Running, ending after a final state.
@@ -446,11 +460,7 @@ async fn job_events(
     let (tx, rx) = mpsc::channel(16);
     tokio::spawn(async move {
         let mut finished = job.state.is_final();
-        if tx
-            .send(sse_event(&JobEvent::State(Box::new(job))))
-            .await
-            .is_err()
-        {
+        if tx.send(JobEvent::State(Box::new(job))).await.is_err() {
             return;
         }
         while !finished {
@@ -459,7 +469,7 @@ async fn job_events(
                 () = tx.closed() => return,
             };
             let event = match received {
-                Ok(event) if event.job_id() == id => event,
+                Ok(event) if event.job_id() == Some(id) => event,
                 Ok(_) => continue,
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     let store = state.store.clone();
@@ -471,33 +481,113 @@ async fn job_events(
                 Err(broadcast::error::RecvError::Closed) => return,
             };
             finished = matches!(&event, JobEvent::State(job) if job.state.is_final());
-            if tx.send(sse_event(&event)).await.is_err() {
+            if tx.send(event).await.is_err() {
                 return;
             }
         }
     });
-    Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
+    Ok(event_stream(rx))
 }
 
-/// Every Job's `state` changes and `progress`, until the client leaves.
+/// How many finished Jobs a `resync` carries besides every Queued or Running one.
+const RESYNC_RECENT: usize = 50;
+
+/// A `resync` of the Jobs now.
+async fn resync(state: &AppState) -> Option<JobEvent> {
+    let store = state.store.clone();
+    match tokio::task::spawn_blocking(move || store.job_snapshot(RESYNC_RECENT)).await {
+        Ok(Ok(jobs)) => Some(JobEvent::Resync(JobSnapshot { jobs })),
+        _ => None,
+    }
+}
+
+/// A `resync` when the client connects and whenever it falls behind, then every Job's `state` changes and
+/// `progress`, until the client leaves.
 async fn all_events(State(state): State<AppState>) -> EventStream {
+    event_stream(all_job_events(state))
+}
+
+fn all_job_events(state: AppState) -> mpsc::Receiver<JobEvent> {
+    // Subscribed before the snapshot is read, so no change after it is missed.
     let mut events = state.jobs.subscribe();
     let (tx, rx) = mpsc::channel(16);
     tokio::spawn(async move {
-        loop {
+        let mut next = resync(&state).await;
+        while let Some(event) = next {
+            if tx.send(event).await.is_err() {
+                return;
+            }
             let received = tokio::select! {
                 received = events.recv() => received,
                 () = tx.closed() => return,
             };
-            let event = match received {
-                Ok(event) => event,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return,
+            next = match received {
+                Ok(event) => Some(event),
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Skips the rest of the backlog, which the snapshot supersedes.
+                    events = events.resubscribe();
+                    resync(&state).await
+                }
+                Err(broadcast::error::RecvError::Closed) => None,
             };
-            if tx.send(sse_event(&event)).await.is_err() {
-                return;
-            }
         }
     });
-    Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
+    rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use title_select_api::JobProgress;
+
+    fn state(dir: &std::path::Path) -> AppState {
+        AppState {
+            store: Arc::new(Store::open(&dir.join("store")).unwrap()),
+            config: Arc::new(Config::parse("").unwrap()),
+            jobs: Arc::new(Jobs::new()),
+            workers: Workers {
+                readers: 1,
+                hashers: 1,
+            },
+        }
+    }
+
+    fn progress(files_done: usize) -> JobEvent {
+        JobEvent::Progress(JobProgress {
+            job: 1,
+            files_done,
+            files_total: 100_000,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_client_that_falls_behind_on_every_jobs_events_is_sent_a_resync() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let mut rx = all_job_events(state.clone());
+        assert!(
+            matches!(rx.recv().await, Some(JobEvent::Resync(_))),
+            "a snapshot on connecting"
+        );
+
+        for n in 0..10_000 {
+            state.jobs.publish(progress(n));
+        }
+        let mut seen = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+        {
+            seen.push(event);
+        }
+
+        let resync = seen.iter().position(|e| matches!(e, JobEvent::Resync(_)));
+        assert!(resync.is_some(), "{} events, none a resync", seen.len());
+        assert!(seen.len() < 10_000, "the backlog was skipped");
+        state.jobs.publish(progress(10_000));
+        assert_eq!(
+            rx.recv().await,
+            Some(progress(10_000)),
+            "events go on after it"
+        );
+    }
 }

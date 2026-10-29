@@ -8,7 +8,7 @@ use common::*;
 use serde::de::DeserializeOwned;
 use title_select_api::{
     AuditSummary, EntryRow, ErrorBody, Finding, GameRow, ImportOutcome, ImportedDatRevision, Job,
-    JobState, Page, Report, SourceSetRecord,
+    JobEvent, JobState, Page, Report, SourceSetRecord,
 };
 use title_select_server::{Handle, Settings, StartError, TOKEN_ACTOR};
 use title_select_store::config::Config;
@@ -170,6 +170,18 @@ impl Client {
             .unwrap()
     }
 
+    /// Subscribes to every Job's events, returning once the `resync` sent on connecting has arrived, with its Jobs.
+    fn watch(&self) -> (Events, title_select_api::JobSnapshot) {
+        let response = self.get("/events").call().unwrap();
+        assert_eq!(response.status(), 200);
+        let mut events = Events(Box::new(
+            std::io::BufReader::new(response.into_body().into_reader()).lines(),
+        ));
+        let (name, data) = events.next_event();
+        assert_eq!(name, "resync");
+        (events, serde_json::from_str(&data).unwrap())
+    }
+
     /// Follows the Job's events to its final state, returning the event names and the last Job.
     fn follow(&self, id: i64) -> (Vec<String>, Job) {
         let response = self.get(&format!("/jobs/{id}/events")).call().unwrap();
@@ -188,6 +200,43 @@ impl Client {
             }
         }
         (names, last.expect("a state event"))
+    }
+}
+
+/// A stream of server-sent events.
+struct Events(Box<dyn Iterator<Item = std::io::Result<String>>>);
+
+impl Events {
+    /// The next event's name and data.
+    fn next_event(&mut self) -> (String, String) {
+        let mut name = String::new();
+        for line in &mut self.0 {
+            let line = line.unwrap();
+            if let Some(n) = line.strip_prefix("event: ") {
+                name = n.to_owned();
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                return (name, data.to_owned());
+            }
+        }
+        panic!("the event stream ended");
+    }
+
+    /// The names of the Job `id`'s events until its final state, and the Job then.
+    fn follow(&mut self, id: i64) -> (Vec<String>, Job) {
+        let mut names = Vec::new();
+        loop {
+            let (name, data) = self.next_event();
+            let event: JobEvent = serde_json::from_str(&data).unwrap();
+            if event.job_id() != Some(id) {
+                continue;
+            }
+            names.push(name);
+            if let JobEvent::State(job) = event
+                && job.state.is_final()
+            {
+                return (names, *job);
+            }
+        }
     }
 }
 
@@ -360,6 +409,8 @@ fn the_api_uploads_a_dat_registers_a_source_set_and_audits_it_end_to_end() {
     let fetched: SourceSetRecord = client.json(&format!("/source-sets/{}", "Test%20-%20System"));
     assert_eq!(fetched, set);
 
+    let (mut watching, snapshot) = client.watch();
+    assert!(snapshot.jobs.is_empty());
     let mut response = client.start_audit();
     assert_eq!(response.status(), 202);
     let job: Job = response.body_mut().read_json().unwrap();
@@ -368,10 +419,20 @@ fn the_api_uploads_a_dat_registers_a_source_set_and_audits_it_end_to_end() {
         (TOKEN_ACTOR, uploaded.dat_revision.sha256.as_str())
     );
 
-    let (events, done) = client.follow(job.id);
+    let (events, done) = watching.follow(job.id);
     assert_eq!(done.state, JobState::Succeeded, "{done:?}");
     assert!(events.contains(&"progress".to_string()), "{events:?}");
-    assert_eq!(events.last().unwrap(), "state");
+    let (_, followed) = client.follow(job.id);
+    assert_eq!(
+        followed, done,
+        "a finished Job's stream sends its final state"
+    );
+    let (_, snapshot) = client.watch();
+    assert_eq!(
+        snapshot.jobs,
+        vec![done.clone()],
+        "the snapshot has recently finished Jobs"
+    );
 
     let job: Job = client.json(&format!("/jobs/{}", job.id));
     let audit_id = job.audit.unwrap();

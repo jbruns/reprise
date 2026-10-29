@@ -31,10 +31,14 @@ impl Jobs {
     /// Announces a Job's new state, and wakes the runner in case it was queued.
     pub fn changed(&self, job: Job) {
         let queued = job.state == title_select_api::JobState::Queued;
-        let _ = self.events.send(JobEvent::State(Box::new(job)));
+        self.publish(JobEvent::State(Box::new(job)));
         if queued {
             self.wake.notify_one();
         }
+    }
+
+    pub fn publish(&self, event: JobEvent) {
+        let _ = self.events.send(event);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<JobEvent> {
@@ -112,7 +116,7 @@ fn run_one(store: &Store, config: &Config, jobs: &Jobs, id: i64) -> Option<Job> 
         let done = p.files_done == p.files_total;
         if done || last.is_none_or(|at| at.elapsed() >= PROGRESS_INTERVAL) {
             *last = Some(Instant::now());
-            let _ = jobs.events.send(JobEvent::Progress(JobProgress {
+            jobs.publish(JobEvent::Progress(JobProgress {
                 job: id,
                 files_done: p.files_done,
                 files_total: p.files_total,

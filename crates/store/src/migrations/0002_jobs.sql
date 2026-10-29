@@ -20,3 +20,5 @@ CREATE TABLE jobs (
 -- One Audit per Source Set at a time.
 CREATE UNIQUE INDEX jobs_one_active_per_source_set ON jobs (source_set_id) WHERE state IN ('queued', 'running');
 CREATE INDEX jobs_by_state ON jobs (state, id);
+-- The Job running an Audit, so that failing the Job discards its running Audit in the same transaction.
+ALTER TABLE audits ADD COLUMN job_id INTEGER REFERENCES jobs (id);

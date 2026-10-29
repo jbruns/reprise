@@ -754,3 +754,47 @@ fn a_queued_job_holds_its_dat_revision_until_it_runs() {
     let done = env.store.run_audit_job(&env.config, job.id, None).unwrap();
     assert_eq!(done.state, JobState::Succeeded);
 }
+
+#[test]
+fn failing_a_job_whose_audit_panicked_discards_its_running_audit_and_releases_its_dat_revision() {
+    use title_select_store::JobState;
+    let env = Env::new(20);
+    let (first, _) = env.import(1);
+    env.add_set();
+    std::fs::write(env.set_dir().join("Pong (USA).a26"), b"pong").unwrap();
+    let job = env
+        .store
+        .enqueue_audit("Test - System", None, "Operator", WORKERS)
+        .unwrap();
+    env.store.claim_job().unwrap();
+
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let progress = |_: title_select_engine::Progress| panic!("injected");
+        env.store
+            .run_audit_job(&env.config, job.id, Some(&progress))
+    }));
+    assert!(panicked.is_err());
+    let running = || -> i64 {
+        database(&env.store)
+            .query_row(
+                "SELECT count(*) FROM audits WHERE status = 'running'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(running(), 1, "the panic left the Audit running");
+
+    let failed = env
+        .store
+        .fail_job(job.id, "the Audit stopped unexpectedly")
+        .unwrap();
+
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(running(), 0);
+    env.import(2);
+    assert!(
+        !env.blob_present(&first),
+        "nothing holds the revision any more"
+    );
+}

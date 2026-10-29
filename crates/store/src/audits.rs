@@ -224,7 +224,7 @@ fn finish_audit(tx: &Transaction, id: i64, report: &Report) -> Result<()> {
 }
 
 /// Deletes the Audits matching `condition`, with their Entries and Game Statuses.
-fn delete_audits(
+pub(super) fn delete_audits(
     tx: &Transaction,
     condition: &str,
     params: impl rusqlite::Params + Copy,
@@ -406,9 +406,9 @@ impl Store {
             let (revision_id, revision) = choose(tx, &set)?;
             check_blob_present(&revision)?;
             tx.execute(
-                "INSERT INTO audits (source_set_id, dat_revision_id, status, source_set_path, started_at)
-                 VALUES (?1, ?2, 'running', ?3, ?4)",
-                params![set.id, revision_id, source_set_path, now()],
+                "INSERT INTO audits (source_set_id, dat_revision_id, status, source_set_path, started_at, job_id)
+                 VALUES (?1, ?2, 'running', ?3, ?4, ?5)",
+                params![set.id, revision_id, source_set_path, now(), job],
             )?;
             Ok((tx.last_insert_rowid(), revision))
         })?;

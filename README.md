@@ -220,12 +220,22 @@ Every body is JSON, and every error is `{"error": "...", "job": <id, when one is
 | `GET /api/v1/jobs`                                 | the latest 100 Jobs, newest first                            |
 | `GET /api/v1/jobs/{id}`                            | one Job                                                      |
 | `GET /api/v1/jobs/{id}/events`                     | server-sent events for one Job, ending at its final state    |
-| `GET /api/v1/events`                               | server-sent events for every Job                             |
+| `GET /api/v1/events`                               | server-sent events for every Job, opening with a `resync`    |
 
 A paged list is `{"items": [...], "next_cursor": "..."}`; pass `next_cursor` back as `?cursor=` for the next page, and
-`?limit=` (1 to 1000, default 100) for its size. Each item carries its `seq`, its position in the report. An event's
-name is `state`, with the Job as data, or `progress`, with `{"job", "files_done", "files_total"}`. A DAT upload may be
-up to 512 MiB, and is `201` when it adds a DAT Revision, `200` when the bytes were already imported.
+`?limit=` (1 to 1000, default 100) for its size. Each item carries its `seq`, its position in the report. A DAT upload
+may be up to 512 MiB, and is `201` when it adds a DAT Revision, `200` when the bytes were already imported.
+
+Server-sent events carry JSON data, under one of these event names:
+
+| Event      | Data                                   | Sent                                                         |
+| ---------- | -------------------------------------- | ------------------------------------------------------------ |
+| `state`    | the Job                                | when a Job's state changes; first on a Job's own stream      |
+| `progress` | `{"job", "files_done", "files_total"}` | while a Job is Running, at most five times a second          |
+| `resync`   | `{"jobs": [...]}`, newest first        | by `/events` on connecting, and after the client fell behind |
+
+A `resync` lists every Queued or Running Job and the 50 most recently finished; it replaces what the client knew,
+since events in between may have been dropped. An idle stream sends a comment every 15 seconds.
 
 ### Headless Audit
 
@@ -233,10 +243,11 @@ up to 512 MiB, and is `201` when it adds a DAT Revision, `200` when the bytes we
 title-select audit --server <url> --set <Source Set> [--revision <sha256 prefix>] [--output <report file>]
 ```
 
-Starts an Audit Job on the Service at `<url>`, sending the Operator token from `TITLE_SELECT_OPERATOR_TOKEN_FILE`
-(or `--token-file`), and follows it to the end. Progress and a summary of the Findings and Game Statuses go to
-stderr; the report goes to stdout, or to `--output`. Exits 0 when the Audit completes, and non-zero when the Job
-fails, the token is refused or the Service cannot be reached.
+Starts an Audit Job on the Service at `<url>`, sending the Operator token from `TITLE_SELECT_OPERATOR_TOKEN_FILE` (or
+`--token-file`), and follows it to the end. Progress and a summary of the Findings and Game Statuses go to stderr; the
+report goes to stdout, or to `--output`. If the Job's event stream sends nothing, not even its keep-alive, for 45
+seconds, the client polls the Job's state instead. Exits 0 when the Audit completes, and non-zero when the Job fails,
+the token is refused or the Service cannot be reached.
 
 ### Image
 
