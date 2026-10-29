@@ -15,7 +15,9 @@ CREATE TABLE jobs (
     hashers INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     started_at TEXT,
-    finished_at TEXT
+    finished_at TEXT,
+    -- Goes up with each change of state, so that a client can tell a stale state from a newer one.
+    version INTEGER NOT NULL DEFAULT 1
 );
 -- One Audit per Source Set at a time.
 CREATE UNIQUE INDEX jobs_one_active_per_source_set ON jobs (source_set_id) WHERE state IN ('queued', 'running');

@@ -216,12 +216,16 @@ pub struct Job {
     pub created_at: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    /// Starts at 1 and goes up with each change of state, so that a client can tell a stale `state` from a newer one.
+    pub version: u64,
 }
 
 /// How far a Running Audit has got through its Source Set's files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobProgress {
     pub job: i64,
+    /// The `version` of the Running Job.
+    pub version: u64,
     pub files_done: usize,
     pub files_total: usize,
 }

@@ -34,7 +34,7 @@ pub(super) struct JobRow {
 
 const JOB_QUERY: &str =
     "SELECT j.id, j.state, s.name, r.sha256, j.actor, j.attempt, j.requeued_from, j.audit_id,
-            j.error, j.readers, j.hashers, j.created_at, j.started_at, j.finished_at
+            j.error, j.readers, j.hashers, j.created_at, j.started_at, j.finished_at, j.version
      FROM jobs j
      JOIN source_sets s ON s.id = j.source_set_id
      JOIN dat_revisions r ON r.id = j.dat_revision_id";
@@ -65,6 +65,7 @@ fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
         created_at: row.get(11)?,
         started_at: row.get(12)?,
         finished_at: row.get(13)?,
+        version: row.get::<_, i64>(14)? as u64,
     })
 }
 
@@ -77,7 +78,8 @@ fn job_by_id(c: &Connection, id: i64) -> Result<Job> {
 /// Moves the Running Job `id` to `to`, failing if it is not Running.
 fn finish_running(tx: &Transaction, id: i64, to: JobState, error: Option<&str>) -> Result<()> {
     let updated = tx.execute(
-        "UPDATE jobs SET state = ?2, error = ?3, finished_at = ?4 WHERE id = ?1 AND state = 'running'",
+        "UPDATE jobs SET state = ?2, error = ?3, finished_at = ?4, version = version + 1
+         WHERE id = ?1 AND state = 'running'",
         params![id, to.as_str(), error, now()],
     )?;
     if updated != 1 {
@@ -164,7 +166,7 @@ impl Store {
                 .optional()?;
             let Some(id) = id else { return Ok(None) };
             tx.execute(
-                "UPDATE jobs SET state = 'running', started_at = ?2 WHERE id = ?1",
+                "UPDATE jobs SET state = 'running', started_at = ?2, version = version + 1 WHERE id = ?1",
                 params![id, now()],
             )?;
             job_by_id(tx, id).map(Some)

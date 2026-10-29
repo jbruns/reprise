@@ -82,10 +82,11 @@ pub async fn run(store: Arc<Store>, config: Arc<Config>, jobs: Arc<Jobs>) {
         jobs.changed(job.clone());
         let (store, config, jobs) = (store.clone(), config.clone(), jobs.clone());
         tokio::spawn(async move {
-            let id = job.id;
+            let (id, version) = (job.id, job.version);
             let ended = {
                 let (store, jobs) = (store.clone(), jobs.clone());
-                tokio::task::spawn_blocking(move || run_one(&store, &config, &jobs, id)).await
+                tokio::task::spawn_blocking(move || run_one(&store, &config, &jobs, id, version))
+                    .await
             };
             let job = match ended {
                 Ok(job) => job,
@@ -109,7 +110,7 @@ pub async fn run(store: Arc<Store>, config: Arc<Config>, jobs: Arc<Jobs>) {
 }
 
 /// Runs one claimed Job's Audit, returning the Job as it ended.
-fn run_one(store: &Store, config: &Config, jobs: &Jobs, id: i64) -> Option<Job> {
+fn run_one(store: &Store, config: &Config, jobs: &Jobs, id: i64, version: u64) -> Option<Job> {
     let last = Mutex::new(None::<Instant>);
     let progress = |p: Progress| {
         let mut last = last.lock().unwrap();
@@ -118,6 +119,7 @@ fn run_one(store: &Store, config: &Config, jobs: &Jobs, id: i64) -> Option<Job> 
             *last = Some(Instant::now());
             jobs.publish(JobEvent::Progress(JobProgress {
                 job: id,
+                version,
                 files_done: p.files_done,
                 files_total: p.files_total,
             }));

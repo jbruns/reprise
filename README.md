@@ -237,6 +237,11 @@ Server-sent events carry JSON data, under one of these event names:
 A `resync` lists every Queued or Running Job and the 50 most recently finished; it replaces what the client knew,
 since events in between may have been dropped. An idle stream sends a comment every 15 seconds.
 
+Every Job carries a `version` that goes up with each change of its state, and `progress` carries the `version` of the
+Running Job it belongs to. The Service drops events that a `resync` or a later `state` already superseded, and a
+client should do the same: ignore a `state` whose `version` is at or below the one it holds for that Job, and
+`progress` whose `version` is below it.
+
 ### Headless Audit
 
 ```sh

@@ -304,6 +304,7 @@ mod tests {
             created_at: "now".into(),
             started_at: None,
             finished_at: None,
+            version: 1,
         }
     }
 

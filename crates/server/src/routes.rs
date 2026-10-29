@@ -1,6 +1,6 @@
 //! The `/api/v1` routes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -448,6 +448,35 @@ fn event_stream(rx: mpsc::Receiver<JobEvent>) -> EventStream {
         .keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE))
 }
 
+/// The latest version of each Job a client has been sent, to drop events that a snapshot or a later state superseded.
+/// Subscriptions start before their snapshot is read, so events buffered meanwhile may be older than it.
+#[derive(Default)]
+struct Sent(HashMap<i64, u64>);
+
+impl Sent {
+    /// Whether the event is news to the client: a `state` newer than the Job's latest sent, `progress` of that state
+    /// or a newer one, or a `resync`. Records what it lets through.
+    fn admit(&mut self, event: &JobEvent) -> bool {
+        match event {
+            JobEvent::State(job) => self.newer(job.id, job.version),
+            JobEvent::Progress(p) => self.0.get(&p.job).is_none_or(|&v| p.version >= v),
+            JobEvent::Resync(snapshot) => {
+                for job in &snapshot.jobs {
+                    self.newer(job.id, job.version);
+                }
+                true
+            }
+        }
+    }
+
+    fn newer(&mut self, job: i64, version: u64) -> bool {
+        let sent = self.0.entry(job).or_default();
+        let newer = version > *sent;
+        *sent = (*sent).max(version);
+        newer
+    }
+}
+
 /// The Job's `state` now and as it changes, and its `progress` while Running, ending after a final state.
 async fn job_events(
     State(state): State<AppState>,
@@ -460,7 +489,10 @@ async fn job_events(
     let (tx, rx) = mpsc::channel(16);
     tokio::spawn(async move {
         let mut finished = job.state.is_final();
-        if tx.send(JobEvent::State(Box::new(job))).await.is_err() {
+        let mut sent = Sent::default();
+        let first = JobEvent::State(Box::new(job));
+        sent.admit(&first);
+        if tx.send(first).await.is_err() {
             return;
         }
         while !finished {
@@ -480,6 +512,9 @@ async fn job_events(
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             };
+            if !sent.admit(&event) {
+                continue;
+            }
             finished = matches!(&event, JobEvent::State(job) if job.state.is_final());
             if tx.send(event).await.is_err() {
                 return;
@@ -512,9 +547,10 @@ fn all_job_events(state: AppState) -> mpsc::Receiver<JobEvent> {
     let mut events = state.jobs.subscribe();
     let (tx, rx) = mpsc::channel(16);
     tokio::spawn(async move {
+        let mut sent = Sent::default();
         let mut next = resync(&state).await;
         while let Some(event) = next {
-            if tx.send(event).await.is_err() {
+            if sent.admit(&event) && tx.send(event).await.is_err() {
                 return;
             }
             let received = tokio::select! {
@@ -555,9 +591,79 @@ mod tests {
     fn progress(files_done: usize) -> JobEvent {
         JobEvent::Progress(JobProgress {
             job: 1,
+            version: 2,
             files_done,
             files_total: 100_000,
         })
+    }
+
+    #[tokio::test]
+    async fn events_buffered_while_the_snapshot_is_read_are_dropped_when_it_supersedes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = dir.path().join("sets/Test - System");
+        std::fs::create_dir_all(&set).unwrap();
+        let mut state = state(dir.path());
+        state.config = Arc::new(
+            Config::parse(&format!(
+                "[roots.sets]\npath = {:?}\n",
+                dir.path().join("sets").display().to_string()
+            ))
+            .unwrap(),
+        );
+        let dat = r#"<?xml version="1.0"?>
+<datafile><header><name>Test - System</name><version>1</version></header>
+<game name="Pong"><rom name="Pong.a26" size="4" crc="00000000"/></game></datafile>"#;
+        let store = &state.store;
+        store
+            .import_dat_bytes(dat.as_bytes(), "test.dat", "No-Intro", None)
+            .unwrap();
+        store
+            .add_source_set(
+                &state.config,
+                "sets",
+                "Test - System",
+                "No-Intro/Test - System",
+            )
+            .unwrap();
+        store
+            .enqueue_audit("Test - System", None, "Operator", state.workers)
+            .unwrap();
+        let running = store.claim_job().unwrap().unwrap();
+
+        // Subscribed, and the Running state buffered, before the snapshot is read.
+        let mut rx = all_job_events(state.clone());
+        state
+            .jobs
+            .publish(JobEvent::State(Box::new(running.clone())));
+        let stale = JobProgress {
+            job: running.id,
+            version: running.version,
+            files_done: 0,
+            files_total: 1,
+        };
+        state.jobs.publish(JobEvent::Progress(stale));
+        let done = store
+            .run_audit_job(&state.config, running.id, None)
+            .unwrap();
+        assert_eq!(done.state, title_select_api::JobState::Succeeded);
+        state.jobs.publish(JobEvent::State(Box::new(done.clone())));
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv());
+        let Ok(Some(JobEvent::Resync(snapshot))) = first.await else {
+            panic!("a snapshot first");
+        };
+        assert_eq!(snapshot.jobs, vec![done.clone()]);
+        let next = JobEvent::Progress(JobProgress {
+            job: done.id + 1,
+            ..stale
+        });
+        state.jobs.publish(next.clone());
+        let after = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv());
+        assert_eq!(
+            after.await.unwrap(),
+            Some(next),
+            "the buffered Running, its progress and the repeated Succeeded are dropped"
+        );
     }
 
     #[tokio::test]
