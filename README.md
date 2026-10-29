@@ -151,13 +151,14 @@ latest Audit, and any Audit cited as provenance, are never pruned.
 ## Service
 
 ```sh
-title-select serve [--listen <address:port>]
+title-select serve [--listen <address:port>] [--ui <dir>]
 ```
 
 Runs the Service: the `/api/v1` JSON API, and the Jobs that run Audits (ADR 0003). It listens on `--listen` or
 `TITLE_SELECT_LISTEN`, by default `127.0.0.1:8080`, and holds the store, and its lock, until it stops on SIGTERM or
 Ctrl-C. While it runs, the store commands above fail with "the store is in use"; use the API, or the headless Audit
-below, instead. This is the supported way to operate Title Select on the Host.
+below, instead. This is the supported way to operate Title Select on the Host. With `--ui` or `TITLE_SELECT_UI` naming
+the workbench's built bundle, it also serves the workbench at `/`; see "Workbench".
 
 ### Auth
 
@@ -256,9 +257,10 @@ the token is refused or the Service cannot be reached.
 
 ### Image
 
-`ghcr.io/jbruns/title-select` is a static binary on `gcr.io/distroless/static:nonroot`, for linux/amd64. It runs
-`serve` on `0.0.0.0:8080` as the nonroot user, with the store at the volume `/store`, and needs nothing else writable,
-so it runs with a read-only root filesystem:
+`ghcr.io/jbruns/title-select` is a static binary and the workbench's bundle (at `/ui`) on
+`gcr.io/distroless/static:nonroot`, for linux/amd64. It runs `serve` on `0.0.0.0:8080` as the nonroot user, with the
+store at the volume `/store`, and serves the workbench at `/`. It needs nothing else writable, so it runs with a
+read-only root filesystem:
 
 ```sh
 docker run --read-only -p 8080:8080 -v title-select-store:/store \
@@ -270,10 +272,55 @@ docker run --read-only -p 8080:8080 -v title-select-store:/store \
 CI publishes `sha-<commit>` (the full commit SHA) for each push to `main`, and `<version>` and `<major>.<minor>` for
 each `v<version>` tag.
 
+## Workbench
+
+The workbench is the Operator's browser interface to the Service (ADR 0005): a Leptos app compiled to WebAssembly that
+uses only the `/api/v1` JSON API, from the same origin. Its screens:
+
+- **Source Sets** lists each Source Set with its latest Audit and the DAT Revision it was last verified against, and
+  registers another from a Root, a path in it and a DAT. Opening a Source Set shows its facts, starts an Audit against
+  the default DAT Revision or a newer one, and lists its history, latest first, with a Re-audit for each row.
+- **DAT Revisions** lists every DAT Revision, newest import first within each DAT, with its provenance (provider,
+  source URL, file, SHA-256, import time), whether its file is kept, and the Audits that refer to it. It uploads a DAT
+  file as a new DAT Revision.
+- **Audit** shows the Audit's Source Set, DAT Revision and times, exports its JSON report and re-audits. Its summary
+  counts each Finding and Game Status, and two derived states: an Entry is Verified when it is Matched with Payload
+  Evidence, and Needs Review when it is Misnamed, Conflicting, Mismatched, Unmatched or Unreadable. Its Entries load in
+  one request from the bulk NDJSON endpoint, then filter by name, Finding, state, Game Status and Evidence algorithm,
+  and sort by any column, in the browser as each key is typed. Selecting an Entry shows its Evidence and the ROMs it
+  matches. A pruned Audit shows only its summary.
+- **Jobs** lists the latest Jobs with their state and progress, live: it follows `/api/v1/events`, applies `state`
+  and `progress` events by the Job `version` rule above, and replaces what it holds with each `resync` snapshot,
+  which also arrives after a reconnect.
+
+Every table is virtualized, sorts by its column headers and works from the keyboard: Tab to the table, then the arrow
+keys, Page Up, Page Down, Home and End move the selected row, Enter opens it and Escape clears it. Each screen's
+controls are ordinary buttons, links and form fields. The workbench needs an evergreen browser; it makes no request
+to any other origin and keeps no credential in browser storage. Its fonts, Liberation Sans and Liberation Mono, are
+served with it under the SIL Open Font License (`crates/ui/assets/fonts/LICENSE-OFL.txt`).
+
+The workbench's own files are served without auth, with a same-origin Content Security Policy; everything it shows
+comes from the API, which needs the Operator as above. Behind an authenticating reverse proxy, the proxy's identity
+header covers the browser's API requests. To run it locally, with `[auth] dev_identity` on a loopback address:
+
+```sh
+rustup target add wasm32-unknown-unknown   # rust-toolchain.toml lists it
+cargo install cargo-leptos --locked
+cargo leptos build --release               # the workbench into target/site, and the binary
+printf '[roots.sets]\npath = "/data/source-sets"\n\n[auth]\ndev_identity = "Developer"\n' > dev.toml
+target/release/title-select --store dev-store --config dev.toml serve --ui target/site
+```
+
+Then open `http://127.0.0.1:8080/`. `crates/ui/bench/filter.py` measures the Audit screen's filtering over 100,000
+synthetic Entries in headless Chromium; its docstring says how to run it.
+
 ## Development
 
 A Cargo workspace: `crates/api` (the API's and the report's types), `crates/engine` (the Audit), `crates/store`
-(the store and configuration), `crates/server` (the Service) and `crates/cli` (the `title-select` binary).
+(the store and configuration), `crates/server` (the Service), `crates/cli` (the `title-select` binary) and
+`crates/ui` (the workbench). The workbench's filtering, sorting, derived states and Job event handling are plain Rust,
+tested on the host with `cargo test`; `cargo clippy --package title-select-ui --target wasm32-unknown-unknown` checks
+it as the browser runs it.
 
 ## Licence
 
