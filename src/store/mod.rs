@@ -116,8 +116,9 @@ impl Store {
             readers: Mutex::new(Vec::new()),
             _lock: lock,
         };
+        // Retention is not run here: it runs after an import or an Audit, so a blob restored by one command is
+        // still there for the Audit the next command runs.
         store.discard_unfinished_audits()?;
-        store.retain_blobs()?;
         store.collect_garbage()?;
         Ok(store)
     }

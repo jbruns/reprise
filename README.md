@@ -85,8 +85,9 @@ first use. Only one Title Select process may have a store open at a time: it hol
 - Migrations are embedded and forward-only. Before one runs on a store that already has a schema, the database is
   copied with `VACUUM INTO` to `backups/schema-<version>-<time>.sqlite`. A store from a newer Title Select is refused.
 - A DAT Revision's file is kept while a retained or running Audit refers to it or while it is the newest imported
-  revision of its DAT. Otherwise the file is deleted; the DAT Revision's row stays, so history still names it. Importing
-  the same file again restores it.
+  revision of its DAT. Otherwise the file is deleted after the next import or Audit; the DAT Revision's row stays, so
+  history still names it. Importing the same file again restores it and keeps it until an Audit using it finishes or a
+  newer revision of its DAT is imported.
 
 ## Configuration
 
@@ -122,8 +123,8 @@ title-select set history <Source Set>
 `set add` registers a folder in a Root, such as `sets "No-Intro/Atari - 2600"`, as a Source Set bound to an imported
 DAT. The Source Set is named by its folder (`Atari - 2600`). An absolute path, `..`, or a symlink that resolves
 outside the Root is refused. `set list` prints each Source Set with the DAT Revision it was last verified against:
-its latest Audit's. `set history` lists a Source Set's Audits, newest first, with the time, DAT Revision, counts, and
-whether the full Audit is kept or only its summary.
+its latest Audit's, the latest being the last to finish. `set history` lists a Source Set's Audits, latest first, with
+the time, DAT Revision, counts, and whether the full Audit is kept or only its summary.
 
 ```sh
 title-select audit --set <Source Set> [--revision <sha256 prefix>] [--output <report file>]

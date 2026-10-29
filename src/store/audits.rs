@@ -21,6 +21,14 @@ pub struct StoredAudit {
     pub report: Report,
 }
 
+/// An Audit whose row is inserted as running, before its scan.
+struct RunningAudit {
+    id: i64,
+    set_id: i64,
+    resolved: Resolved,
+    revision: DatRevisionRecord,
+}
+
 /// One Audit in a Source Set's history. A pruned Audit keeps only this summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditSummary {
@@ -108,7 +116,7 @@ fn choose_revision(
             &format!(
                 "{base} WHERE r.id = (SELECT dat_revision_id FROM audits
                                       WHERE source_set_id = ?1 AND status = 'finished'
-                                      ORDER BY id DESC LIMIT 1)"
+                                      ORDER BY finish_seq DESC LIMIT 1)"
             ),
             [set.id],
             revision_from_row,
@@ -148,7 +156,9 @@ fn finish_audit(tx: &Transaction, id: i64, report: &Report) -> Result<()> {
     values.push(Value::Integer(id));
     let updated = tx.execute(
         &format!(
-            "UPDATE audits SET status = 'finished', source_set_path = ?, started_at = ?, finished_at = ?, {}
+            "UPDATE audits SET status = 'finished',
+                               finish_seq = (SELECT coalesce(max(finish_seq), 0) + 1 FROM audits),
+                               source_set_path = ?, started_at = ?, finished_at = ?, {}
              WHERE id = ? AND status = 'running'",
             counts.join(", ")
         ),
@@ -157,6 +167,12 @@ fn finish_audit(tx: &Transaction, id: i64, report: &Report) -> Result<()> {
     if updated != 1 {
         return Err(Error::Io(format!("Audit {id} is no longer running")));
     }
+    // The Audit now holds its revision, so a restored blob needs no other hold.
+    tx.execute(
+        "UPDATE dat_revisions SET restored_at = NULL
+         WHERE id = (SELECT dat_revision_id FROM audits WHERE id = ?1)",
+        [id],
+    )?;
 
     let mut entry = tx.prepare(
         "INSERT INTO audit_entries (audit_id, seq, path, member, finding, roms, named_game, named_rom,
@@ -262,11 +278,21 @@ impl Store {
         name: &str,
         revision: Option<&str>,
     ) -> Result<StoredAudit> {
+        let running = self.begin_audit(config, name, revision)?;
+        self.complete_audit(config, running)
+    }
+
+    /// Chooses the revision and inserts the running row in one transaction, which pins the blob: retention, which
+    /// also runs under the writer, treats a running Audit as a holder.
+    fn begin_audit(
+        &self,
+        config: &Config,
+        name: &str,
+        revision: Option<&str>,
+    ) -> Result<RunningAudit> {
         let set = self.read(|c| set_by_name(c, name))?;
         let resolved = resolve(config, &set.record.root, &set.record.path)?;
         let source_set_path = resolved.path.display().to_string();
-        // Choosing the revision and inserting the running row in one transaction pins the blob: retention, which
-        // also runs under the writer, treats a running Audit as a holder.
         let (id, revision) = self.write(|tx| {
             let (revision_id, revision) = choose_revision(tx, &set, revision)?;
             if !revision.blob_present {
@@ -284,20 +310,30 @@ impl Store {
             )?;
             Ok((tx.last_insert_rowid(), revision))
         })?;
+        Ok(RunningAudit {
+            id,
+            set_id: set.id,
+            resolved,
+            revision,
+        })
+    }
+
+    /// Scans and finishes a running Audit. Its report is read before pruning, so pruning cannot take it even if
+    /// a later-started Audit finished first.
+    fn complete_audit(&self, config: &Config, running: RunningAudit) -> Result<StoredAudit> {
+        let id = running.id;
         let finished = self
-            .scan(&revision, &resolved)
+            .scan(&running.revision, &running.resolved)
             .and_then(|report| self.write(|tx| finish_audit(tx, id, &report)));
         if let Err(err) = finished {
             // Best effort: a running row that survives this is deleted when the store next opens.
             let _ = self.write(|tx| delete_audits(tx, "id = ?1", [id]));
             return Err(err);
         }
-        self.prune(set.id, config.audits.keep)?;
+        let report = self.report(id)?;
+        self.prune(running.set_id, config.audits.keep)?;
         self.retain_blobs()?;
-        Ok(StoredAudit {
-            id,
-            report: self.report(id)?,
-        })
+        Ok(StoredAudit { id, report })
     }
 
     /// Reads the Source Set's files against the revision's blob, confined to the Root.
@@ -398,14 +434,14 @@ impl Store {
         })
     }
 
-    /// The Audits of the Source Set `name`, newest first.
+    /// The Audits of the Source Set `name`, the latest to finish first.
     pub fn history(&self, name: &str) -> Result<Vec<AuditSummary>> {
         self.read(|c| {
             let set = set_by_name(c, name)?;
             let mut stmt = c.prepare(&format!(
                 "SELECT a.id, a.started_at, a.finished_at, r.sha256, r.version, a.pruned_at IS NOT NULL, {}
                  FROM audits a JOIN dat_revisions r ON r.id = a.dat_revision_id
-                 WHERE a.source_set_id = ?1 AND a.status = 'finished' ORDER BY a.id DESC",
+                 WHERE a.source_set_id = ?1 AND a.status = 'finished' ORDER BY a.finish_seq DESC",
                 count_columns("a.")
             ))?;
             let rows = stmt.query_map([set.id], |r| {
@@ -425,14 +461,15 @@ impl Store {
         })
     }
 
-    /// Prunes the Source Set's full Audits beyond the latest `keep` to their summary rows, except any cited as
-    /// provenance. The latest Audit is always kept.
+    /// Prunes the Source Set's full Audits beyond the latest `keep` to finish to their summary rows, except any
+    /// cited as provenance. The latest Audit is always kept.
     fn prune(&self, set_id: i64, keep: usize) -> Result<Vec<i64>> {
         self.write(|tx| {
             let mut stmt = tx.prepare(
                 "SELECT id, EXISTS (SELECT 1 FROM audit_citations c WHERE c.audit_id = a.id)
                  FROM audits a
-                 WHERE source_set_id = ?1 AND status = 'finished' AND pruned_at IS NULL ORDER BY id DESC",
+                 WHERE source_set_id = ?1 AND status = 'finished' AND pruned_at IS NULL
+                 ORDER BY finish_seq DESC",
             )?;
             let full = stmt
                 .query_map([set_id], |r| {
@@ -456,5 +493,51 @@ impl Store {
             }
             Ok(pruned)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_latest_audit_is_the_last_to_finish_and_is_never_pruned_by_its_own_completion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sets");
+        std::fs::create_dir_all(root.join("Test")).unwrap();
+        let dat = tmp.path().join("Test.dat");
+        std::fs::write(
+            &dat,
+            "<datafile><header><name>Test</name><version>1</version></header></datafile>",
+        )
+        .unwrap();
+        let config = Config::parse(&format!(
+            "[roots.sets]\npath = {:?}\n\n[audits]\nkeep = 1\n",
+            root.display().to_string()
+        ))
+        .unwrap();
+        let store = Store::open(&tmp.path().join("store")).unwrap();
+        store.import_dat(&dat, "Test", None).unwrap();
+        store
+            .add_source_set(&config, "sets", "Test", "Test/Test")
+            .unwrap();
+
+        let first = store.begin_audit(&config, "Test", None).unwrap();
+        let second = store.begin_audit(&config, "Test", None).unwrap();
+        let (first_id, second_id) = (first.id, second.id);
+        store.complete_audit(&config, second).unwrap();
+        let completed = store.complete_audit(&config, first).unwrap();
+
+        assert_eq!(completed.id, first_id);
+        let history = store.history("Test").unwrap();
+        assert_eq!(
+            history.iter().map(|a| (a.id, a.pruned)).collect::<Vec<_>>(),
+            vec![(first_id, false), (second_id, true)],
+            "the Audit that finished last is the latest"
+        );
+        assert!(store.report(first_id).is_ok());
+        let set = &store.source_sets().unwrap()[0];
+        let last = set.last_verified_against.as_ref().unwrap();
+        assert_eq!(last.finished_at, history[0].finished_at);
     }
 }

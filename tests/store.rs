@@ -446,14 +446,57 @@ fn a_running_audit_holds_its_dat_revision_until_a_restart_discards_it() {
 
     assert!(env.blob_present(&first), "the running Audit holds it");
     assert!(env.store.history("Test - System").unwrap().is_empty());
+    let config = env.config.clone();
     let (_tmp, store) = env.reopen();
     let running: i64 = database(&store)
         .query_row("SELECT count(*) FROM audits", [], |r| r.get(0))
         .unwrap();
     assert_eq!(running, 0, "a restart discards the unfinished Audit");
     assert!(
+        store.blob_path(&first).exists(),
+        "opening the store does not run retention"
+    );
+    store
+        .audit_source_set(&config, "Test - System", None)
+        .unwrap();
+    assert!(
         !store.blob_path(&first).exists(),
-        "and then nothing holds it"
+        "the next Audit's retention finds nothing holding it"
+    );
+}
+
+#[test]
+fn a_restored_dat_revision_is_kept_across_commands_until_an_audit_uses_it() {
+    let env = Env::new(1);
+    let (old, _) = env.import(1);
+    env.add_set();
+    let (new, _) = env.import(2);
+    assert!(!env.blob_present(&old));
+    env.import(1);
+    let config = env.config.clone();
+    let (_tmp, store) = env.reopen();
+    let present = |sha: &str| store.blob_path(sha).is_file();
+    assert!(present(&old), "opening the store keeps the restored blob");
+
+    store
+        .audit_source_set(&config, "Test - System", Some(&new))
+        .unwrap();
+    assert!(
+        present(&old),
+        "an Audit of another revision does not drop the restored blob"
+    );
+
+    let audit = store
+        .audit_source_set(&config, "Test - System", Some(&old))
+        .unwrap();
+    assert_eq!(audit.report.dat_revision.sha256, old);
+
+    store
+        .audit_source_set(&config, "Test - System", Some(&new))
+        .unwrap();
+    assert!(
+        !present(&old),
+        "once its Audit is pruned, nothing holds the restored revision"
     );
 }
 

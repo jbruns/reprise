@@ -40,8 +40,9 @@ const SET_QUERY: &str =
             r.sha256, r.version, a.finished_at
      FROM source_sets s
      JOIN dats d ON d.id = s.dat_id
-     LEFT JOIN audits a ON a.id = (SELECT max(id) FROM audits
-                                  WHERE source_set_id = s.id AND status = 'finished')
+     LEFT JOIN audits a ON a.id = (SELECT id FROM audits
+                                  WHERE source_set_id = s.id AND status = 'finished'
+                                  ORDER BY finish_seq DESC LIMIT 1)
      LEFT JOIN dat_revisions r ON r.id = a.dat_revision_id";
 
 fn set_from_row(row: &Row) -> rusqlite::Result<SourceSetRow> {

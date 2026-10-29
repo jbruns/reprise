@@ -111,8 +111,8 @@ impl Store {
                 }
                 write_blob(&dats, &dat.sha256, &bytes)?;
                 conn.execute(
-                    "UPDATE dat_revisions SET blob_dropped_at = NULL WHERE id = ?1",
-                    [id],
+                    "UPDATE dat_revisions SET blob_dropped_at = NULL, restored_at = ?2 WHERE id = ?1",
+                    params![id, now()],
                 )?;
                 let restored = DatRevisionRecord {
                     blob_present: true,
@@ -130,6 +130,11 @@ impl Store {
                 "SELECT id FROM dats WHERE provider = ?1 AND name = ?2",
                 params![provider, dat.name],
                 |r| r.get(0),
+            )?;
+            // A newer revision releases any restored revision of the same DAT.
+            tx.execute(
+                "UPDATE dat_revisions SET restored_at = NULL WHERE dat_id = ?1",
+                [dat_id],
             )?;
             tx.execute(
                 "INSERT INTO dat_revisions (dat_id, sha256, version, file_name, imported_at, source_url)
@@ -158,8 +163,8 @@ impl Store {
         })
     }
 
-    /// Drops the blob of every DAT Revision that no retained or running Audit refers to and that is not the
-    /// newest imported revision of its DAT (ADR 0003). The row stays. Returns the SHA-256s whose blobs were
+    /// Drops the blob of every DAT Revision that no retained or running Audit refers to, that is not the
+    /// newest imported revision of its DAT (ADR 0003), and that is not held as restored. The row stays. Returns the SHA-256s whose blobs were
     /// dropped.
     pub fn retain_blobs(&self) -> Result<Vec<String>> {
         self.with_writer(|conn| {
@@ -168,7 +173,7 @@ impl Store {
             let shas = tx
                 .prepare(
                     "SELECT r.sha256 FROM dat_revisions r
-                     WHERE r.blob_dropped_at IS NULL
+                     WHERE r.blob_dropped_at IS NULL AND r.restored_at IS NULL
                        AND r.id <> (SELECT max(n.id) FROM dat_revisions n WHERE n.dat_id = r.dat_id)
                        AND NOT EXISTS (
                            SELECT 1 FROM audits a WHERE a.dat_revision_id = r.id AND a.pruned_at IS NULL)

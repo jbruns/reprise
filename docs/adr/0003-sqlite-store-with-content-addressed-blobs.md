@@ -39,3 +39,5 @@ Postgres, which adds a Service to run and back up for a single-Operator applicat
 ## Amendment (2026-10-29, #9)
 
 - One process at a time opens the store, holding an exclusive lock on `<store>/lock`: the Service (#10).
+- A blob restored by importing its bytes again is also kept until an Audit using it finishes or a newer revision of
+  its DAT is imported.

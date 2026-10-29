@@ -6,7 +6,9 @@ CREATE TABLE dats (
     UNIQUE (provider, name)
 );
 
--- The blob of a DAT Revision is dats/<sha256> beside the database while blob_dropped_at is NULL.
+-- The blob of a DAT Revision is dats/<sha256> beside the database while blob_dropped_at is NULL. restored_at is
+-- set when importing its bytes again restores a dropped blob, and holds the blob until an Audit using the revision
+-- finishes or a newer revision of its DAT is imported.
 CREATE TABLE dat_revisions (
     id INTEGER PRIMARY KEY,
     dat_id INTEGER NOT NULL REFERENCES dats (id),
@@ -15,7 +17,8 @@ CREATE TABLE dat_revisions (
     file_name TEXT NOT NULL,
     imported_at TEXT NOT NULL,
     source_url TEXT,
-    blob_dropped_at TEXT
+    blob_dropped_at TEXT,
+    restored_at TEXT
 );
 CREATE INDEX dat_revisions_by_dat ON dat_revisions (dat_id, id);
 
@@ -32,7 +35,8 @@ CREATE TABLE source_sets (
 
 -- One row per Audit, inserted as running before its scan so that it holds its DAT Revision, and finished in the
 -- transaction that writes its Entries and Game Statuses. A running row left by a crash is deleted on open. A
--- pruned Audit keeps this row: its counts are the summary that remains.
+-- pruned Audit keeps this row: its counts are the summary that remains. finish_seq orders Audits by completion:
+-- the latest Audit is the one that finished last, whatever the order they started in.
 CREATE TABLE audits (
     id INTEGER PRIMARY KEY,
     source_set_id INTEGER NOT NULL REFERENCES source_sets (id),
@@ -41,6 +45,7 @@ CREATE TABLE audits (
     source_set_path TEXT NOT NULL,
     started_at TEXT NOT NULL,
     finished_at TEXT,
+    finish_seq INTEGER UNIQUE,
     matched INTEGER NOT NULL DEFAULT 0,
     misnamed INTEGER NOT NULL DEFAULT 0,
     conflicting INTEGER NOT NULL DEFAULT 0,
@@ -52,7 +57,7 @@ CREATE TABLE audits (
     missing INTEGER NOT NULL DEFAULT 0,
     pruned_at TEXT
 );
-CREATE INDEX audits_by_source_set ON audits (source_set_id, id);
+CREATE INDEX audits_by_source_set ON audits (source_set_id, finish_seq);
 CREATE INDEX audits_by_dat_revision ON audits (dat_revision_id);
 
 -- Something that cites an Audit as provenance, such as a later Change Plan. A cited Audit is never pruned.
