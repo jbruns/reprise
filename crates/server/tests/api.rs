@@ -56,6 +56,7 @@ impl Env {
             config: self.config(extra),
             listen: "127.0.0.1:0".parse().unwrap(),
             token_file: Some(self.tmp.path().join("token")),
+            ui: None,
             hold_jobs: false,
         }
     }
@@ -300,6 +301,65 @@ fn dev_identity_on_loopback_authenticates_requests_with_no_credential() {
         ..Client::new(&service)
     };
     assert_eq!(status_of(wrong.get("/jobs").call()), 401);
+}
+
+#[test]
+fn the_workbench_is_served_beside_the_api_without_hiding_its_errors() {
+    let env = Env::new();
+    let ui = env.tmp.path().join("site");
+    std::fs::create_dir_all(ui.join("pkg")).unwrap();
+    std::fs::write(
+        ui.join("workbench.html"),
+        "<!doctype html><title>workbench</title>",
+    )
+    .unwrap();
+    std::fs::write(ui.join("pkg/title-select.js"), "export default 1;").unwrap();
+    let service = title_select_server::spawn(Settings {
+        ui: Some(ui),
+        ..env.settings("")
+    })
+    .unwrap();
+    let page = |path: &str| {
+        let mut response = agent()
+            .get(format!("{}{path}", service.url()))
+            .call()
+            .unwrap();
+        let csp = response.headers().get("content-security-policy").cloned();
+        (
+            response.status().as_u16(),
+            response.body_mut().read_to_string().unwrap(),
+            csp,
+        )
+    };
+
+    let (status, body, csp) = page("/");
+    assert_eq!(status, 200);
+    assert!(body.contains("workbench"));
+    assert!(
+        csp.unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("default-src 'self'")
+    );
+    let (status, body, _) = page("/audits/7");
+    assert_eq!(
+        (status, body.contains("workbench")),
+        (200, true),
+        "a screen's URL loads the workbench"
+    );
+    assert_eq!(page("/pkg/title-select.js").1, "export default 1;");
+
+    for path in ["/api/v1/no-such-thing", "/api/v2/jobs", "/api"] {
+        let (status, body, _) = page(path);
+        assert_eq!(status, 404, "{path}");
+        let error: ErrorBody = serde_json::from_str(&body).unwrap();
+        assert_eq!(error.error, "no such API path");
+    }
+    assert_eq!(
+        page("/api/v1/jobs").0,
+        401,
+        "the API still needs a credential"
+    );
 }
 
 #[test]

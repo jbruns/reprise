@@ -21,6 +21,7 @@ subtle = "2.6.1"
 ipnet = "2.12.2"
 futures-util = "0.3.34"
 tokio-stream = { version = "0.1.19", features = ["sync"] }
+tower-http = { version = "0.7.1", features = ["fs", "set-header"] }
 
 [dev-dependencies]
 crc32fast.workspace = true

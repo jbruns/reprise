@@ -28,6 +28,8 @@ pub struct Settings {
     pub listen: SocketAddr,
     /// The file holding the Operator token, if the token is enabled.
     pub token_file: Option<PathBuf>,
+    /// The workbench's built bundle, served at `/` (ADR 0005).
+    pub ui: Option<PathBuf>,
     /// Leaves queued Jobs queued, so tests can observe them.
     #[doc(hidden)]
     pub hold_jobs: bool,
@@ -59,6 +61,7 @@ fn prepare(settings: Settings) -> Result<Prepared, StartError> {
         config,
         listen,
         token_file,
+        ui,
         hold_jobs,
     } = settings;
     let auth = auth::Auth::new(&config.auth, token_file.as_deref(), listen)?;
@@ -88,7 +91,7 @@ fn prepare(settings: Settings) -> Result<Prepared, StartError> {
         jobs: Arc::new(jobs::Jobs::new()),
         workers,
     };
-    let app = routes::router(state.clone(), Arc::new(auth));
+    let app = routes::router(state.clone(), Arc::new(auth), ui.as_deref());
     Ok(Prepared {
         listener,
         app,
