@@ -1,0 +1,368 @@
+mod common;
+
+use common::*;
+use reprise::{EvidenceLevel, Finding, GameStatus, audit};
+use sha2::Digest;
+
+#[test]
+fn loose_file_whose_payload_matches_its_named_rom_is_matched() {
+    let f = Fixture::new();
+    let dat = f.dat(&[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])]);
+    write_file(&f.set_path("Pong (USA).a26"), b"pong");
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(report.entries[0].finding, Finding::Matched);
+    assert_eq!(report.games[0].status, GameStatus::Complete);
+}
+
+fn finding_of(report: &reprise::Report, path: &str) -> Finding {
+    report
+        .entries
+        .iter()
+        .find(|e| e.path == path)
+        .unwrap()
+        .finding
+}
+
+fn status_of(report: &reprise::Report, game: &str) -> GameStatus {
+    report.games.iter().find(|g| g.name == game).unwrap().status
+}
+
+#[test]
+fn payload_of_a_rom_under_a_name_the_dat_lacks_is_misnamed_and_completes_that_game() {
+    let f = Fixture::new();
+    let dat = f.dat(&[(
+        "Asteroids (USA)",
+        vec![rom("Asteroids (USA).a26", b"rocks")],
+    )]);
+    write_file(&f.set_path("Asteroids (USA) (Anthology).a26"), b"rocks");
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    assert_eq!(
+        finding_of(&report, "Asteroids (USA) (Anthology).a26"),
+        Finding::Misnamed
+    );
+    assert_eq!(status_of(&report, "Asteroids (USA)"), GameStatus::Complete);
+}
+
+#[test]
+fn payload_of_one_rom_under_another_roms_name_is_conflicting_and_completes_the_payloads_game() {
+    let f = Fixture::new();
+    let dat = f.dat(&[
+        (
+            "Breakout (Europe)",
+            vec![rom("Breakout (Europe).a26", b"rev0")],
+        ),
+        (
+            "Breakout (Europe) (Rev 1)",
+            vec![rom("Breakout (Europe) (Rev 1).a26", b"rev1")],
+        ),
+    ]);
+    write_file(&f.set_path("Breakout (Europe).a26"), b"rev1");
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    let entry = &report.entries[0];
+    assert_eq!(entry.finding, Finding::Conflicting);
+    assert_eq!(entry.roms[0].game, "Breakout (Europe) (Rev 1)");
+    assert_eq!(entry.named_rom.as_ref().unwrap().game, "Breakout (Europe)");
+    assert_eq!(
+        status_of(&report, "Breakout (Europe) (Rev 1)"),
+        GameStatus::Complete
+    );
+    assert_eq!(status_of(&report, "Breakout (Europe)"), GameStatus::Missing);
+}
+
+#[test]
+fn named_rom_whose_payload_matches_no_rom_is_bad() {
+    let f = Fixture::new();
+    let dat = f.dat(&[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])]);
+    write_file(&f.set_path("Pong (USA).a26"), b"pong, corrupted");
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    assert_eq!(report.entries[0].finding, Finding::Bad);
+    assert_eq!(
+        report.entries[0].named_rom.as_ref().unwrap().name,
+        "Pong (USA).a26"
+    );
+    assert_eq!(status_of(&report, "Pong (USA)"), GameStatus::Missing);
+}
+
+#[test]
+fn file_matching_no_rom_by_name_or_payload_is_extra() {
+    let f = Fixture::new();
+    let dat = f.dat(&[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])]);
+    write_file(&f.set_path("Homebrew.a26"), b"homebrew");
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    assert_eq!(report.entries[0].finding, Finding::Extra);
+    assert!(report.entries[0].roms.is_empty());
+}
+
+#[test]
+fn zip_members_are_entries_and_a_partly_present_multi_rom_game_is_incomplete() {
+    let f = Fixture::new();
+    let dat = f.dat(&[(
+        "Music Game (USA)",
+        vec![
+            rom("Music Game (USA).a26", b"code"),
+            rom("Track 1.wav", b"track one"),
+            rom("Track 2.wav", b"track two"),
+        ],
+    )]);
+    write_zip(
+        &f.set_path("Music Game (USA).zip"),
+        &[
+            ("Music Game (USA).a26", b"code"),
+            ("Track 1.wav", b"track one"),
+        ],
+    );
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    let members: Vec<_> = report
+        .entries
+        .iter()
+        .map(|e| (e.path.as_str(), e.member.as_deref(), e.finding))
+        .collect();
+    assert_eq!(
+        members,
+        [
+            (
+                "Music Game (USA).zip",
+                Some("Music Game (USA).a26"),
+                Finding::Matched
+            ),
+            (
+                "Music Game (USA).zip",
+                Some("Track 1.wav"),
+                Finding::Matched
+            ),
+        ]
+    );
+    let game = &report.games[0];
+    assert_eq!(game.status, GameStatus::Incomplete);
+    assert_eq!(game.missing_roms, ["Track 2.wav"]);
+}
+
+#[test]
+fn archive_that_cannot_be_read_is_one_unreadable_entry_and_the_audit_continues() {
+    let f = Fixture::new();
+    let dat = f.dat(&[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])]);
+    write_file(&f.set_path("Broken.zip"), b"PK\x03\x04 not really a zip");
+    write_file(&f.set_path("Pong (USA).a26"), b"pong");
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    let broken = &report.entries[0];
+    assert_eq!(
+        (broken.path.as_str(), broken.finding),
+        ("Broken.zip", Finding::Unreadable)
+    );
+    assert!(broken.reason.as_deref().is_some_and(|r| !r.is_empty()));
+    assert_eq!(finding_of(&report, "Pong (USA).a26"), Finding::Matched);
+}
+
+#[test]
+fn zip_member_failing_its_crc_is_unreadable() {
+    let f = Fixture::new();
+    let dat = f.dat(&[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])]);
+    let zip = f.set_path("Pong (USA).zip");
+    write_stored_zip(&zip, &[("Pong (USA).a26", b"pong")]);
+    // Stored member: flip its payload bytes in place so the stored CRC no longer agrees.
+    let mut bytes = std::fs::read(&zip).unwrap();
+    let at = bytes.windows(4).position(|w| w == b"pong").unwrap();
+    bytes[at..at + 4].copy_from_slice(b"PONG");
+    std::fs::write(&zip, bytes).unwrap();
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    assert_eq!(report.entries[0].member.as_deref(), Some("Pong (USA).a26"));
+    assert_eq!(report.entries[0].finding, Finding::Unreadable);
+}
+
+#[test]
+fn evidence_records_the_algorithms_each_rom_supplies() {
+    let f = Fixture::new();
+    let dat = f.dat(&[
+        ("New (USA)", vec![rom("New (USA).a26", b"new")]),
+        (
+            "Old (USA)",
+            vec![rom_without_sha256("Old (USA).a26", b"old")],
+        ),
+    ]);
+    write_file(&f.set_path("New (USA).a26"), b"new");
+    write_file(&f.set_path("Old (USA).a26"), b"old");
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    let algorithms = |path| {
+        let e = report.entries.iter().find(|e| e.path == path).unwrap();
+        let evidence = e.evidence.as_ref().unwrap();
+        assert_eq!(evidence.level, EvidenceLevel::Payload);
+        evidence.algorithms.clone()
+    };
+    assert_eq!(
+        algorithms("New (USA).a26"),
+        ["size", "crc32", "md5", "sha1", "sha256"]
+    );
+    assert_eq!(
+        algorithms("Old (USA).a26"),
+        ["size", "crc32", "md5", "sha1"]
+    );
+}
+
+#[test]
+fn report_pins_the_dat_revision_and_summarises_findings_and_game_statuses() {
+    let f = Fixture::new();
+    let dat = f.dat(&[
+        ("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")]),
+        ("Combat (USA)", vec![rom("Combat (USA).a26", b"combat")]),
+    ]);
+    write_file(&f.set_path("Pong (USA).a26"), b"pong");
+    write_file(&f.set_path("Homebrew.a26"), b"homebrew");
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    let expected_sha256: String = sha2::Sha256::digest(std::fs::read(&dat).unwrap())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(report.dat_revision.sha256, expected_sha256);
+    assert_eq!(report.dat_revision.name, "Test - System");
+    assert_eq!(report.dat_revision.version, "20260101-000000");
+    assert_eq!(report.summary.findings.get(&Finding::Matched), Some(&1));
+    assert_eq!(report.summary.findings.get(&Finding::Extra), Some(&1));
+    assert_eq!(report.summary.games.get(&GameStatus::Complete), Some(&1));
+    assert_eq!(report.summary.games.get(&GameStatus::Missing), Some(&1));
+    assert!(report.started_at <= report.finished_at);
+}
+
+fn snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>, std::time::SystemTime)> {
+    let mut out: Vec<_> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .map(|e| e.unwrap())
+        .map(|e| {
+            let bytes = if e.file_type().is_file() {
+                std::fs::read(e.path()).unwrap()
+            } else {
+                Vec::new()
+            };
+            (
+                e.path().to_path_buf(),
+                bytes,
+                e.metadata().unwrap().modified().unwrap(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn audit_leaves_the_verified_set_unchanged() {
+    let f = Fixture::new();
+    let dat = f.dat(&[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])]);
+    write_zip(
+        &f.set_path("Pong (USA).zip"),
+        &[("Pong (USA).a26", b"pong")],
+    );
+    write_file(&f.set_path("sub/Homebrew.a26"), b"homebrew");
+    write_file(&f.set_path("Broken.zip"), b"not a zip");
+    let before = snapshot(f.set.path());
+
+    audit(&dat, f.set.path()).unwrap();
+
+    assert_eq!(snapshot(f.set.path()), before);
+}
+
+#[test]
+fn rom_listed_without_a_crc_is_matched_by_its_other_checksums() {
+    let f = Fixture::new();
+    let dat = f.dat(&[(
+        "Prototype (USA)",
+        vec![rom_without_crc("Prototype (USA).a26", b"proto")],
+    )]);
+    write_file(&f.set_path("Prototype (USA).a26"), b"proto");
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    assert_eq!(report.entries[0].finding, Finding::Matched);
+    assert_eq!(
+        report.entries[0].evidence.as_ref().unwrap().algorithms,
+        ["size", "sha1"]
+    );
+    assert_eq!(status_of(&report, "Prototype (USA)"), GameStatus::Complete);
+}
+
+#[test]
+fn identical_rom_shared_by_two_games_completes_both() {
+    let f = Fixture::new();
+    let dat = f.dat(&[
+        (
+            "Game A (USA)",
+            vec![rom("bios.bin", b"bios"), rom("a.bin", b"a")],
+        ),
+        (
+            "Game B (USA)",
+            vec![rom("bios.bin", b"bios"), rom("b.bin", b"b")],
+        ),
+    ]);
+    write_zip(
+        &f.set_path("Game A (USA).zip"),
+        &[("bios.bin", b"bios"), ("a.bin", b"a")],
+    );
+    write_zip(
+        &f.set_path("Game B (USA).zip"),
+        &[("bios.bin", b"bios"), ("b.bin", b"b")],
+    );
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    assert_eq!(status_of(&report, "Game A (USA)"), GameStatus::Complete);
+    assert_eq!(status_of(&report, "Game B (USA)"), GameStatus::Complete);
+}
+
+#[test]
+fn bad_entry_evidence_is_only_the_size_and_crc32_lookup() {
+    let f = Fixture::new();
+    let dat = f.dat(&[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])]);
+    write_file(&f.set_path("Pong (USA).a26"), b"gnop");
+
+    let report = audit(&dat, f.set.path()).unwrap();
+
+    assert_eq!(report.entries[0].finding, Finding::Bad);
+    assert_eq!(
+        report.entries[0].evidence.as_ref().unwrap().algorithms,
+        ["size", "crc32"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_files_are_audited_and_an_unreadable_directory_is_unreadable_without_stopping_the_audit()
+ {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let dat = f.dat(&[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])]);
+    write_file(&f.dat_dir.path().join("elsewhere.a26"), b"pong");
+    std::os::unix::fs::symlink(
+        f.dat_dir.path().join("elsewhere.a26"),
+        f.set_path("Pong (USA).a26"),
+    )
+    .unwrap();
+    write_file(&f.set_path("locked/Homebrew.a26"), b"homebrew");
+    std::fs::set_permissions(f.set_path("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let report = audit(&dat, f.set.path());
+    std::fs::set_permissions(f.set_path("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let report = report.unwrap();
+
+    assert_eq!(finding_of(&report, "Pong (USA).a26"), Finding::Matched);
+    assert_eq!(finding_of(&report, "locked"), Finding::Unreadable);
+}
