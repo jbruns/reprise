@@ -42,25 +42,29 @@ pub(super) fn remove_blob(path: &Path) -> Result<()> {
 impl Store {
     /// Deletes every file in the blob directory that is not the blob of a DAT Revision whose row holds it,
     /// including temp files left by an interrupted write. Returns the names it deleted.
+    ///
+    /// It holds the writer throughout, so no import in this process is between writing a blob and inserting its
+    /// row; the store's lock excludes every other process.
     pub fn collect_garbage(&self) -> Result<Vec<String>> {
-        let held: HashSet<String> = self.read(|c| {
+        self.with_writer(|conn| {
             let mut stmt =
-                c.prepare("SELECT sha256 FROM dat_revisions WHERE blob_dropped_at IS NULL")?;
-            let rows = stmt.query_map([], |r| r.get(0))?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })?;
-        let dats = self.dir.join(DATS);
-        let mut removed = Vec::new();
-        for item in std::fs::read_dir(&dats).map_err(|e| io_error(&dats, e))? {
-            let item = item.map_err(|e| io_error(&dats, e))?;
-            let name = item.file_name().to_string_lossy().into_owned();
-            let is_file = item.file_type().is_ok_and(|t| t.is_file());
-            if is_file && !held.contains(&name) {
-                remove_blob(&item.path())?;
-                removed.push(name);
+                conn.prepare("SELECT sha256 FROM dat_revisions WHERE blob_dropped_at IS NULL")?;
+            let held = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<HashSet<String>, _>>()?;
+            let dats = self.dir.join(DATS);
+            let mut removed = Vec::new();
+            for item in std::fs::read_dir(&dats).map_err(|e| io_error(&dats, e))? {
+                let item = item.map_err(|e| io_error(&dats, e))?;
+                let name = item.file_name().to_string_lossy().into_owned();
+                let is_file = item.file_type().is_ok_and(|t| t.is_file());
+                if is_file && !held.contains(&name) {
+                    remove_blob(&item.path())?;
+                    removed.push(name);
+                }
             }
-        }
-        removed.sort();
-        Ok(removed)
+            removed.sort();
+            Ok(removed)
+        })
     }
 }

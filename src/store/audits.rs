@@ -6,7 +6,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
 
 use super::dats::{DatRevisionRecord, REVISION_COLUMNS, revision_from_row};
-use super::sets::{SourceSetRow, resolve, set_by_name};
+use super::sets::{Resolved, SourceSetRow, resolve, set_by_name};
 use super::{Error, Result, Store, now};
 use crate::config::Config;
 use crate::{
@@ -106,7 +106,8 @@ fn choose_revision(
     let latest_audit = c
         .query_row(
             &format!(
-                "{base} WHERE r.id = (SELECT dat_revision_id FROM audits WHERE source_set_id = ?1
+                "{base} WHERE r.id = (SELECT dat_revision_id FROM audits
+                                      WHERE source_set_id = ?1 AND status = 'finished'
                                       ORDER BY id DESC LIMIT 1)"
             ),
             [set.id],
@@ -125,11 +126,9 @@ fn choose_revision(
     .ok_or_else(|| Error::Refused(format!("no DAT Revision of {dat} has been imported")))
 }
 
-/// Records a finished Audit, its Entries and its Game Statuses.
-fn insert_audit(tx: &Transaction, set_id: i64, revision_id: i64, report: &Report) -> Result<i64> {
+/// Finishes the running Audit `id`: its counts and times, its Entries and its Game Statuses.
+fn finish_audit(tx: &Transaction, id: i64, report: &Report) -> Result<()> {
     let mut values = vec![
-        Value::Integer(set_id),
-        Value::Integer(revision_id),
         Value::Text(report.source_set.clone()),
         Value::Text(report.started_at.to_string()),
         Value::Text(report.finished_at.to_string()),
@@ -140,16 +139,24 @@ fn insert_audit(tx: &Transaction, set_id: i64, revision_id: i64, report: &Report
     for g in GameStatus::ALL {
         values.push(Value::Integer(report.summary.games[&g] as i64));
     }
-    let placeholders = vec!["?"; values.len()].join(", ");
-    tx.execute(
+    let counts: Vec<String> = Finding::ALL
+        .iter()
+        .map(|f| f.as_str())
+        .chain(GameStatus::ALL.iter().map(|g| g.as_str()))
+        .map(|c| format!("{c} = ?"))
+        .collect();
+    values.push(Value::Integer(id));
+    let updated = tx.execute(
         &format!(
-            "INSERT INTO audits (source_set_id, dat_revision_id, source_set_path, started_at, finished_at, {})
-             VALUES ({placeholders})",
-            count_columns("")
+            "UPDATE audits SET status = 'finished', source_set_path = ?, started_at = ?, finished_at = ?, {}
+             WHERE id = ? AND status = 'running'",
+            counts.join(", ")
         ),
         params_from_iter(values),
     )?;
-    let id = tx.last_insert_rowid();
+    if updated != 1 {
+        return Err(Error::Io(format!("Audit {id} is no longer running")));
+    }
 
     let mut entry = tx.prepare(
         "INSERT INTO audit_entries (audit_id, seq, path, member, finding, roms, named_game, named_rom,
@@ -179,7 +186,24 @@ fn insert_audit(tx: &Transaction, set_id: i64, revision_id: i64, report: &Report
         let missing = serde_json::to_string(&g.missing_roms).map_err(corrupt)?;
         game.execute(params![id, seq as i64, g.name, g.status.as_str(), missing])?;
     }
-    Ok(id)
+    Ok(())
+}
+
+/// Deletes the Audits matching `condition`, with their Entries and Game Statuses.
+fn delete_audits(
+    tx: &Transaction,
+    condition: &str,
+    params: impl rusqlite::Params + Copy,
+) -> Result<usize> {
+    for table in ["audit_entries", "audit_games", "audit_citations"] {
+        tx.execute(
+            &format!(
+                "DELETE FROM {table} WHERE audit_id IN (SELECT id FROM audits WHERE {condition})"
+            ),
+            params,
+        )?;
+    }
+    Ok(tx.execute(&format!("DELETE FROM audits WHERE {condition}"), params)?)
 }
 
 fn entry_from_row(row: &Row) -> Result<Entry> {
@@ -238,29 +262,36 @@ impl Store {
         name: &str,
         revision: Option<&str>,
     ) -> Result<StoredAudit> {
-        let (set, (revision_id, revision)) = self.read(|c| {
-            let set = set_by_name(c, name)?;
-            let revision = choose_revision(c, &set, revision)?;
-            Ok((set, revision))
+        let set = self.read(|c| set_by_name(c, name))?;
+        let resolved = resolve(config, &set.record.root, &set.record.path)?;
+        let source_set_path = resolved.path.display().to_string();
+        // Choosing the revision and inserting the running row in one transaction pins the blob: retention, which
+        // also runs under the writer, treats a running Audit as a holder.
+        let (id, revision) = self.write(|tx| {
+            let (revision_id, revision) = choose_revision(tx, &set, revision)?;
+            if !revision.blob_present {
+                return Err(Error::Refused(format!(
+                    "DAT Revision {} of {} is no longer kept; import its file ({}) again to restore it",
+                    revision.sha256,
+                    revision.dat(),
+                    revision.file
+                )));
+            }
+            tx.execute(
+                "INSERT INTO audits (source_set_id, dat_revision_id, status, source_set_path, started_at)
+                 VALUES (?1, ?2, 'running', ?3, ?4)",
+                params![set.id, revision_id, source_set_path, now()],
+            )?;
+            Ok((tx.last_insert_rowid(), revision))
         })?;
-        let (_, set_path) = resolve(config, &set.record.root, &set.record.path)?;
-        if !revision.blob_present {
-            return Err(Error::Refused(format!(
-                "DAT Revision {} of {} is no longer kept; import its file ({}) again to restore it",
-                revision.sha256,
-                revision.dat(),
-                revision.file
-            )));
+        let finished = self
+            .scan(&revision, &resolved)
+            .and_then(|report| self.write(|tx| finish_audit(tx, id, &report)));
+        if let Err(err) = finished {
+            // Best effort: a running row that survives this is deleted when the store next opens.
+            let _ = self.write(|tx| delete_audits(tx, "id = ?1", [id]));
+            return Err(err);
         }
-        let blob = self.blob_path(&revision.sha256);
-        let report = crate::audit_as(&blob, revision.file.clone(), &set_path)?;
-        if report.dat_revision.sha256 != revision.sha256 {
-            return Err(Error::Io(format!(
-                "{}: the blob does not match its SHA-256",
-                blob.display()
-            )));
-        }
-        let id = self.write(|tx| insert_audit(tx, set.id, revision_id, &report))?;
         self.prune(set.id, config.audits.keep)?;
         self.retain_blobs()?;
         Ok(StoredAudit {
@@ -269,9 +300,35 @@ impl Store {
         })
     }
 
+    /// Reads the Source Set's files against the revision's blob, confined to the Root.
+    fn scan(&self, revision: &DatRevisionRecord, resolved: &Resolved) -> Result<Report> {
+        let blob = self.blob_path(&revision.sha256);
+        let report = crate::audit_as(
+            &blob,
+            revision.file.clone(),
+            &resolved.path,
+            Some(&resolved.canonical_root),
+        )?;
+        if report.dat_revision.sha256 != revision.sha256 {
+            return Err(Error::Io(format!(
+                "{}: the blob does not match its SHA-256",
+                blob.display()
+            )));
+        }
+        Ok(report)
+    }
+
+    /// Deletes the rows of Audits left running by a process that stopped mid-Audit.
+    pub(super) fn discard_unfinished_audits(&self) -> Result<usize> {
+        self.write(|tx| delete_audits(tx, "status = 'running'", []))
+    }
+
     /// The `schema: 2` report of a stored Audit, generated from its rows.
     pub fn report(&self, audit_id: i64) -> Result<Report> {
-        self.read(|c| {
+        self.read(|conn| {
+            // One read transaction, so a concurrent prune cannot leave the counts without their rows. It only
+            // reads, so ending it by rollback when it drops is enough.
+            let c = conn.unchecked_transaction()?;
             let head = c
                 .query_row(
                     &format!(
@@ -280,7 +337,7 @@ impl Store {
                          FROM audits a
                          JOIN dat_revisions r ON r.id = a.dat_revision_id
                          JOIN dats d ON d.id = r.dat_id
-                         WHERE a.id = ?1",
+                         WHERE a.id = ?1 AND a.status = 'finished'",
                         count_columns("a.")
                     ),
                     [audit_id],
@@ -303,7 +360,7 @@ impl Store {
                     },
                 )
                 .optional()?
-                .ok_or_else(|| Error::Refused(format!("no Audit {audit_id}")))?;
+                .ok_or_else(|| Error::Refused(format!("no finished Audit {audit_id}")))?;
             let ((source_set, started_at, finished_at, pruned), dat_revision, (findings, games)) =
                 head;
             if pruned {
@@ -348,7 +405,7 @@ impl Store {
             let mut stmt = c.prepare(&format!(
                 "SELECT a.id, a.started_at, a.finished_at, r.sha256, r.version, a.pruned_at IS NOT NULL, {}
                  FROM audits a JOIN dat_revisions r ON r.id = a.dat_revision_id
-                 WHERE a.source_set_id = ?1 ORDER BY a.id DESC",
+                 WHERE a.source_set_id = ?1 AND a.status = 'finished' ORDER BY a.id DESC",
                 count_columns("a.")
             ))?;
             let rows = stmt.query_map([set.id], |r| {
@@ -374,7 +431,8 @@ impl Store {
         self.write(|tx| {
             let mut stmt = tx.prepare(
                 "SELECT id, EXISTS (SELECT 1 FROM audit_citations c WHERE c.audit_id = a.id)
-                 FROM audits a WHERE source_set_id = ?1 AND pruned_at IS NULL ORDER BY id DESC",
+                 FROM audits a
+                 WHERE source_set_id = ?1 AND status = 'finished' AND pruned_at IS NULL ORDER BY id DESC",
             )?;
             let full = stmt
                 .query_map([set_id], |r| {

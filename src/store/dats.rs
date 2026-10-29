@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::blobs::{remove_blob, write_blob};
 use super::{DATS, Error, Result, Store, io_error, now};
@@ -98,32 +98,30 @@ impl Store {
             )));
         }
         let dats = self.dir.join(DATS);
-        if let Some((id, existing)) = self.read(|c| revision_by_sha(c, &dat.sha256))? {
-            let blob = self.blob_path(&existing.sha256);
-            if existing.blob_present && blob.is_file() {
-                return Ok((existing, ImportOutcome::AlreadyImported));
-            }
-            write_blob(&dats, &dat.sha256, &bytes)?;
-            self.write(|tx| {
-                tx.execute(
-                    "UPDATE dat_revisions SET blob_dropped_at = NULL WHERE id = ?1",
-                    [id],
-                )?;
-                Ok(())
-            })?;
-            let restored = DatRevisionRecord {
-                blob_present: true,
-                ..existing
-            };
-            return Ok((restored, ImportOutcome::Restored));
-        }
-
-        write_blob(&dats, &dat.sha256, &bytes)?;
         let file = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let record = self.write(|tx| {
+        // Holding the writer keeps the blob and its row consistent against retention and garbage collection.
+        let (record, outcome) = self.with_writer(|conn| {
+            if let Some((id, existing)) = revision_by_sha(conn, &dat.sha256)? {
+                let blob = self.blob_path(&existing.sha256);
+                if existing.blob_present && blob.is_file() {
+                    return Ok((existing, ImportOutcome::AlreadyImported));
+                }
+                write_blob(&dats, &dat.sha256, &bytes)?;
+                conn.execute(
+                    "UPDATE dat_revisions SET blob_dropped_at = NULL WHERE id = ?1",
+                    [id],
+                )?;
+                let restored = DatRevisionRecord {
+                    blob_present: true,
+                    ..existing
+                };
+                return Ok((restored, ImportOutcome::Restored));
+            }
+            write_blob(&dats, &dat.sha256, &bytes)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
                 "INSERT INTO dats (provider, name) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
                 params![provider, dat.name],
@@ -138,10 +136,14 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![dat_id, dat.sha256, dat.version, file, now(), source_url],
             )?;
-            Ok(revision_by_sha(tx, &dat.sha256)?.expect("just inserted").1)
+            let record = revision_by_sha(&tx, &dat.sha256)?.expect("just inserted").1;
+            tx.commit()?;
+            Ok((record, ImportOutcome::Added))
         })?;
-        self.retain_blobs()?;
-        Ok((record, ImportOutcome::Added))
+        if outcome == ImportOutcome::Added {
+            self.retain_blobs()?;
+        }
+        Ok((record, outcome))
     }
 
     /// Every DAT Revision, oldest import first.
@@ -156,19 +158,22 @@ impl Store {
         })
     }
 
-    /// Drops the blob of every DAT Revision that no retained Audit refers to and that is not the newest
-    /// imported revision of its DAT (ADR 0003). The row stays. Returns the SHA-256s whose blobs were dropped.
+    /// Drops the blob of every DAT Revision that no retained or running Audit refers to and that is not the
+    /// newest imported revision of its DAT (ADR 0003). The row stays. Returns the SHA-256s whose blobs were
+    /// dropped.
     pub fn retain_blobs(&self) -> Result<Vec<String>> {
-        let dropped: Vec<String> = self.write(|tx| {
-            let mut stmt = tx.prepare(
-                "SELECT r.sha256 FROM dat_revisions r
-                 WHERE r.blob_dropped_at IS NULL
-                   AND r.id <> (SELECT max(n.id) FROM dat_revisions n WHERE n.dat_id = r.dat_id)
-                   AND NOT EXISTS (
-                       SELECT 1 FROM audits a WHERE a.dat_revision_id = r.id AND a.pruned_at IS NULL)
-                 ORDER BY r.id",
-            )?;
-            let shas = stmt
+        self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // An Audit row that is not pruned, including one still running, holds its DAT Revision.
+            let shas = tx
+                .prepare(
+                    "SELECT r.sha256 FROM dat_revisions r
+                     WHERE r.blob_dropped_at IS NULL
+                       AND r.id <> (SELECT max(n.id) FROM dat_revisions n WHERE n.dat_id = r.dat_id)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM audits a WHERE a.dat_revision_id = r.id AND a.pruned_at IS NULL)
+                     ORDER BY r.id",
+                )?
                 .query_map([], |r| r.get(0))?
                 .collect::<Result<Vec<String>, _>>()?;
             let at = now();
@@ -178,12 +183,22 @@ impl Store {
                     params![at, sha],
                 )?;
             }
-            Ok(shas)
-        })?;
-        // The rows no longer hold these blobs, so a crash before this point leaves only garbage.
-        for sha in &dropped {
-            remove_blob(&self.blob_path(sha))?;
-        }
-        Ok(dropped)
+            tx.commit()?;
+            // The rows no longer hold these blobs, so a crash before this point leaves only garbage. The
+            // writer is still held, so no restore can clear a marker in between; check it anyway before deleting.
+            let mut dropped = Vec::new();
+            for sha in shas {
+                let still_dropped: bool = conn.query_row(
+                    "SELECT blob_dropped_at IS NOT NULL FROM dat_revisions WHERE sha256 = ?1",
+                    [&sha],
+                    |r| r.get(0),
+                )?;
+                if still_dropped {
+                    remove_blob(&self.blob_path(&sha))?;
+                    dropped.push(sha);
+                }
+            }
+            Ok(dropped)
+        })
     }
 }

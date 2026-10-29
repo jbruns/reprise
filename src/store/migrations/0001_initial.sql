@@ -30,23 +30,26 @@ CREATE TABLE source_sets (
     UNIQUE (root, path)
 );
 
--- One row per Audit, kept when the Audit is pruned: its counts are the summary that remains.
+-- One row per Audit, inserted as running before its scan so that it holds its DAT Revision, and finished in the
+-- transaction that writes its Entries and Game Statuses. A running row left by a crash is deleted on open. A
+-- pruned Audit keeps this row: its counts are the summary that remains.
 CREATE TABLE audits (
     id INTEGER PRIMARY KEY,
     source_set_id INTEGER NOT NULL REFERENCES source_sets (id),
     dat_revision_id INTEGER NOT NULL REFERENCES dat_revisions (id),
+    status TEXT NOT NULL CHECK (status IN ('running', 'finished')),
     source_set_path TEXT NOT NULL,
     started_at TEXT NOT NULL,
-    finished_at TEXT NOT NULL,
-    matched INTEGER NOT NULL,
-    misnamed INTEGER NOT NULL,
-    conflicting INTEGER NOT NULL,
-    mismatched INTEGER NOT NULL,
-    unmatched INTEGER NOT NULL,
-    unreadable INTEGER NOT NULL,
-    complete INTEGER NOT NULL,
-    incomplete INTEGER NOT NULL,
-    missing INTEGER NOT NULL,
+    finished_at TEXT,
+    matched INTEGER NOT NULL DEFAULT 0,
+    misnamed INTEGER NOT NULL DEFAULT 0,
+    conflicting INTEGER NOT NULL DEFAULT 0,
+    mismatched INTEGER NOT NULL DEFAULT 0,
+    unmatched INTEGER NOT NULL DEFAULT 0,
+    unreadable INTEGER NOT NULL DEFAULT 0,
+    complete INTEGER NOT NULL DEFAULT 0,
+    incomplete INTEGER NOT NULL DEFAULT 0,
+    missing INTEGER NOT NULL DEFAULT 0,
     pruned_at TEXT
 );
 CREATE INDEX audits_by_source_set ON audits (source_set_id, id);

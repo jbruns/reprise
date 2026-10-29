@@ -196,11 +196,18 @@ pub fn audit(dat_path: &Path, root: &Path) -> Result<Report, Error> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    audit_as(dat_path, file, root)
+    audit_as(dat_path, file, root, None)
 }
 
-/// Like [`audit`], but reports the DAT Revision under `file`, its original filename.
-pub(crate) fn audit_as(dat_path: &Path, file: String, root: &Path) -> Result<Report, Error> {
+/// Like [`audit`], but reports the DAT Revision under `file`, its original filename. With `confine`, a canonical
+/// path, every file and directory must resolve inside it: one that resolves outside is an Unreadable Entry and is
+/// not read, and the file read is the one its resolved path names.
+pub(crate) fn audit_as(
+    dat_path: &Path,
+    file: String,
+    root: &Path,
+    confine: Option<&Path>,
+) -> Result<Report, Error> {
     let started_at = jiff::Timestamp::now();
     if !root.is_dir() {
         return Err(Error::SourceSet(format!(
@@ -220,10 +227,11 @@ pub(crate) fn audit_as(dat_path: &Path, file: String, root: &Path) -> Result<Rep
             .to_string_lossy()
             .into_owned()
     };
-    for item in walkdir::WalkDir::new(root)
+    let mut walk = walkdir::WalkDir::new(root)
         .follow_links(true)
         .sort_by_file_name()
-    {
+        .into_iter();
+    while let Some(item) = walk.next() {
         let item = match item {
             Ok(item) => item,
             Err(err) if err.depth() == 0 => return Err(Error::SourceSet(err.to_string())),
@@ -233,6 +241,27 @@ pub(crate) fn audit_as(dat_path: &Path, file: String, root: &Path) -> Result<Rep
                 continue;
             }
         };
+        let mut path = item.path().to_path_buf();
+        if let Some(confine) = confine {
+            let refusal = match item.path().canonicalize() {
+                Ok(real) if real.starts_with(confine) => {
+                    path = real;
+                    None
+                }
+                Ok(_) => Some("resolves outside the Root".to_owned()),
+                Err(err) => Some(err.to_string()),
+            };
+            if let Some(reason) = refusal {
+                if item.depth() == 0 {
+                    return Err(Error::SourceSet(format!("{}: {reason}", root.display())));
+                }
+                if item.file_type().is_dir() {
+                    walk.skip_current_dir();
+                }
+                scan.unreadable(rel(item.path()), None, reason);
+                continue;
+            }
+        }
         if !item.file_type().is_file() {
             continue;
         }
@@ -241,7 +270,7 @@ pub(crate) fn audit_as(dat_path: &Path, file: String, root: &Path) -> Result<Rep
             .path()
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
-        if let Err(reason) = scan.read_file(item.path(), &rel, is_zip) {
+        if let Err(reason) = scan.read_file(&path, &rel, is_zip) {
             scan.unreadable(rel, None, reason);
         }
     }

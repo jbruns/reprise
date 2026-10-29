@@ -6,6 +6,7 @@ mod dats;
 mod migrations;
 mod sets;
 
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -22,6 +23,8 @@ pub const DATABASE: &str = "title-select.sqlite";
 pub const DATS: &str = "dats";
 /// The directory, in the store directory, that holds the backups taken before migrations.
 pub const BACKUPS: &str = "backups";
+/// The file, in the store directory, that an open store holds an exclusive lock on.
+pub const LOCK: &str = "lock";
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Idle reader connections kept for reuse.
@@ -50,11 +53,33 @@ pub(crate) fn now() -> String {
     jiff::Timestamp::now().to_string()
 }
 
-/// An open store: one writer connection that serialises writes, and a pool of readers.
+/// An open store: one writer connection that serialises writes, and a pool of readers. Only one process at a
+/// time may open a store, so the writer is the only one.
 pub struct Store {
     dir: PathBuf,
     writer: Mutex<Connection>,
     readers: Mutex<Vec<Connection>>,
+    /// Holds the exclusive lock on `lock` until the store is dropped.
+    _lock: File,
+}
+
+/// Takes the store directory's exclusive lock, failing at once if another process holds it.
+fn lock(dir: &Path) -> Result<File> {
+    let path = dir.join(LOCK);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| io_error(&path, e))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(Error::Refused(format!(
+            "{}: the store is in use by another Title Select process",
+            dir.display()
+        ))),
+        Err(TryLockError::Error(e)) => Err(io_error(&path, e)),
+    }
 }
 
 /// Settings every connection gets (ADR 0003).
@@ -74,6 +99,7 @@ impl Store {
     fn open_with(dir: &Path, migrations: &[&str]) -> Result<Store> {
         let dats = dir.join(DATS);
         std::fs::create_dir_all(&dats).map_err(|e| io_error(&dats, e))?;
+        let lock = lock(dir)?;
         let mut writer = Connection::open(dir.join(DATABASE))?;
         configure(&writer)?;
         let mode: String = writer.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
@@ -88,7 +114,10 @@ impl Store {
             dir: dir.to_path_buf(),
             writer: Mutex::new(writer),
             readers: Mutex::new(Vec::new()),
+            _lock: lock,
         };
+        store.discard_unfinished_audits()?;
+        store.retain_blobs()?;
         store.collect_garbage()?;
         Ok(store)
     }
@@ -125,11 +154,18 @@ impl Store {
 
     /// Runs `f` in one write transaction on the writer connection.
     fn write<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
+        self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let out = f(&tx)?;
+            tx.commit()?;
+            Ok(out)
+        })
+    }
+
+    /// Runs `f` while holding the writer, so that blob files and the rows that hold them change together.
+    fn with_writer<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
         let mut conn = self.writer.lock().unwrap();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let out = f(&tx)?;
-        tx.commit()?;
-        Ok(out)
+        f(&mut conn)
     }
 }
 
@@ -197,6 +233,24 @@ mod tests {
         assert_eq!(revisions, 1);
         let version = store.read(|c| Ok(pragma(c, "user_version"))).unwrap();
         assert_eq!(version, "Integer(2)");
+    }
+
+    #[test]
+    fn a_second_open_of_the_same_store_fails_until_the_first_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Store::open(dir.path()).unwrap();
+
+        let second = Store::open(dir.path());
+
+        let Err(Error::Refused(message)) = second else {
+            panic!(
+                "expected a refusal, got {second:?}",
+                second = second.map(|_| ())
+            );
+        };
+        assert!(message.contains("in use by another Title Select process"));
+        drop(first);
+        Store::open(dir.path()).unwrap();
     }
 
     const DAT: &str = "<datafile><header><name>Test</name><version>1</version></header></datafile>";

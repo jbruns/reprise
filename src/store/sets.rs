@@ -40,7 +40,8 @@ const SET_QUERY: &str =
             r.sha256, r.version, a.finished_at
      FROM source_sets s
      JOIN dats d ON d.id = s.dat_id
-     LEFT JOIN audits a ON a.id = (SELECT max(id) FROM audits WHERE source_set_id = s.id)
+     LEFT JOIN audits a ON a.id = (SELECT max(id) FROM audits
+                                  WHERE source_set_id = s.id AND status = 'finished')
      LEFT JOIN dat_revisions r ON r.id = a.dat_revision_id";
 
 fn set_from_row(row: &Row) -> rusqlite::Result<SourceSetRow> {
@@ -77,11 +78,20 @@ pub(super) fn set_by_name(c: &Connection, name: &str) -> Result<SourceSetRow> {
     .ok_or_else(|| Error::Refused(format!("no Source Set named {name}")))
 }
 
-/// Checks that `rel` names a directory inside the Root called `root`, and returns the relative path with `/`
-/// separators and the Source Set's path as configured (the Root's path joined with `rel`).
+/// A Source Set's folder, checked to lie inside its Root.
+pub(super) struct Resolved {
+    /// Relative to the Root, with `/` separators.
+    pub rel: String,
+    /// The Root's path, as configured, joined with `rel`.
+    pub path: PathBuf,
+    /// The Root's canonical path, which every file an Audit reads must resolve inside.
+    pub canonical_root: PathBuf,
+}
+
+/// Checks that `rel` names a directory inside the Root called `root`.
 ///
 /// Refuses an absolute path, `..`, and a path that, after following symlinks, resolves outside the Root.
-pub(super) fn resolve(config: &Config, root: &str, rel: &str) -> Result<(String, PathBuf)> {
+pub(super) fn resolve(config: &Config, root: &str, rel: &str) -> Result<Resolved> {
     let root_config = config
         .root(root)
         .ok_or_else(|| Error::Refused(format!("no Root named {root} is configured")))?;
@@ -133,7 +143,11 @@ pub(super) fn resolve(config: &Config, root: &str, rel: &str) -> Result<(String,
             configured.display()
         )));
     }
-    Ok((parts.join("/"), configured))
+    Ok(Resolved {
+        rel: parts.join("/"),
+        path: configured,
+        canonical_root,
+    })
 }
 
 impl Store {
@@ -145,7 +159,7 @@ impl Store {
         rel: &str,
         dat: &str,
     ) -> Result<SourceSetRecord> {
-        let (rel, _) = resolve(config, root, rel)?;
+        let rel = resolve(config, root, rel)?.rel;
         let name = rel.rsplit('/').next().unwrap_or(&rel).to_owned();
         let (provider, dat_name) = split_dat(dat)?;
         self.write(|tx| {

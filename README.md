@@ -76,16 +76,17 @@ writes a JSON report to stdout, or to `--output`. It only reads: the Source Set 
 
 The store is one directory: a SQLite database (`title-select.sqlite`), the unmodified DAT files under
 `dats/<sha256>`, and `backups/` (ADR 0003). Pass it with `--store <dir>` or `TITLE_SELECT_STORE`; it is created on
-first use.
+first use. Only one Title Select process may have a store open at a time: it holds an exclusive lock on
+`<store>/lock`, and another process fails at once with "the store is in use by another Title Select process".
 
 - The database runs in WAL mode. Every connection uses `synchronous=FULL`, `foreign_keys=ON` and a busy timeout.
 - A DAT file is written to a temp file, fsynced and renamed into place before its row is inserted. Files under
   `dats/` that no DAT Revision holds are deleted each time the store opens.
 - Migrations are embedded and forward-only. Before one runs on a store that already has a schema, the database is
   copied with `VACUUM INTO` to `backups/schema-<version>-<time>.sqlite`. A store from a newer Title Select is refused.
-- A DAT Revision's file is kept while a retained Audit refers to it or while it is the newest imported revision of
-  its DAT. Otherwise the file is deleted; the DAT Revision's row stays, so history still names it. Importing the
-  same file again restores it.
+- A DAT Revision's file is kept while a retained or running Audit refers to it or while it is the newest imported
+  revision of its DAT. Otherwise the file is deleted; the DAT Revision's row stays, so history still names it. Importing
+  the same file again restores it.
 
 ## Configuration
 
@@ -128,11 +129,12 @@ whether the full Audit is kept or only its summary.
 title-select audit --set <Source Set> [--revision <sha256 prefix>] [--output <report file>]
 ```
 
-Audits a registered Source Set, read-only, and records it. Without `--revision`, the DAT Revision is the latest
-Audit's, else the newest imported revision of the bound DAT, so a newer DAT Revision is adopted only by naming it.
-The Entries and Game Statuses are written in one transaction when the Audit finishes, and the report below is
-generated from them. Afterwards, Audits beyond the newest `audits.keep` are pruned to a one-row summary; the latest
-Audit, and any Audit cited as provenance, are never pruned.
+Audits a registered Source Set, read-only, and records it. Unlike the stateless Audit, it does not follow a symlink that
+resolves outside the Root: such a file or folder is an Unreadable Entry with that reason. Without `--revision`, the DAT
+Revision is the latest Audit's, else the newest imported revision of the bound DAT, so a newer DAT Revision is adopted
+only by naming it. The Entries and Game Statuses are written in one transaction when the Audit finishes, and the report
+below is generated from them. Afterwards, Audits beyond the newest `audits.keep` are pruned to a one-row summary; the
+latest Audit, and any Audit cited as provenance, are never pruned.
 
 ## Licence
 

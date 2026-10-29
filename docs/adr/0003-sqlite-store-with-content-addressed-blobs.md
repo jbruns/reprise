@@ -35,3 +35,7 @@ Postgres, which adds a Service to run and back up for a single-Operator applicat
 
 - The database and its blobs must live on one volume that supports fsync and atomic rename.
 - One writer bounds write throughput. That is enough for one Operator, and readers never block it in WAL mode.
+
+## Amendment (2026-10-29, #9)
+
+- One process at a time opens the store, holding an exclusive lock on `<store>/lock`: the Service (#10).

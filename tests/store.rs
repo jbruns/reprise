@@ -31,6 +31,15 @@ impl Env {
         Env { tmp, store, config }
     }
 
+    /// Closes the store and opens it again, as a restarted process would. The temp dir is returned so that it
+    /// outlives the store.
+    fn reopen(self) -> (tempfile::TempDir, Store) {
+        let Env { tmp, store, .. } = self;
+        let dir = store.dir().to_path_buf();
+        drop(store);
+        (tmp, Store::open(&dir).unwrap())
+    }
+
     fn root(&self) -> PathBuf {
         self.tmp.path().join("roots/sets")
     }
@@ -68,6 +77,11 @@ impl Env {
         self.store
             .add_source_set(&self.config, "sets", SET, "No-Intro/Test - System")
             .unwrap();
+    }
+
+    fn add_dat_and_set(&self) {
+        self.import(1);
+        self.add_set();
     }
 
     fn audit(&self, revision: Option<&str>) -> title_select::store::StoredAudit {
@@ -153,11 +167,12 @@ fn a_blob_without_a_row_is_collected() {
     assert!(env.store.blob_path(&held).is_file());
 
     std::fs::write(dats.join(&orphan), b"no row").unwrap();
-    drop(Store::open(env.store.dir()).unwrap());
+    let (_tmp, store) = env.reopen();
     assert!(
         !dats.join(&orphan).exists(),
         "opening the store collects too"
     );
+    assert!(store.blob_path(&held).is_file());
 }
 
 #[test]
@@ -408,4 +423,128 @@ fn a_writable_root_is_refused_in_this_slice() {
     let refused = Config::parse("[roots.sets]\npath = \"/sets\"\nwritable = true\n");
 
     assert!(refused.is_err());
+}
+
+fn database(store: &Store) -> rusqlite::Connection {
+    rusqlite::Connection::open(store.dir().join("title-select.sqlite")).unwrap()
+}
+
+#[test]
+fn a_running_audit_holds_its_dat_revision_until_a_restart_discards_it() {
+    let env = Env::new(20);
+    let (first, _) = env.import(1);
+    env.add_set();
+    let db = database(&env.store);
+    db.execute(
+        "INSERT INTO audits (source_set_id, dat_revision_id, status, source_set_path, started_at)
+         SELECT s.id, r.id, 'running', 'set', 'now' FROM source_sets s, dat_revisions r WHERE r.sha256 = ?1",
+        [&first],
+    )
+    .unwrap();
+
+    env.import(2);
+
+    assert!(env.blob_present(&first), "the running Audit holds it");
+    assert!(env.store.history("Test - System").unwrap().is_empty());
+    let (_tmp, store) = env.reopen();
+    let running: i64 = database(&store)
+        .query_row("SELECT count(*) FROM audits", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(running, 0, "a restart discards the unfinished Audit");
+    assert!(
+        !store.blob_path(&first).exists(),
+        "and then nothing holds it"
+    );
+}
+
+#[test]
+fn an_audit_that_fails_leaves_no_row() {
+    let env = Env::new(20);
+    let (sha, _) = env.import(1);
+    env.add_set();
+    std::fs::write(env.store.blob_path(&sha), b"<datafile></datafile>").unwrap();
+
+    let failed = env
+        .store
+        .audit_source_set(&env.config, "Test - System", None);
+
+    assert!(matches!(failed, Err(Error::Io(_))), "{failed:?}");
+    let rows: i64 = database(&env.store)
+        .query_row("SELECT count(*) FROM audits", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[test]
+fn a_stored_audit_does_not_follow_symlinks_out_of_the_root() {
+    let env = Env::new(20);
+    env.import(1);
+    env.add_set();
+    let outside = env.tmp.path().join("outside");
+    write_file(&outside.join("Pong (USA).a26"), b"pong");
+    std::os::unix::fs::symlink(
+        outside.join("Pong (USA).a26"),
+        env.set_dir().join("Pong (USA).a26"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&outside, env.set_dir().join("elsewhere")).unwrap();
+    write_file(&env.root().join("shared/Combat (USA).a26"), b"combat");
+    std::os::unix::fs::symlink(env.root().join("shared"), env.set_dir().join("shared")).unwrap();
+
+    let stored = env.audit(None).report;
+
+    let finding = |path: &str| {
+        let entry = stored.entries.iter().find(|e| e.path == path).unwrap();
+        (entry.finding, entry.reason.clone())
+    };
+    let escaped = (
+        title_select::Finding::Unreadable,
+        Some("resolves outside the Root".to_owned()),
+    );
+    assert_eq!(finding("Pong (USA).a26"), escaped);
+    assert_eq!(finding("elsewhere"), escaped);
+    assert_eq!(
+        finding("shared/Combat (USA).a26").0,
+        title_select::Finding::Matched,
+        "a symlink inside the Root is followed"
+    );
+    assert_eq!(stored.entries.len(), 3, "nothing under `elsewhere` is read");
+
+    let stateless = title_select::audit(&env.dat(1), &env.set_dir()).unwrap();
+    assert_eq!(
+        stateless.summary.findings[&title_select::Finding::Matched],
+        3
+    );
+}
+
+#[test]
+fn an_ambiguous_revision_prefix_is_refused() {
+    let env = Env::new(20);
+    env.add_dat_and_set();
+    let mut seen: BTreeMap<char, String> = BTreeMap::new();
+    let mut shared = None;
+    for n in 0..17 {
+        let path = write_dat_version(
+            &env.tmp.path().join("in"),
+            &format!("v{n}.dat"),
+            &format!("v{n}"),
+            &[("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")])],
+        );
+        let (rev, _) = env.store.import_dat(&path, "No-Intro", None).unwrap();
+        let first = rev.sha256.chars().next().unwrap();
+        if seen.insert(first, rev.sha256).is_some() {
+            shared = Some(first);
+            break;
+        }
+    }
+    let prefix = shared.expect("17 SHA-256s share a first digit").to_string();
+
+    let refused = env
+        .store
+        .audit_source_set(&env.config, "Test - System", Some(&prefix));
+
+    let Err(Error::Refused(message)) = refused else {
+        panic!("expected a refusal: {refused:?}");
+    };
+    assert!(message.contains("more than one"), "{message}");
 }
