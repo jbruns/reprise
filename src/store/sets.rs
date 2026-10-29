@@ -1,0 +1,207 @@
+//! The Source Set registry: each Source Set is a Root plus a relative path, bound to a DAT.
+
+use std::path::{Component, Path, PathBuf};
+
+use rusqlite::{Connection, OptionalExtension, Row, params};
+
+use super::dats::split_dat;
+use super::{Error, Result, Store, now};
+use crate::config::Config;
+
+/// The DAT Revision a Source Set was last verified against: its latest Audit's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastVerified {
+    pub sha256: String,
+    pub version: String,
+    pub finished_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSetRecord {
+    /// The Source Set's folder name, which identifies it.
+    pub name: String,
+    pub root: String,
+    /// Relative to the Root, with `/` separators.
+    pub path: String,
+    /// The bound DAT, as `<provider>/<name>`.
+    pub dat: String,
+    pub added_at: String,
+    pub last_verified_against: Option<LastVerified>,
+}
+
+pub(super) struct SourceSetRow {
+    pub id: i64,
+    pub dat_id: i64,
+    pub record: SourceSetRecord,
+}
+
+const SET_QUERY: &str =
+    "SELECT s.id, s.dat_id, s.name, s.root, s.path, d.provider || '/' || d.name, s.added_at,
+            r.sha256, r.version, a.finished_at
+     FROM source_sets s
+     JOIN dats d ON d.id = s.dat_id
+     LEFT JOIN audits a ON a.id = (SELECT id FROM audits
+                                  WHERE source_set_id = s.id AND status = 'finished'
+                                  ORDER BY finish_seq DESC LIMIT 1)
+     LEFT JOIN dat_revisions r ON r.id = a.dat_revision_id";
+
+fn set_from_row(row: &Row) -> rusqlite::Result<SourceSetRow> {
+    let sha256: Option<String> = row.get(7)?;
+    let last_verified_against = match sha256 {
+        Some(sha256) => Some(LastVerified {
+            sha256,
+            version: row.get(8)?,
+            finished_at: row.get(9)?,
+        }),
+        None => None,
+    };
+    Ok(SourceSetRow {
+        id: row.get(0)?,
+        dat_id: row.get(1)?,
+        record: SourceSetRecord {
+            name: row.get(2)?,
+            root: row.get(3)?,
+            path: row.get(4)?,
+            dat: row.get(5)?,
+            added_at: row.get(6)?,
+            last_verified_against,
+        },
+    })
+}
+
+pub(super) fn set_by_name(c: &Connection, name: &str) -> Result<SourceSetRow> {
+    c.query_row(
+        &format!("{SET_QUERY} WHERE s.name = ?1"),
+        [name],
+        set_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| Error::Refused(format!("no Source Set named {name}")))
+}
+
+/// A Source Set's folder, checked to lie inside its Root.
+pub(super) struct Resolved {
+    /// Relative to the Root, with `/` separators.
+    pub rel: String,
+    /// The Root's path, as configured, joined with `rel`.
+    pub path: PathBuf,
+    /// The Root's canonical path, which every file an Audit reads must resolve inside.
+    pub canonical_root: PathBuf,
+}
+
+/// Checks that `rel` names a directory inside the Root called `root`.
+///
+/// Refuses an absolute path, `..`, and a path that, after following symlinks, resolves outside the Root.
+pub(super) fn resolve(config: &Config, root: &str, rel: &str) -> Result<Resolved> {
+    let root_config = config
+        .root(root)
+        .ok_or_else(|| Error::Refused(format!("no Root named {root} is configured")))?;
+    let rel_path = Path::new(rel);
+    if rel_path.has_root() || rel_path.is_absolute() {
+        return Err(Error::Refused(format!(
+            "{rel}: a Source Set's path must be relative to its Root"
+        )));
+    }
+    let mut parts = Vec::new();
+    for component in rel_path.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(Error::Refused(format!(
+                    "{rel}: a Source Set's path must not contain `..`"
+                )));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::Refused(format!(
+                    "{rel}: a Source Set's path must be relative to its Root"
+                )));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(Error::Refused(
+            "a Source Set's path must name a folder inside its Root".into(),
+        ));
+    }
+    let canonical_root = root_config.path.canonicalize().map_err(|e| {
+        Error::Refused(format!("Root {root} ({}): {e}", root_config.path.display()))
+    })?;
+    let configured = parts
+        .iter()
+        .fold(root_config.path.clone(), |p, part| p.join(part));
+    let canonical = configured
+        .canonicalize()
+        .map_err(|e| Error::Refused(format!("{}: {e}", configured.display())))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(Error::Refused(format!(
+            "{rel}: resolves outside Root {root}"
+        )));
+    }
+    if !canonical.is_dir() {
+        return Err(Error::Refused(format!(
+            "{}: not a directory",
+            configured.display()
+        )));
+    }
+    Ok(Resolved {
+        rel: parts.join("/"),
+        path: configured,
+        canonical_root,
+    })
+}
+
+impl Store {
+    /// Registers the folder `rel` in the Root `root` as a Source Set bound to `dat` (`<provider>/<name>`).
+    pub fn add_source_set(
+        &self,
+        config: &Config,
+        root: &str,
+        rel: &str,
+        dat: &str,
+    ) -> Result<SourceSetRecord> {
+        let rel = resolve(config, root, rel)?.rel;
+        let name = rel.rsplit('/').next().unwrap_or(&rel).to_owned();
+        let (provider, dat_name) = split_dat(dat)?;
+        self.write(|tx| {
+            let dat_id: i64 = tx
+                .query_row(
+                    "SELECT id FROM dats WHERE provider = ?1 AND name = ?2",
+                    params![provider, dat_name],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::Refused(format!("no DAT {dat} has been imported")))?;
+            let clash: Option<String> = tx
+                .query_row(
+                    "SELECT name FROM source_sets WHERE name = ?1 OR (root = ?2 AND path = ?3)",
+                    params![name, root, rel],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(clash) = clash {
+                return Err(Error::Refused(format!(
+                    "a Source Set named {clash} already uses that name or folder"
+                )));
+            }
+            tx.execute(
+                "INSERT INTO source_sets (name, root, path, dat_id, added_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![name, root, rel, dat_id, now()],
+            )?;
+            Ok(set_by_name(tx, &name)?.record)
+        })
+    }
+
+    /// Every registered Source Set, by name.
+    pub fn source_sets(&self) -> Result<Vec<SourceSetRecord>> {
+        self.read(|c| {
+            let mut stmt = c.prepare(&format!("{SET_QUERY} ORDER BY s.name"))?;
+            let rows = stmt.query_map([], |r| set_from_row(r).map(|s| s.record))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    pub fn source_set(&self, name: &str) -> Result<SourceSetRecord> {
+        self.read(|c| set_by_name(c, name).map(|s| s.record))
+    }
+}

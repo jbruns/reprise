@@ -1,7 +1,9 @@
 //! Audits a Source Set against a DAT Revision (see GLOSSARY.md and ADR 0002).
 
+pub mod config;
 mod dat;
 mod payload;
+pub mod store;
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -32,7 +34,7 @@ pub enum Finding {
 }
 
 impl Finding {
-    const ALL: [Finding; 6] = [
+    pub const ALL: [Finding; 6] = [
         Finding::Matched,
         Finding::Misnamed,
         Finding::Conflicting,
@@ -40,6 +42,22 @@ impl Finding {
         Finding::Unmatched,
         Finding::Unreadable,
     ];
+
+    /// The name the report uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Finding::Matched => "matched",
+            Finding::Misnamed => "misnamed",
+            Finding::Conflicting => "conflicting",
+            Finding::Mismatched => "mismatched",
+            Finding::Unmatched => "unmatched",
+            Finding::Unreadable => "unreadable",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Finding> {
+        Finding::ALL.into_iter().find(|f| f.as_str() == s)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -51,11 +69,24 @@ pub enum GameStatus {
 }
 
 impl GameStatus {
-    const ALL: [GameStatus; 3] = [
+    pub const ALL: [GameStatus; 3] = [
         GameStatus::Complete,
         GameStatus::Incomplete,
         GameStatus::Missing,
     ];
+
+    /// The name the report uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GameStatus::Complete => "complete",
+            GameStatus::Incomplete => "incomplete",
+            GameStatus::Missing => "missing",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<GameStatus> {
+        GameStatus::ALL.into_iter().find(|g| g.as_str() == s)
+    }
 }
 
 /// Only Payload exists so far: every Entry's bytes are read and checksummed.
@@ -64,6 +95,22 @@ impl GameStatus {
 pub enum EvidenceLevel {
     Payload,
 }
+
+impl EvidenceLevel {
+    /// The name the report uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EvidenceLevel::Payload => "payload",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<EvidenceLevel> {
+        (s == "payload").then_some(EvidenceLevel::Payload)
+    }
+}
+
+/// Every algorithm an Evidence can list, in report order.
+pub const ALGORITHMS: [&str; 5] = ["size", "crc32", "md5", "sha1", "sha256"];
 
 /// What the Audit actually checked for an Entry.
 #[derive(Debug, Serialize)]
@@ -90,7 +137,7 @@ pub struct Summary {
 }
 
 /// A ROM of a DAT Revision, by its Game and name.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct RomRef {
     pub game: String,
     pub name: String,
@@ -145,6 +192,22 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 /// Audits the Source Set at `root` against the DAT Revision at `dat_path`, reading every payload.
 pub fn audit(dat_path: &Path, root: &Path) -> Result<Report, Error> {
+    let file = dat_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    audit_as(dat_path, file, root, None)
+}
+
+/// Like [`audit`], but reports the DAT Revision under `file`, its original filename. With `confine`, a canonical
+/// path, every file and directory must resolve inside it: one that resolves outside is an Unreadable Entry and is
+/// not read, and the file read is the one its resolved path names.
+pub(crate) fn audit_as(
+    dat_path: &Path,
+    file: String,
+    root: &Path,
+    confine: Option<&Path>,
+) -> Result<Report, Error> {
     let started_at = jiff::Timestamp::now();
     if !root.is_dir() {
         return Err(Error::SourceSet(format!(
@@ -164,10 +227,11 @@ pub fn audit(dat_path: &Path, root: &Path) -> Result<Report, Error> {
             .to_string_lossy()
             .into_owned()
     };
-    for item in walkdir::WalkDir::new(root)
+    let mut walk = walkdir::WalkDir::new(root)
         .follow_links(true)
         .sort_by_file_name()
-    {
+        .into_iter();
+    while let Some(item) = walk.next() {
         let item = match item {
             Ok(item) => item,
             Err(err) if err.depth() == 0 => return Err(Error::SourceSet(err.to_string())),
@@ -177,6 +241,27 @@ pub fn audit(dat_path: &Path, root: &Path) -> Result<Report, Error> {
                 continue;
             }
         };
+        let mut path = item.path().to_path_buf();
+        if let Some(confine) = confine {
+            let refusal = match item.path().canonicalize() {
+                Ok(real) if real.starts_with(confine) => {
+                    path = real;
+                    None
+                }
+                Ok(_) => Some("resolves outside the Root".to_owned()),
+                Err(err) => Some(err.to_string()),
+            };
+            if let Some(reason) = refusal {
+                if item.depth() == 0 {
+                    return Err(Error::SourceSet(format!("{}: {reason}", root.display())));
+                }
+                if item.file_type().is_dir() {
+                    walk.skip_current_dir();
+                }
+                scan.unreadable(rel(item.path()), None, reason);
+                continue;
+            }
+        }
         if !item.file_type().is_file() {
             continue;
         }
@@ -185,7 +270,7 @@ pub fn audit(dat_path: &Path, root: &Path) -> Result<Report, Error> {
             .path()
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
-        if let Err(reason) = scan.read_file(item.path(), &rel, is_zip) {
+        if let Err(reason) = scan.read_file(&path, &rel, is_zip) {
             scan.unreadable(rel, None, reason);
         }
     }
@@ -204,10 +289,7 @@ pub fn audit(dat_path: &Path, root: &Path) -> Result<Report, Error> {
             sha256: dat.sha256.clone(),
             name: dat.name.clone(),
             version: dat.version.clone(),
-            file: dat_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            file,
         },
         source_set: root.display().to_string(),
         started_at,
