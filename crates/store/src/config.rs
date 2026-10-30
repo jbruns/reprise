@@ -379,6 +379,7 @@ mod tests {
             ("../{dat}", "the template must not contain `..`"),
             ("/{dat}", "the template must be relative to its root"),
             ("C:/{dat}", "the template must be relative to its root"),
+            ("./C:/{dat}", "the template must be relative to its root"),
             (
                 r"{provider}\{dat}",
                 "the template must separate folders with /",

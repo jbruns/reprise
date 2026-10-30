@@ -329,7 +329,12 @@ pub fn relative_path(path: &str) -> Result<String, PathError> {
     if parts.is_empty() {
         return Err(PathError::Empty);
     }
-    Ok(parts.join("/"))
+    let path = parts.join("/");
+    // Dropping `.` components can bring a drive prefix to the front, as in `./C:/folder`.
+    if has_drive_prefix(&path) {
+        return Err(PathError::Absolute);
+    }
+    Ok(path)
 }
 
 /// Whether `path` starts with a Windows drive prefix: a letter and a colon, such as `C:` or `c:folder`.
@@ -457,6 +462,8 @@ mod tests {
             (r"C:\root\folder", PathError::Absolute),
             ("C:/root/folder", PathError::Absolute),
             ("c:folder", PathError::Absolute),
+            ("./C:/folder", PathError::Absolute),
+            (".//./c:folder", PathError::Absolute),
             (r"\\server\share\folder", PathError::Backslash),
             ("//server/share/folder", PathError::Absolute),
             (r"\\?\C:\folder", PathError::Backslash),
@@ -474,6 +481,7 @@ mod tests {
             }
         );
         assert_eq!(relative_path("No-Intro/a:b").unwrap(), "No-Intro/a:b");
+        assert_eq!(relative_path("./No-Intro/C:").unwrap(), "No-Intro/C:");
     }
 
     #[test]
@@ -485,6 +493,7 @@ mod tests {
             ("{provider}/../../{dat}", PathError::ParentDir),
             ("/{dat}", PathError::Absolute),
             ("C:/{dat}", PathError::Absolute),
+            ("./C:/{dat}", PathError::Absolute),
             (r"{provider}\{dat}", PathError::Backslash),
         ] {
             assert_eq!(
@@ -497,7 +506,14 @@ mod tests {
             PathTemplate::parse("../{dat}").unwrap_err().to_string(),
             "the template must not contain `..`"
         );
-        for template in ["{dat}", "{dat}..", "..{dat}", "{provider}:{dat}", "{dat}/."] {
+        for template in [
+            "{dat}",
+            "{dat}..",
+            "..{dat}",
+            "{provider}:{dat}",
+            "{dat}/.",
+            "./{provider}/C:/{dat}",
+        ] {
             assert!(PathTemplate::parse(template).is_ok(), "{template:?}");
         }
     }
