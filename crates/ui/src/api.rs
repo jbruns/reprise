@@ -49,7 +49,17 @@ pub async fn text(path: &str) -> Result<String, String> {
 }
 
 pub async fn post<B: Serialize, T: DeserializeOwned>(path: &str, body: &B) -> Result<T, String> {
+    post_until(path, body, None).await
+}
+
+/// Like `post`, but `signal` aborts the request, which closes the connection so the Service stops the work.
+pub async fn post_until<B: Serialize, T: DeserializeOwned>(
+    path: &str,
+    body: &B,
+    signal: Option<&web_sys::AbortSignal>,
+) -> Result<T, String> {
     let request = Request::post(&url(path))
+        .abort_signal(signal)
         .json(body)
         .map_err(|e| e.to_string())?;
     let response = request.send().await.map_err(failed)?;

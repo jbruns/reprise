@@ -320,6 +320,15 @@ fn Editor(name: Option<String>, initial: Option<ProfileVersion>) -> impl IntoVie
         }
     });
     let sequence = StoredValue::new(0u64);
+    // The request in flight, aborted when a newer preview starts or the editor goes, so that the Service stops
+    // the engine run instead of finishing it for nobody.
+    let in_flight = StoredValue::new_local(None::<web_sys::AbortController>);
+    let abort = move || {
+        if let Some(Some(controller)) = in_flight.try_update_value(Option::take) {
+            controller.abort();
+        }
+    };
+    on_cleanup(abort);
     let run_preview = move || {
         let source_set = set.get_untracked();
         if source_set.is_empty() {
@@ -333,8 +342,12 @@ fn Editor(name: Option<String>, initial: Option<ProfileVersion>) -> impl IntoVie
         let n = sequence.get_value() + 1;
         sequence.set_value(n);
         running.set(true);
+        abort();
+        let controller = web_sys::AbortController::new().ok();
+        let signal = controller.as_ref().map(web_sys::AbortController::signal);
+        in_flight.set_value(controller);
         leptos::task::spawn_local(async move {
-            let result = api::post::<_, Preview>("/preview", &request).await;
+            let result = api::post_until::<_, Preview>("/preview", &request, signal.as_ref()).await;
             // A newer preview superseded this one, or the editor is gone.
             if sequence.try_get_value() != Some(n) {
                 return;

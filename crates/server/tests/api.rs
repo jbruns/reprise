@@ -755,6 +755,100 @@ mod selections {
             .collect()
     }
 
+    /// A client that goes away mid-preview stops the engine run: its run folder under the store's `tmp` goes at
+    /// once instead of when the run would have finished.
+    #[test]
+    fn a_preview_whose_client_goes_away_stops_the_engine() {
+        use std::io::Write as _;
+        let env = Env::new();
+        let names: Vec<String> = (0..10_000)
+            .flat_map(|i| {
+                [
+                    format!("Game {i:05} (USA)"),
+                    format!("Game {i:05} (Europe)"),
+                ]
+            })
+            .collect();
+        let games: Vec<(&str, Vec<RomSpec>)> = names
+            .iter()
+            .map(|name| {
+                let file: &'static str = Box::leak(format!("{name}.a26").into_boxed_str());
+                (name.as_str(), vec![rom(file, name.as_bytes())])
+            })
+            .collect();
+        let path = write_dat_version(
+            &env.tmp.path().join("in"),
+            "Test - System (20260101).dat",
+            "20260101",
+            &games,
+        );
+        let service = env.start();
+        let client = Client::new(&service);
+        let (status, _) = client.upload(
+            "Test - System (20260101).dat",
+            &std::fs::read(path).unwrap(),
+        );
+        assert_eq!(status, 201);
+        client.add_set();
+        let job: Job = client.start_audit().body_mut().read_json().unwrap();
+        assert_eq!(client.follow(job.id).1.state, JobState::Succeeded);
+        let runs = || -> Vec<PathBuf> {
+            std::fs::read_dir(env.store().join("tmp"))
+                .into_iter()
+                .flatten()
+                .map(|e| e.unwrap().path())
+                .filter(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("selection-")
+                })
+                .collect()
+        };
+        let wait_for = |what: &str, done: &dyn Fn() -> bool, within: std::time::Duration| {
+            let started = std::time::Instant::now();
+            while !done() {
+                assert!(started.elapsed() < within, "{what} within {within:?}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        let body = json!({"source_set": SET, "profile": {}}).to_string();
+        let address = service.url().trim_start_matches("http://").to_owned();
+        let mut connection = std::net::TcpStream::connect(address).unwrap();
+        write!(
+            connection,
+            "POST /api/v1/preview HTTP/1.1\r\nhost: test\r\nauthorization: Bearer {TOKEN}\r\n\
+             content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        wait_for(
+            "the engine to start",
+            &|| !runs().is_empty(),
+            std::time::Duration::from_secs(60),
+        );
+        drop(connection);
+        wait_for(
+            "the engine to stop",
+            &|| runs().is_empty(),
+            std::time::Duration::from_secs(5),
+        );
+        let stopped = started.elapsed();
+
+        // Done before the run could have finished: a whole preview of this DAT takes several seconds.
+        let (_, whole) = send(
+            client.post("/preview"),
+            json!({"source_set": SET, "profile": {}}),
+        );
+        let elapsed = std::time::Duration::from_millis(whole["elapsed_ms"].as_u64().unwrap());
+        assert!(
+            stopped < elapsed,
+            "stopped after {stopped:?}, a whole run takes {elapsed:?}"
+        );
+    }
+
     #[test]
     fn a_first_run_previews_a_draft_and_saves_it_only_when_confirmed() {
         let env = Env::new();
