@@ -1,0 +1,260 @@
+{
+  "pins": {
+    "retool_commit": "",
+    "patch_set_sha256": "",
+    "clone_list_commit": "",
+    "trace_schema": 0
+  },
+  "dat_sha256": "a88550ec36e6ed0f76fbfa5ee2c9b2b793888ff24d61d13fdd292225efa0889a",
+  "system": "Retool - Prefer oldest",
+  "system_settings": false,
+  "summary": {
+    "groups": 7,
+    "winners": 7,
+    "alternatives": 10,
+    "exclusions": 0,
+    "unresolved": 0
+  },
+  "coverage_drift": {
+    "clone_list": true,
+    "metadata": false,
+    "unmatched_clone_list_terms": [],
+    "titles_without_metadata": [
+      "Test Title (USA)",
+      "Test Title (USA) (2004-01-01)",
+      "Test Title (USA) (2004-02-01)",
+      "Test Title 2 (USA) (2004-01-01)",
+      "Test Title 2 (USA) (2004-02-01)",
+      "Test Title 3 (USA)",
+      "Test Title 3 (USA) (Rev 1)",
+      "Test Title 3 (USA) (Rev 2)",
+      "Test Title 4 (USA)",
+      "Test Title 4 - GOTY (USA)",
+      "Test Title 5 (USA)",
+      "Test Title 5 - I like this version (USA)",
+      "Test Title 6 (USA)",
+      "Test Title 6 (USA) (Rev 1)",
+      "Test Title 6 (USA) (Rev 2)",
+      "Test Title 7 (USA)",
+      "Test Title 7 (USA) (PlayStation the Best)"
+    ]
+  },
+  "groups": [
+    {
+      "group": "test title",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title (USA) (2004-02-01)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0009",
+            "message": "Group after choosing dates"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [
+        {
+          "title": "Test Title (USA)",
+          "clone_of": "Test Title (USA) (2004-02-01)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0009",
+            "message": "Group after choosing dates"
+          }
+        },
+        {
+          "title": "Test Title (USA) (2004-01-01)",
+          "clone_of": "Test Title (USA) (2004-02-01)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0009",
+            "message": "Group after choosing dates"
+          }
+        }
+      ],
+      "exclusions": []
+    },
+    {
+      "group": "test title 2",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 2 (USA) (2004-02-01)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0009",
+            "message": "Group after choosing dates"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [
+        {
+          "title": "Test Title 2 (USA) (2004-01-01)",
+          "clone_of": "Test Title 2 (USA) (2004-02-01)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0009",
+            "message": "Group after choosing dates"
+          }
+        }
+      ],
+      "exclusions": []
+    },
+    {
+      "group": "test title 3",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 3 (USA) (Rev 2)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0007",
+            "message": "Group after handling versions and revisions"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [
+        {
+          "title": "Test Title 3 (USA)",
+          "clone_of": "Test Title 3 (USA) (Rev 2)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0007",
+            "message": "Group after handling versions and revisions"
+          }
+        },
+        {
+          "title": "Test Title 3 (USA) (Rev 1)",
+          "clone_of": "Test Title 3 (USA) (Rev 2)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0007",
+            "message": "Group after handling versions and revisions"
+          }
+        }
+      ],
+      "exclusions": []
+    },
+    {
+      "group": "test title 4",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 4 - GOTY (USA)",
+          "rule": {
+            "stage": "Superset parent selection",
+            "ref": "REF0076",
+            "message": "Group after choosing superset titles"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [
+        {
+          "title": "Test Title 4 (USA)",
+          "clone_of": "Test Title 4 - GOTY (USA)",
+          "rule": {
+            "stage": "Superset parent selection",
+            "ref": "REF0076",
+            "message": "Group after choosing superset titles"
+          }
+        }
+      ],
+      "exclusions": []
+    },
+    {
+      "group": "test title 5",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 5 - I like this version (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0002",
+            "message": "Group after taking clone list priorities into account"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [
+        {
+          "title": "Test Title 5 (USA)",
+          "clone_of": "Test Title 5 - I like this version (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0002",
+            "message": "Group after taking clone list priorities into account"
+          }
+        }
+      ],
+      "exclusions": []
+    },
+    {
+      "group": "test title 6",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 6 (USA) (Rev 2)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0007",
+            "message": "Group after handling versions and revisions"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [
+        {
+          "title": "Test Title 6 (USA)",
+          "clone_of": "Test Title 6 (USA) (Rev 2)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0007",
+            "message": "Group after handling versions and revisions"
+          }
+        },
+        {
+          "title": "Test Title 6 (USA) (Rev 1)",
+          "clone_of": "Test Title 6 (USA) (Rev 2)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0007",
+            "message": "Group after handling versions and revisions"
+          }
+        }
+      ],
+      "exclusions": []
+    },
+    {
+      "group": "test title 7",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 7 (USA) (PlayStation the Best)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0113",
+            "message": "Marking a title as English-friendly due to a condition in the Variants object being true"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [
+        {
+          "title": "Test Title 7 (USA)",
+          "clone_of": "Test Title 7 (USA) (PlayStation the Best)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0113",
+            "message": "Marking a title as English-friendly due to a condition in the Variants object being true"
+          }
+        }
+      ],
+      "exclusions": []
+    }
+  ]
+}

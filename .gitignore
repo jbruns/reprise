@@ -6,3 +6,6 @@
 # Per-issue agent worktrees
 .worktrees/
 /.venv/
+
+# Retool for Selection, built by tools/retool/setup
+/.retool/

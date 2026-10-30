@@ -2646,6 +2646,7 @@ dependencies = [
  "tempfile",
  "title-select-api",
  "title-select-engine",
+ "title-select-selection",
  "title-select-server",
  "title-select-store",
  "ureq",
@@ -2676,6 +2677,19 @@ dependencies = [
  "title-select-api",
  "walkdir",
  "zip",
+]
+
+[[package]]
+name = "title-select-selection"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "title-select-api",
+ "toml",
 ]
 
 [[package]]

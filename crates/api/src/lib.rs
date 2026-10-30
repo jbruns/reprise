@@ -2,6 +2,7 @@
 //! (ADR 0005). Every response body is one of these, or the `schema: 2` [`Report`].
 
 pub mod report;
+pub mod selection;
 
 use std::collections::BTreeMap;
 

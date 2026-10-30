@@ -160,3 +160,35 @@ fn a_stored_audit_without_a_store_fails_with_a_message() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("--store"));
 }
+
+#[test]
+fn select_prints_the_selection_and_refuses_a_profile_it_cannot_read() {
+    let (f, dat) = pong_fixture();
+    let profile = f.dat_dir.path().join("profile.json");
+    std::fs::write(&profile, r#"{"region_order": ["USA"]}"#).unwrap();
+
+    let stdout = run_ok(
+        title_select()
+            .arg("select")
+            .arg("--dat")
+            .arg(&dat)
+            .arg("--profile")
+            .arg(&profile),
+    );
+    let selection: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(selection["system"], "Test - System");
+    assert_eq!(selection["groups"][0]["winners"][0]["title"], "Pong (USA)");
+
+    std::fs::write(&profile, r#"{"region_ordr": ["USA"]}"#).unwrap();
+    let out = title_select()
+        .arg("select")
+        .arg("--dat")
+        .arg(&dat)
+        .arg("--profile")
+        .arg(&profile)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("region_ordr"));
+}

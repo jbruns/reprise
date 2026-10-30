@@ -1,0 +1,1047 @@
+{
+  "pins": {
+    "retool_commit": "",
+    "patch_set_sha256": "",
+    "clone_list_commit": "",
+    "trace_schema": 0
+  },
+  "dat_sha256": "9f591e7aeda39392839ae6cf1a8238332afa20d50a8b8fa64ad4e21d92d0594e",
+  "system": "Retool - Exclusions",
+  "system_settings": false,
+  "summary": {
+    "groups": 55,
+    "winners": 1,
+    "alternatives": 0,
+    "exclusions": 57,
+    "unresolved": 0
+  },
+  "coverage_drift": {
+    "clone_list": false,
+    "metadata": false,
+    "unmatched_clone_list_terms": [],
+    "titles_without_metadata": [
+      "Test Title 0 (USA)",
+      "Test Title 1 (USA)",
+      "Test Title 10 (USA) (Enhancement Chip)",
+      "Test Title 11 (USA)",
+      "Test Title 12 (USA)",
+      "Test Title 13 (USA)",
+      "Test Title 14 (USA) (Demo)",
+      "Test Title 15 (USA) (Demo 2)",
+      "Test Title 16 (USA) (Demo-CD)",
+      "Test Title 17 (Japan) (@barai)",
+      "Test Title 18 (USA) (GameCube Preview)",
+      "Test Title 19 (USA) (Kiosk Special)",
+      "Test Title 2 (USA) (Program)",
+      "Test Title 20 (USA) (Special Kiosk)",
+      "Test Title 21 Kiosk Demo Disc (USA)",
+      "Test Title 22 - PS2 Kiosk (USA)",
+      "Test Title 23 - PSP System Kiosk (USA)",
+      "Test Title 24 (USA) (Preview)",
+      "Test Title 25 (USA) (Sample)",
+      "Test Title 26 (Japan) (Taikenban)",
+      "Test Title 27 Trial Edition (USA)",
+      "Test Title 28 (USA)",
+      "Test Title 29 (USA) (Manual)",
+      "Test Title 29A (USA)",
+      "Test Title 3 (USA) (Test Program)",
+      "Test Title 31 (USA)",
+      "Test Title 32 (USA)",
+      "Test Title 33 (Pirate) (USA)",
+      "Test Title 34 (Alpha) (USA)",
+      "Test Title 35 (Alpha 2) (USA)",
+      "Test Title 36 (Testing Alpha) (USA)",
+      "Test Title 37 (Beta) (USA)",
+      "Test Title 38 (Beta 2) (USA)",
+      "Test Title 39 (Testing Beta) (USA)",
+      "Test Title 4 Check Program (USA)",
+      "Test Title 40 (Proto) (USA)",
+      "Test Title 41 (Proto 2) (USA)",
+      "Test Title 42 (Testing Proto) (USA)",
+      "Test Title 43 (Pre-production) (USA)",
+      "Test Title 44 (USA)",
+      "Test Title 45 (USA) (Promo)",
+      "Test Title 46 EPK (USA)",
+      "Test Title 47 - Press Kit (USA)",
+      "Test Title 48 (USA) (Unl)",
+      "Test Title 49 (USA) (Aftermarket)",
+      "Test Title 5 Sample Program (USA)",
+      "Test Title 50 (USA)",
+      "Test Title 51 (USA) (Addon)",
+      "Test Title 52 (USA) (DLC)",
+      "Test Title 53 (USA) (Addon for XBLA)",
+      "Test Title 53 (USA) (Avatar)",
+      "Test Title 53 (USA) (Theme)",
+      "Test Title 6 (USA)",
+      "Test Title 6 (USA) (Soundtrack)",
+      "Test Title 7 (USA) [b]",
+      "Test Title 9 (USA)",
+      "[BIOS] Test Title 8 (USA)",
+      "[MIA] Test Title 30 (USA)"
+    ]
+  },
+  "groups": [
+    {
+      "group": "[bios] test title 8",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "[BIOS] Test Title 8 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: BIOS"
+          },
+          "reason": "Category exclude, BIOS"
+        }
+      ]
+    },
+    {
+      "group": "[mia] test title 30",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "[MIA] Test Title 30 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0062",
+            "message": "Excluded due to known MIA"
+          },
+          "reason": "Known MIA title"
+        }
+      ]
+    },
+    {
+      "group": "test title 0",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 0 (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0074",
+            "message": "Only one title in this region, skipping filtering"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [],
+      "exclusions": []
+    },
+    {
+      "group": "test title 1",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 1 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Add-Ons"
+          },
+          "reason": "Category exclude, Add-Ons"
+        }
+      ]
+    },
+    {
+      "group": "test title 10",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 10 (USA) (Enhancement Chip)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: BIOS"
+          },
+          "reason": "Category exclude, BIOS"
+        }
+      ]
+    },
+    {
+      "group": "test title 11",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 11 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Bonus Discs"
+          },
+          "reason": "Category exclude, Bonus Discs"
+        }
+      ]
+    },
+    {
+      "group": "test title 12",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 12 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Coverdiscs"
+          },
+          "reason": "Category exclude, Coverdiscs"
+        }
+      ]
+    },
+    {
+      "group": "test title 13",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 13 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 14",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 14 (USA) (Demo)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Games, Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 15",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 15 (USA) (Demo 2)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Games, Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 16",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 16 (USA) (Demo-CD)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Games, Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 17",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 17 (Japan) (@barai)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 18",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 18 (USA) (GameCube Preview)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 19",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 19 (USA) (Kiosk Special)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 2",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 2 (USA) (Program)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Applications"
+          },
+          "reason": "Category exclude, Applications"
+        }
+      ]
+    },
+    {
+      "group": "test title 20",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 20 (USA) (Special Kiosk)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 21 kiosk demo disc",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 21 Kiosk Demo Disc (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 22 - ps2 kiosk",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 22 - PS2 Kiosk (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 23 - psp system kiosk",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 23 - PSP System Kiosk (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 24",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 24 (USA) (Preview)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 25",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 25 (USA) (Sample)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 26",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 26 (Japan) (Taikenban)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 27 trial edition",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 27 Trial Edition (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Demos"
+          },
+          "reason": "Category exclude, Demos"
+        }
+      ]
+    },
+    {
+      "group": "test title 28",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 28 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Educational"
+          },
+          "reason": "Category exclude, Educational"
+        }
+      ]
+    },
+    {
+      "group": "test title 29",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 29 (USA) (Manual)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0044",
+            "message": "Excluded due to a categories regex: '\\\\(Manual\\\\)'"
+          },
+          "reason": "Category exclude, Manuals"
+        }
+      ]
+    },
+    {
+      "group": "test title 29a",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 29A (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Manuals"
+          },
+          "reason": "Category exclude, Manuals"
+        }
+      ]
+    },
+    {
+      "group": "test title 3",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 3 (USA) (Test Program)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Applications"
+          },
+          "reason": "Category exclude, Applications"
+        }
+      ]
+    },
+    {
+      "group": "test title 31",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 31 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0062",
+            "message": "Excluded due to known MIA"
+          },
+          "reason": "Known MIA title"
+        }
+      ]
+    },
+    {
+      "group": "test title 32",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 32 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Multimedia"
+          },
+          "reason": "Category exclude, Multimedia"
+        }
+      ]
+    },
+    {
+      "group": "test title 33",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 33 (Pirate) (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0044",
+            "message": "Excluded due to a categories regex: '\\\\(Pirate\\\\)'"
+          },
+          "reason": "Category exclude, Pirate"
+        }
+      ]
+    },
+    {
+      "group": "test title 34",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 34 (Alpha) (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Preproduction"
+          },
+          "reason": "Category exclude, Preproduction"
+        }
+      ]
+    },
+    {
+      "group": "test title 35",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 35 (Alpha 2) (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Preproduction"
+          },
+          "reason": "Category exclude, Preproduction"
+        }
+      ]
+    },
+    {
+      "group": "test title 36",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 36 (Testing Alpha) (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Preproduction"
+          },
+          "reason": "Category exclude, Preproduction"
+        }
+      ]
+    },
+    {
+      "group": "test title 37",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 37 (Beta) (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Preproduction"
+          },
+          "reason": "Category exclude, Preproduction"
+        }
+      ]
+    },
+    {
+      "group": "test title 38",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 38 (Beta 2) (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Preproduction"
+          },
+          "reason": "Category exclude, Preproduction"
+        }
+      ]
+    },
+    {
+      "group": "test title 39",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 39 (Testing Beta) (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Preproduction"
+          },
+          "reason": "Category exclude, Preproduction"
+        }
+      ]
+    },
+    {
+      "group": "test title 4 check program",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 4 Check Program (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Applications"
+          },
+          "reason": "Category exclude, Applications"
+        }
+      ]
+    },
+    {
+      "group": "test title 40",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 40 (Proto) (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Preproduction"
+          },
+          "reason": "Category exclude, Preproduction"
+        }
+      ]
+    },
+    {
+      "group": "test title 41",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 41 (Proto 2) (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Preproduction"
+          },
+          "reason": "Category exclude, Preproduction"
+        }
+      ]
+    },
+    {
+      "group": "test title 42",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 42 (Testing Proto) (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Preproduction"
+          },
+          "reason": "Category exclude, Preproduction"
+        }
+      ]
+    },
+    {
+      "group": "test title 43",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 43 (Pre-production) (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Preproduction"
+          },
+          "reason": "Category exclude, Preproduction"
+        }
+      ]
+    },
+    {
+      "group": "test title 44",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 44 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Promotional"
+          },
+          "reason": "Category exclude, Promotional"
+        }
+      ]
+    },
+    {
+      "group": "test title 45",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 45 (USA) (Promo)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0044",
+            "message": "Excluded due to a categories regex: 'EPK|Press Kit|\\\\(Promo\\\\)'"
+          },
+          "reason": "Category exclude, Promotional"
+        }
+      ]
+    },
+    {
+      "group": "test title 46 epk",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 46 EPK (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0044",
+            "message": "Excluded due to a categories regex: 'EPK|Press Kit|\\\\(Promo\\\\)'"
+          },
+          "reason": "Category exclude, Promotional"
+        }
+      ]
+    },
+    {
+      "group": "test title 47 - press kit",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 47 - Press Kit (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0044",
+            "message": "Excluded due to a categories regex: 'EPK|Press Kit|\\\\(Promo\\\\)'"
+          },
+          "reason": "Category exclude, Promotional"
+        }
+      ]
+    },
+    {
+      "group": "test title 48",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 48 (USA) (Unl)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0044",
+            "message": "Excluded due to a categories regex: '\\\\(Unl\\\\)'"
+          },
+          "reason": "Category exclude, Unlicensed"
+        }
+      ]
+    },
+    {
+      "group": "test title 49",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 49 (USA) (Aftermarket)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0044",
+            "message": "Excluded due to a categories regex: '\\\\(Aftermarket\\\\)'"
+          },
+          "reason": "Category exclude, Aftermarket"
+        }
+      ]
+    },
+    {
+      "group": "test title 5 sample program",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 5 Sample Program (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Applications"
+          },
+          "reason": "Category exclude, Applications"
+        }
+      ]
+    },
+    {
+      "group": "test title 50",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 50 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Video"
+          },
+          "reason": "Category exclude, Video"
+        }
+      ]
+    },
+    {
+      "group": "test title 51",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 51 (USA) (Addon)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Add-Ons"
+          },
+          "reason": "Category exclude, Add-Ons"
+        }
+      ]
+    },
+    {
+      "group": "test title 52",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 52 (USA) (DLC)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Add-Ons"
+          },
+          "reason": "Category exclude, Add-Ons"
+        }
+      ]
+    },
+    {
+      "group": "test title 53",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 53 (USA) (Addon for XBLA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Add-Ons"
+          },
+          "reason": "Category exclude, Add-Ons"
+        },
+        {
+          "title": "Test Title 53 (USA) (Avatar)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Add-Ons"
+          },
+          "reason": "Category exclude, Add-Ons"
+        },
+        {
+          "title": "Test Title 53 (USA) (Theme)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Add-Ons"
+          },
+          "reason": "Category exclude, Add-Ons"
+        }
+      ]
+    },
+    {
+      "group": "test title 6",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 6 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Audio"
+          },
+          "reason": "Category exclude, Audio"
+        },
+        {
+          "title": "Test Title 6 (USA) (Soundtrack)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: Games, Audio"
+          },
+          "reason": "Category exclude, Audio"
+        }
+      ]
+    },
+    {
+      "group": "test title 7",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 7 (USA) [b]",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0044",
+            "message": "Excluded due to a categories regex: '\\\\[b\\\\]'"
+          },
+          "reason": "Category exclude, Bad Dumps"
+        }
+      ]
+    },
+    {
+      "group": "test title 9",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 9 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "ref": "REF0042",
+            "message": "Excluded due to categories: BIOS"
+          },
+          "reason": "Category exclude, BIOS"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,167 @@
+{
+  "pins": {
+    "retool_commit": "",
+    "patch_set_sha256": "",
+    "clone_list_commit": "",
+    "trace_schema": 0
+  },
+  "dat_sha256": "1f80277bb1641832ed43688a504e763b1bde2c0630351ee52fb27e4e2d1ef4de",
+  "system": "Retool - Post Filters",
+  "system_settings": false,
+  "summary": {
+    "groups": 8,
+    "winners": 4,
+    "alternatives": 0,
+    "exclusions": 4,
+    "unresolved": 0
+  },
+  "coverage_drift": {
+    "clone_list": true,
+    "metadata": false,
+    "unmatched_clone_list_terms": [],
+    "titles_without_metadata": [
+      "Discard Test Title (USA)",
+      "Discard Test Title 2 & 3 (USA)",
+      "Discard Test Title 2 (USA)",
+      "Discard Test Title 3 (USA)",
+      "Full String (USA)",
+      "Partial String 2 (USA)",
+      "Test Title (USA)",
+      "Test Title 2 (USA)"
+    ]
+  },
+  "groups": [
+    {
+      "group": "discard test title",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Discard Test Title (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Global post filter exclude"
+          },
+          "reason": "Global post filter exclude"
+        }
+      ]
+    },
+    {
+      "group": "discard test title 2",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Discard Test Title 2 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Global post filter exclude"
+          },
+          "reason": "Global post filter exclude"
+        }
+      ]
+    },
+    {
+      "group": "discard test title 2 & 3",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Discard Test Title 2 & 3 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Global post filter exclude"
+          },
+          "reason": "Global post filter exclude"
+        }
+      ]
+    },
+    {
+      "group": "discard test title 3",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Discard Test Title 3 (USA)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Global post filter exclude"
+          },
+          "reason": "Global post filter exclude"
+        }
+      ]
+    },
+    {
+      "group": "full string",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Full String (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0074",
+            "message": "Only one title in this region, skipping filtering"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [],
+      "exclusions": []
+    },
+    {
+      "group": "partial string 2",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Partial String 2 (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0074",
+            "message": "Only one title in this region, skipping filtering"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [],
+      "exclusions": []
+    },
+    {
+      "group": "test title",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0074",
+            "message": "Only one title in this region, skipping filtering"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [],
+      "exclusions": []
+    },
+    {
+      "group": "test title 2",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 2 (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0074",
+            "message": "Only one title in this region, skipping filtering"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [],
+      "exclusions": []
+    }
+  ]
+}

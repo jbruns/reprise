@@ -1,0 +1,3 @@
+# Tests and `cargo run` find the Retool install that tools/retool/setup builds.
+[env]
+TITLE_SELECT_RETOOL = { value = ".retool", relative = true }

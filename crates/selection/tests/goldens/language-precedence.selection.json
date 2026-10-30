@@ -1,0 +1,127 @@
+{
+  "pins": {
+    "retool_commit": "",
+    "patch_set_sha256": "",
+    "clone_list_commit": "",
+    "trace_schema": 0
+  },
+  "dat_sha256": "be4336d5b782cf455a40aea301a2477b8b3370afa2e0c01bb0f9674322f67bd2",
+  "system": "Retool - Languages",
+  "system_settings": false,
+  "summary": {
+    "groups": 1,
+    "winners": 1,
+    "alternatives": 7,
+    "exclusions": 1,
+    "unresolved": 0
+  },
+  "coverage_drift": {
+    "clone_list": false,
+    "metadata": false,
+    "unmatched_clone_list_terms": [],
+    "titles_without_metadata": [
+      "Test Title (Europe)",
+      "Test Title (Europe) (Da,No,Sv)",
+      "Test Title (Europe) (En,De,It)",
+      "Test Title (Europe) (En,Es,It)",
+      "Test Title (Europe) (En,Fr,De,It)",
+      "Test Title (Europe) (En,Fr,It)",
+      "Test Title (Europe) (Fr)",
+      "Test Title (Japan)",
+      "Test Title (USA)"
+    ]
+  },
+  "groups": [
+    {
+      "group": "test title",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title (Europe) (En,Fr,De,It)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0014",
+            "message": "Group after lower priority region, non-superset clones removed"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [
+        {
+          "title": "Test Title (Europe)",
+          "clone_of": "Test Title (Europe) (En,Fr,De,It)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0043",
+            "message": "[Second pass] Group after filtering by user language order"
+          }
+        },
+        {
+          "title": "Test Title (Europe) (En,De,It)",
+          "clone_of": "Test Title (Europe) (En,Fr,De,It)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0043",
+            "message": "[Second pass] Group after filtering by user language order"
+          }
+        },
+        {
+          "title": "Test Title (Europe) (En,Es,It)",
+          "clone_of": "Test Title (Europe) (En,Fr,De,It)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0043",
+            "message": "[Second pass] Group after filtering by user language order"
+          }
+        },
+        {
+          "title": "Test Title (Europe) (En,Fr,It)",
+          "clone_of": "Test Title (Europe) (En,Fr,De,It)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0043",
+            "message": "[Second pass] Group after filtering by user language order"
+          }
+        },
+        {
+          "title": "Test Title (Europe) (Fr)",
+          "clone_of": "Test Title (Europe) (En,Fr,De,It)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0005",
+            "message": "[First pass] Group after filtering by user language order"
+          }
+        },
+        {
+          "title": "Test Title (Japan)",
+          "clone_of": "Test Title (Europe) (En,Fr,De,It)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0119",
+            "message": "Group after good dump/production/retail check"
+          }
+        },
+        {
+          "title": "Test Title (USA)",
+          "clone_of": "Test Title (Europe) (En,Fr,De,It)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0014",
+            "message": "Group after lower priority region, non-superset clones removed"
+          }
+        }
+      ],
+      "exclusions": [
+        {
+          "title": "Test Title (Europe) (Da,No,Sv)",
+          "rule": {
+            "stage": "Language filter",
+            "ref": "REF0049",
+            "message": "Removed due to user language filters: En(?:-[A-Z][A-Z])?, De, Fr(?!-CA)(?:-[A-Z][A-Z])?, It, Ja"
+          },
+          "reason": "Language remove"
+        }
+      ]
+    }
+  ]
+}

@@ -22,6 +22,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # rustup on the runner installs the toolchain rust-toolchain.toml pins.
       - run: rustup show active-toolchain
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      # The patched Retool the Selection tests run, with its pinned clone lists.
+      - run: tools/retool/setup
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       # The workbench as the browser runs it; the image build compiles it the same way.
@@ -60,6 +63,17 @@ jobs:
           curl -fsS localhost:8080/ | grep -q '/boot.js'
           curl -fsS -o /dev/null -H 'Accept-Encoding: br' localhost:8080/pkg/title-select.wasm
           curl -fsS localhost:8080/source-sets | grep -q '/boot.js'
+      # A Selection runs the image's Retool offline, writing only to the store's tmp.
+      - name: select smoke test
+        run: |
+          printf '{"region_order": ["USA"]}\n' > "$RUNNER_TEMP/profile.json"
+          chmod 644 "$RUNNER_TEMP/profile.json"
+          docker run --rm --read-only --network none -v title-select-select:/store \
+            -v "$PWD/third_party/retool/upstream/tests/source/features:/dats:ro" \
+            -v "$RUNNER_TEMP/profile.json:/run/profile.json:ro" \
+            title-select:ci select --dat '/dats/Retool - Prefer regions.dat' --profile /run/profile.json \
+            > "$RUNNER_TEMP/selection.json"
+          jq -e '.summary.groups > 0 and (.pins.retool_commit | length == 40)' "$RUNNER_TEMP/selection.json"
       - if: always()
         run: docker logs service
 
