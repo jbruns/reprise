@@ -25,3 +25,12 @@ approved option, gated on a conformance suite that uses the patched Retool as it
 - The image carries a Python runtime for Selection.
 - Title Select maintains a small patch set against unmaintained upstream code, and shows clone-list and metadata drift
   against each DAT Revision instead of hiding it.
+- The pristine upstream source, without its GUI, is vendored at its pinned commit beside an ordered set of patches,
+  applied at build time. The patches add a JSON Lines trace covering every group, write no DAT that Title Select reads,
+  and make no network call. A test shows they leave Retool's selections unchanged. The vendored tree goes away once the
+  Rust port lands.
+- Clone lists and metadata are not vendored. The image build fetches them at a pinned upstream commit, checked by
+  sha256. Renovate proposes a new commit when upstream moves, and the conformance tests gate it. This mirrors
+  Retool's own updates while keeping every Selection reproducible. Revisit if upstream maintenance changes.
+- The image's base becomes distroless Python, with Retool's few runtime dependencies hash-locked and the GUI's left out.
+  Tests and CI build the same patched Retool and environment with one setup script.
