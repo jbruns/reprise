@@ -1049,6 +1049,61 @@ mod profiles_and_selections {
         assert!(!env.store.selection_record(ids[1]).unwrap().pruned);
     }
 
+    /// Reading a Selection while a newer one prunes it gives the whole Selection or a refusal, never a Selection
+    /// with its groups or releases gone.
+    #[test]
+    fn a_selection_read_while_it_is_pruned_is_whole_or_refused() {
+        let mut env = Env::new(20);
+        env.config.selections.keep = 1;
+        env.add_dat_and_set();
+        let (sha256, _) = env.import(1);
+        save(&env, &SelectionProfile::default(), None);
+        let expected = selection(&sha256);
+        let make = || {
+            let job = env
+                .store
+                .enqueue_selection("Test - System", None, NAME, None, "Operator", WORKERS)
+                .unwrap();
+            env.store.claim_job().unwrap();
+            env.store
+                .record_selection(&env.config, job.id, &expected)
+                .unwrap()
+                .selection
+                .unwrap()
+        };
+        let mut id = make();
+        let mut whole = 0;
+        for _ in 0..50 {
+            let pruned = id;
+            std::thread::scope(|scope| {
+                let reader = scope.spawn(|| {
+                    let mut whole = 0;
+                    loop {
+                        match env.store.selection(pruned) {
+                            Ok(read) => {
+                                assert_eq!(read, expected, "selection {pruned}");
+                                whole += 1;
+                            }
+                            Err(Error::Refused(_)) => {}
+                            Err(err) => panic!("selection {pruned}: {err}"),
+                        }
+                        match env.store.selection_rows(pruned) {
+                            Ok(rows) => assert_eq!(rows.len(), 2, "selection {pruned}'s rows"),
+                            Err(Error::Refused(_)) => return whole,
+                            Err(err) => panic!("selection {pruned}'s rows: {err}"),
+                        }
+                    }
+                });
+                id = make();
+                whole += reader.join().unwrap();
+            });
+        }
+        assert!(
+            whole > 0,
+            "no read finished before its selection was pruned"
+        );
+    }
+
     #[test]
     fn a_restart_queues_a_running_selection_job_again_with_its_profile_version() {
         let env = Env::new(20);

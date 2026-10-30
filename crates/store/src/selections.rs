@@ -446,14 +446,19 @@ impl Store {
 
     /// The explained Selection, as the engine and the Operator's choices made it.
     pub fn selection(&self, id: i64) -> Result<Selection> {
-        self.read(|c| read_selection(c, id))
+        // One read transaction, so a prune between the queries cannot leave the record without its groups.
+        self.read(|c| {
+            let tx = c.unchecked_transaction()?;
+            read_selection(&tx, id)
+        })
     }
 
     /// Every release of the Selection, in order.
     pub fn selection_rows(&self, id: i64) -> Result<Vec<ReleaseRow>> {
         self.read(|c| {
-            check_full(c, id)?;
-            read_rows(c, id)
+            let tx = c.unchecked_transaction()?;
+            check_full(&tx, id)?;
+            read_rows(&tx, id)
         })
     }
 
