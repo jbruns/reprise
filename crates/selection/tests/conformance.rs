@@ -15,6 +15,9 @@ struct Case {
     /// Under Retool's `tests/configs/`.
     config: &'static str,
     adjust: fn(&mut SelectionProfile),
+    /// The DAT's header name, when it must differ from the fixture's so that Retool finds a clone list on a
+    /// case-sensitive file system too.
+    system: Option<&'static str>,
     /// Retool's output for the same DAT and settings, under its `tests/goldens/`.
     upstream_golden: Option<&'static str>,
     /// Whether this crate's goldens cover the case. Large DATs are checked against Retool's output only, to keep
@@ -30,6 +33,7 @@ const CASES: &[Case] = &[
         dat: "features/Retool - World is USA-Europe-Japan.dat",
         config: "user-config-regions-1.yaml",
         adjust: none,
+        system: None,
         upstream_golden: Some(
             "features/world-is-usa-europe-japan/Retool - World is USA-Europe-Japan (-x).dat",
         ),
@@ -40,6 +44,7 @@ const CASES: &[Case] = &[
         dat: "systems/Sega - Game Gear.dat",
         config: "user-config-regions-4.yaml",
         adjust: none,
+        system: None,
         upstream_golden: Some("japan-world-asia-usa-remainder/Sega - Game Gear (-x).dat"),
         goldens: false,
     },
@@ -48,6 +53,7 @@ const CASES: &[Case] = &[
         dat: "features/Retool - Prefer regions.dat",
         config: "user-config-regions-1.yaml",
         adjust: |p| p.options.prefer_regions = true,
+        system: None,
         upstream_golden: Some("features/prefer-regions-1/Retool - Prefer regions (-rx).dat"),
         goldens: true,
     },
@@ -56,6 +62,7 @@ const CASES: &[Case] = &[
         dat: "features/Retool - Languages.dat",
         config: "user-config-languages-1.yaml",
         adjust: |p| p.options.filter_languages = true,
+        system: None,
         upstream_golden: Some("features/languages-1/Retool - Languages (-lx).dat"),
         goldens: true,
     },
@@ -64,6 +71,7 @@ const CASES: &[Case] = &[
         dat: "features/Retool - Languages.dat",
         config: "user-config-languages-2.yaml",
         adjust: |p| p.options.filter_languages = true,
+        system: None,
         upstream_golden: Some("features/languages-2/Retool - Languages (-lx).dat"),
         goldens: true,
     },
@@ -72,6 +80,7 @@ const CASES: &[Case] = &[
         dat: "features/Retool - Prefer oldest.dat",
         config: "user-config-regions-1.yaml",
         adjust: none,
+        system: None,
         upstream_golden: Some("features/prefer-oldest-2/Retool - Prefer oldest (-x).dat"),
         goldens: true,
     },
@@ -80,6 +89,7 @@ const CASES: &[Case] = &[
         dat: "features/Retool - Prefer oldest.dat",
         config: "user-config-regions-1.yaml",
         adjust: |p| p.options.prefer_oldest = true,
+        system: None,
         upstream_golden: Some("features/prefer-oldest-1/Retool - Prefer oldest (-ox).dat"),
         goldens: true,
     },
@@ -88,6 +98,7 @@ const CASES: &[Case] = &[
         dat: "features/Retool - Clone list filters.dat",
         config: "user-config-regions-1.yaml",
         adjust: none,
+        system: None,
         upstream_golden: Some("features/clone-list-filters-1/Retool - Clone list filters (-x).dat"),
         goldens: true,
     },
@@ -96,6 +107,7 @@ const CASES: &[Case] = &[
         dat: "features/Retool - Clone list filters.dat",
         config: "user-config-clone-list-filters-1.yaml",
         adjust: none,
+        system: None,
         upstream_golden: Some("features/clone-list-filters-2/Retool - Clone list filters (-x).dat"),
         goldens: true,
     },
@@ -109,6 +121,7 @@ const CASES: &[Case] = &[
                 .filter(|c| *c != Category::Games)
                 .collect()
         },
+        system: None,
         upstream_golden: Some(
             "features/exclusions/Retool - Exclusions (-x) [-aAbBcdDefkmMopPruv].dat",
         ),
@@ -119,6 +132,7 @@ const CASES: &[Case] = &[
         dat: "systems/Microsoft - Xbox - Datfile.dat",
         config: "user-config-overrides.yaml",
         adjust: none,
+        system: None,
         upstream_golden: Some("features/overrides/Microsoft - Xbox.dat"),
         goldens: false,
     },
@@ -134,6 +148,7 @@ const CASES: &[Case] = &[
             ];
             p.overrides.include = vec!["|Test Title 1 (Germany)".into()];
         },
+        system: None,
         upstream_golden: None,
         goldens: true,
     },
@@ -142,6 +157,7 @@ const CASES: &[Case] = &[
         dat: "features/Retool - Post filters.dat",
         config: "user-config-post-filters.yaml",
         adjust: none,
+        system: Some("Retool - Post Filters"),
         upstream_golden: Some("features/post-filters/Retool - Post filters (-x).dat"),
         goldens: true,
     },
@@ -171,12 +187,16 @@ fn run(case: &Case) -> Selection {
     let mut profile = support::profile_from_upstream_config(case.config);
     (case.adjust)(&mut profile);
     let tests = support::upstream().join("tests");
+    let mut dat = tests.join("source").join(case.dat);
+    if let Some(system) = case.system {
+        let text = std::fs::read_to_string(&dat).unwrap();
+        let (start, rest) = text.split_once("<name>").unwrap();
+        let (_, end) = rest.split_once("</name>").unwrap();
+        dat = work.path().join("input.dat");
+        std::fs::write(&dat, format!("{start}<name>{system}</name>{end}")).unwrap();
+    }
     let outcome = support::fixture_engine()
-        .run(
-            &tests.join("source").join(case.dat),
-            &profile,
-            &support::options(work.path()),
-        )
+        .run(&dat, &profile, &support::options(work.path()))
         .unwrap_or_else(|e| panic!("{}: {e}", case.name));
     let selection = outcome.selection;
 

@@ -30,7 +30,7 @@
 {"after":["Test Title 2 (USA)"],"before":null,"details":[],"group":"test title 2","kept":[],"message":"ACTION: Kept due to global post filter:","ref":"REF0100","removed":[],"schema":1,"scope":"","stage":"Post filters","type":"step","variables":[]}
 {"after":["Test Title 2 (USA)"],"before":null,"details":[],"group":"test title 2","kept":[],"message":"Cross region parents:","ref":"REF0013","removed":[],"schema":1,"scope":"All regions","stage":"Parent selection","type":"step","variables":[]}
 {"after":["Test Title 2 (USA)"],"before":null,"details":[],"group":"test title 2","kept":[],"message":"Only one title in this region, skipping filtering:","ref":"REF0074","removed":[],"schema":1,"scope":"USA | test title 2","stage":"Parent selection","type":"step","variables":[]}
-{"clone_list":true,"metadata":false,"schema":1,"system":"Retool - Post filters","type":"run"}
+{"clone_list":true,"metadata":false,"schema":1,"system":"Retool - Post Filters","type":"run"}
 {"clone_list_unmatched":[],"metadata_missing":["Discard Test Title (USA)","Discard Test Title 2 & 3 (USA)","Discard Test Title 2 (USA)","Discard Test Title 3 (USA)","Full String (USA)","Partial String 2 (USA)","Test Title (USA)","Test Title 2 (USA)"],"schema":1,"type":"coverage"}
 {"clones":{},"group":"discard test title 2","parents":[],"schema":1,"type":"group"}
 {"clones":{},"group":"discard test title 3","parents":[],"schema":1,"type":"group"}
