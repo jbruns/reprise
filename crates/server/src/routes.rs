@@ -426,7 +426,7 @@ async fn entries_ndjson(
     let summary = blocking(&state, move |store| store.audit(id)).await?;
     if summary.pruned {
         return Err(
-            Error::Refused(format!("Audit {id} was pruned; only its summary is kept")).into(),
+            Error::Refused(format!("audit {id} was pruned; only its summary is kept")).into(),
         );
     }
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);

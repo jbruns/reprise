@@ -202,11 +202,11 @@ impl Config {
         }
         for (name, root) in &config.roots {
             if name.is_empty() {
-                return Err(Error("a Root has an empty name".into()));
+                return Err(Error("a root has an empty name".into()));
             }
             if root.writable {
                 return Err(Error(format!(
-                    "Root {name} is writable; every Root is read-only until Change Plans exist"
+                    "root {name} is writable; every root is read-only until change plans exist"
                 )));
             }
         }

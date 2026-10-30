@@ -591,7 +591,7 @@ fn a_second_audit_of_the_same_source_set_is_refused_naming_the_active_job() {
     let body: ErrorBody = second.body_mut().read_json().unwrap();
     assert_eq!(body.job, Some(first.id));
     assert!(
-        body.error.contains(&format!("Job {}", first.id)),
+        body.error.contains(&format!("job {}", first.id)),
         "{}",
         body.error
     );

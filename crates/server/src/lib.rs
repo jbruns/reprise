@@ -71,11 +71,11 @@ fn prepare(settings: Settings) -> Result<Prepared, StartError> {
         let job = &interruption.job;
         match &interruption.requeued {
             Some(again) => eprintln!(
-                "title-select: Job {} was interrupted by a stop; queued again as Job {}",
+                "title-select: job {} was interrupted by a stop; queued again as job {}",
                 job.id, again.id
             ),
             None => eprintln!(
-                "title-select: Job {} was interrupted by a stop again; it failed",
+                "title-select: job {} was interrupted by a stop again; it failed",
                 job.id
             ),
         }

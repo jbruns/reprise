@@ -111,7 +111,7 @@ fn the_headless_client_fails_on_a_wrong_token_an_unreachable_server_or_a_failed_
     let wrong = env.audit(&env.service.url(), &env.file("wrong"), &[]);
     assert!(!wrong.status.success());
     assert!(
-        stderr(&wrong).contains("Operator token"),
+        stderr(&wrong).contains("operator token"),
         "{}",
         stderr(&wrong)
     );

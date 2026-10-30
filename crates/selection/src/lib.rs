@@ -35,20 +35,20 @@ const STDERR_TAIL_LINES: usize = 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Retool install: {0} (build it with tools/retool/setup)")]
+    #[error("selection engine install: {0} (build it with tools/retool/setup)")]
     Install(String),
-    #[error("Selection Profile: {0}")]
+    #[error("selection profile: {0}")]
     Profile(String),
     #[error("{context}: {source}")]
     Io {
         context: String,
         source: std::io::Error,
     },
-    #[error("Retool failed ({status}):\n{output}")]
+    #[error("the selection engine failed ({status}):\n{output}")]
     Retool { status: String, output: String },
-    #[error("Retool did not finish within {} s", .0.as_secs())]
+    #[error("selection did not finish within {} s", .0.as_secs())]
     Timeout(Duration),
-    #[error("Retool's trace: {0}")]
+    #[error("the selection engine's trace: {0}")]
     Trace(String),
 }
 
@@ -258,7 +258,10 @@ impl Engine {
             .map_err(io(format!("starting {}", self.python().display())))?;
         let started = Instant::now();
         let status = loop {
-            if let Some(status) = child.try_wait().map_err(io("waiting for Retool"))? {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(io("waiting for the selection engine"))?
+            {
                 break status;
             }
             if started.elapsed() >= options.timeout {

@@ -121,7 +121,7 @@ impl Client {
             .map(|b| b.error)
             .unwrap_or_else(|_| status.to_string());
         if status == ureq::http::StatusCode::UNAUTHORIZED {
-            return Err(format!("the Service refused the Operator token: {message}"));
+            return Err(format!("the Service refused the operator token: {message}"));
         }
         Err(message)
     }
@@ -151,7 +151,7 @@ impl Client {
                 std::thread::sleep(self.timing.poll);
             } else if self.stream(&mut job, &mut shown)? == Stream::Stalled {
                 eprintln!(
-                    "Job {}: no events from the Service for {}s; polling its state instead",
+                    "job {}: no events from the Service for {}s; polling its state instead",
                     job.id,
                     self.timing.stall.as_secs()
                 );
@@ -242,7 +242,7 @@ impl Default for Timing {
 /// Takes the Job's new state, showing it if it changed.
 fn update(job: &mut Job, next: Job) {
     if next.state != job.state {
-        eprintln!("Job {}: {}", next.id, next.state.as_str());
+        eprintln!("job {}: {}", next.id, next.state.as_str());
     }
     *job = next;
 }
@@ -255,7 +255,7 @@ fn show_progress(progress: JobProgress, shown: &mut Option<usize>) {
     if *shown != Some(tenth) {
         *shown = Some(tenth);
         eprintln!(
-            "Job {}: {}/{} files read",
+            "job {}: {}/{} files read",
             progress.job, progress.files_done, progress.files_total
         );
     }
@@ -263,13 +263,13 @@ fn show_progress(progress: JobProgress, shown: &mut Option<usize>) {
 
 fn read_token(path: Option<&Path>) -> Result<String, String> {
     let path = path.ok_or(
-        "no Operator token: pass --token-file <file> or set TITLE_SELECT_OPERATOR_TOKEN_FILE",
+        "no operator token: pass --token-file <file> or set TITLE_SELECT_OPERATOR_TOKEN_FILE",
     )?;
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let token = text.trim();
     if token.is_empty() {
         return Err(format!(
-            "{}: the Operator token file is empty",
+            "{}: the operator token file is empty",
             path.display()
         ));
     }
@@ -296,7 +296,7 @@ pub fn audit(request: Request) -> Result<Report, String> {
         .read_json()
         .map_err(|e| e.to_string())?;
     eprintln!(
-        "Job {}: {}: Audit of {} against DAT Revision {}",
+        "job {}: {}: audit of {} against DAT revision {}",
         job.id,
         job.state.as_str(),
         job.source_set,
@@ -305,13 +305,13 @@ pub fn audit(request: Request) -> Result<Report, String> {
     let job = client.follow(job)?;
     if job.state != JobState::Succeeded {
         return Err(format!(
-            "Job {} {}: {}",
+            "job {} {}: {}",
             job.id,
             job.state.as_str(),
             job.error.as_deref().unwrap_or("no reason given")
         ));
     }
-    let audit = job.audit.ok_or("the Job succeeded without an Audit")?;
+    let audit = job.audit.ok_or("the job succeeded without an audit")?;
     let report: Report = client.get(&format!("/audits/{audit}/report"))?;
     let findings = Finding::ALL.iter().map(|f| {
         format!(
@@ -329,7 +329,7 @@ pub fn audit(request: Request) -> Result<Report, String> {
     });
     let counts: Vec<String> = findings.chain(games).collect();
     eprintln!(
-        "Audit {audit} of {} against {} ({}): {}",
+        "audit {audit} of {} against {} ({}): {}",
         job.source_set,
         report.dat_revision.sha256,
         report.dat_revision.version,

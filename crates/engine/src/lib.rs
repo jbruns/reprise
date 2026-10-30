@@ -18,7 +18,7 @@ use read::FileRead;
 pub enum Error {
     #[error("cannot read DAT: {0}")]
     Dat(String),
-    #[error("cannot read Source Set: {0}")]
+    #[error("cannot read source set: {0}")]
     SourceSet(String),
 }
 
