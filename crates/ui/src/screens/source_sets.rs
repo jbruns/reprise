@@ -7,7 +7,8 @@ use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 use leptos_struct_table::ColumnSort;
 use title_select_api::{
-    AddSourceSet, AuditSummary, Dat, Finding, GameStatus, Job, Root, SourceSetRecord, StartAudit,
+    AddSourceSet, AuditSummary, Dat, DatRevisionRecord, Finding, GameStatus, Job, ProfileRecord,
+    Root, SelectionRecord, SourceSetRecord, StartAudit, StartSelection,
 };
 
 use crate::api;
@@ -17,6 +18,7 @@ use crate::model::{
     audit_choices, finding_label, game_status_label, needs_review_from_counts, short_sha, when,
 };
 use crate::screens::audit::{ReAudit, queued};
+use crate::screens::selection::SelectionQueued;
 use crate::table::{DataTable, Grid, Rows, rows_of, sort_of};
 
 #[derive(Clone, PartialEq)]
@@ -541,6 +543,8 @@ fn SourceSetView(set: SourceSetRecord) -> impl IntoView {
             }}
         </section>
 
+        <Selections name choices />
+
         <section aria-labelledby="history-title">
             <h2 id="history-title">"History"</h2>
             <p class="lede">"Latest first. A pruned audit keeps only its summary."</p>
@@ -559,6 +563,167 @@ fn SourceSetView(set: SourceSetRecord) -> impl IntoView {
                 empty="Not audited yet.".to_string()
             />
         </section>
+    }
+}
+
+/// The Selections made for a Source Set, and the form to make another.
+#[component]
+fn Selections(
+    name: StoredValue<String>,
+    /// The DAT Revisions to offer: the default, and newer ones.
+    choices: Memo<(Option<DatRevisionRecord>, Vec<DatRevisionRecord>)>,
+) -> impl IntoView {
+    let live = use_live();
+    let selections = LocalResource::new(move || {
+        live.settled.track();
+        let path = format!("/selections?source_set={}", api::segment(&name.get_value()));
+        async move { api::get::<Vec<SelectionRecord>>(&path).await }
+    });
+    let profiles = LocalResource::new(|| api::get::<Vec<ProfileRecord>>("/profiles"));
+    let saved = move || {
+        profiles
+            .get()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.latest.is_some())
+            .collect::<Vec<_>>()
+    };
+    let profile = RwSignal::new(String::new());
+    Effect::new(move || {
+        if profile.get_untracked().is_empty()
+            && let Some(first) = saved().into_iter().next()
+        {
+            profile.set(first.name);
+        }
+    });
+    let revision = RwSignal::new(String::new());
+    let outcome = RwSignal::new(None::<Result<Job, String>>);
+    let start = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let chosen = revision.get_untracked();
+        let request = StartSelection {
+            source_set: name.get_value(),
+            revision: (!chosen.is_empty()).then_some(chosen),
+            profile: profile.get_untracked(),
+            version: None,
+        };
+        leptos::task::spawn_local(async move {
+            outcome.set(Some(api::post::<_, Job>("/selections", &request).await));
+        });
+    };
+    view! {
+        <section aria-labelledby="selections-title">
+            <h2 id="selections-title">"Selections"</h2>
+            <p class="lede">"Latest first. Each records the selection profile version it used."</p>
+            {move || match profiles.get() {
+                Some(Ok(_)) if saved().is_empty() => {
+                    view! {
+                        <p class="note">
+                            "To make a selection, first "
+                            <A href="/profiles/new">"create a selection profile"</A>
+                            "."
+                        </p>
+                    }
+                        .into_any()
+                }
+                _ => {
+                    view! {
+                        <form class="form" on:submit=start>
+                            <label>
+                                "Selection profile"
+                                <select prop:value=profile on:change=move |ev| profile.set(event_target_value(&ev))>
+                                    {move || {
+                                        saved()
+                                            .into_iter()
+                                            .map(|p| {
+                                                let label = format!(
+                                                    "{}, version {}",
+                                                    p.name,
+                                                    p.latest.as_ref().map_or(0, |v| v.version),
+                                                );
+                                                view! { <option value=p.name>{label}</option> }
+                                            })
+                                            .collect_view()
+                                    }}
+                                </select>
+                            </label>
+                            <label>
+                                "DAT revision"
+                                <select prop:value=revision on:change=move |ev| revision.set(event_target_value(&ev))>
+                                    {move || {
+                                        let (default, newer) = choices.get();
+                                        let default = match default {
+                                            Some(r) => format!("{} ({}), the default", r.version, short_sha(&r.sha256)),
+                                            None => "The default".to_string(),
+                                        };
+                                        view! {
+                                            <option value="">{default}</option>
+                                            {newer
+                                                .into_iter()
+                                                .map(|r| {
+                                                    let label = format!("{} ({}), newer", r.version, short_sha(&r.sha256));
+                                                    view! { <option value=r.sha256>{label}</option> }
+                                                })
+                                                .collect_view()}
+                                        }
+                                    }}
+                                </select>
+                            </label>
+                            <button type="submit" class="primary" disabled=move || profile.with(String::is_empty)>
+                                "Make selection"
+                            </button>
+                        </form>
+                    }
+                        .into_any()
+                }
+            }}
+            {move || {
+                outcome
+                    .get()
+                    .map(|outcome| match outcome {
+                        Ok(job) => view! { <SelectionQueued job=job.id /> }.into_any(),
+                        Err(message) => view! { <Problem message /> }.into_any(),
+                    })
+            }}
+            {move || match selections.get() {
+                None => view! { <Loading what="the selections" /> }.into_any(),
+                Some(Err(message)) => view! { <Problem message /> }.into_any(),
+                Some(Ok(list)) if list.is_empty() => {
+                    view! { <p class="note">"No selections yet."</p> }.into_any()
+                }
+                Some(Ok(list)) => {
+                    view! {
+                        <ul class="plain selections">
+                            {list.into_iter().map(selection_line).collect_view()}
+                        </ul>
+                    }
+                        .into_any()
+                }
+            }}
+        </section>
+    }
+}
+
+fn selection_line(s: SelectionRecord) -> impl IntoView {
+    let summary = s.summary;
+    let review = summary.needs_review();
+    view! {
+        <li>
+            <A href=format!("/selections/{}", s.id)>{format!("Selection #{}", s.id)}</A>
+            {format!(
+                ", {} version {}, DAT revision {} ({}), {}: {} selected, {} excluded",
+                s.profile.name,
+                s.profile.version,
+                s.dat_revision_version,
+                short_sha(&s.dat_revision_sha256),
+                when(&s.created_at),
+                summary.winners,
+                summary.exclusions,
+            )}
+            {(review > 0).then(|| view! { <span class="review">{format!(", {review} to review")}</span> })}
+            {s.pruned.then_some(" (pruned: only the summary is kept)")}
+        </li>
     }
 }
 

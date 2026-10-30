@@ -5,7 +5,7 @@ use leptos::prelude::*;
 use leptos::tachys::view::any_view::AnyView;
 use leptos_router::components::A;
 use leptos_struct_table::ColumnSort;
-use title_select_api::{Job, JobState};
+use title_select_api::{Job, JobKind, JobState};
 
 use crate::api;
 use crate::app::{Loading, Problem};
@@ -17,6 +17,7 @@ use crate::table::{DataTable, Grid, Rows, rows_of, sort_of};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum JobCol {
     Id,
+    Kind,
     State,
     SourceSet,
     DatRevision,
@@ -24,7 +25,7 @@ pub enum JobCol {
     Actor,
     Created,
     Finished,
-    Audit,
+    Result,
 }
 
 #[derive(Clone, PartialEq)]
@@ -53,6 +54,7 @@ impl Grid for JobItem {
     type Col = JobCol;
     const COLUMNS: &'static [JobCol] = &[
         JobCol::Id,
+        JobCol::Kind,
         JobCol::State,
         JobCol::SourceSet,
         JobCol::DatRevision,
@@ -60,12 +62,13 @@ impl Grid for JobItem {
         JobCol::Actor,
         JobCol::Created,
         JobCol::Finished,
-        JobCol::Audit,
+        JobCol::Result,
     ];
 
     fn header(col: JobCol) -> &'static str {
         match col {
             JobCol::Id => "Job",
+            JobCol::Kind => "Kind",
             JobCol::State => "State",
             JobCol::SourceSet => "Source set",
             JobCol::DatRevision => "DAT revision",
@@ -73,13 +76,15 @@ impl Grid for JobItem {
             JobCol::Actor => "Started by",
             JobCol::Created => "Queued",
             JobCol::Finished => "Finished",
-            JobCol::Audit => "Audit",
+            JobCol::Result => "Result",
         }
     }
 
     fn class(col: JobCol) -> &'static str {
         match col {
-            JobCol::Id | JobCol::Audit => "c-id data",
+            JobCol::Id => "c-id data",
+            JobCol::Kind => "c-state",
+            JobCol::Result => "c-actor",
             JobCol::State => "c-state",
             JobCol::SourceSet | JobCol::Progress => "c-wide",
             JobCol::DatRevision => "c-hash data",
@@ -91,7 +96,12 @@ impl Grid for JobItem {
     fn sortable(col: JobCol) -> bool {
         matches!(
             col,
-            JobCol::Id | JobCol::State | JobCol::SourceSet | JobCol::Created | JobCol::Finished
+            JobCol::Id
+                | JobCol::Kind
+                | JobCol::State
+                | JobCol::SourceSet
+                | JobCol::Created
+                | JobCol::Finished
         )
     }
 
@@ -99,6 +109,7 @@ impl Grid for JobItem {
         let job = &self.0.job;
         match col {
             JobCol::Id => format!("#{}", job.id).into_any(),
+            JobCol::Kind => kind_label(job.kind).into_any(),
             JobCol::State => state_view(job.state),
             JobCol::SourceSet => job.source_set.clone().into_any(),
             JobCol::DatRevision => short_sha(&job.dat_revision).to_string().into_any(),
@@ -111,14 +122,29 @@ impl Grid for JobItem {
                 .map(when)
                 .unwrap_or_default()
                 .into_any(),
-            JobCol::Audit => match job.audit {
-                Some(audit) => {
-                    view! { <A href=format!("/audits/{audit}")>{format!("#{audit}")}</A> }
-                        .into_any()
-                }
-                None => ().into_any(),
-            },
+            JobCol::Result => result_link(job),
         }
+    }
+}
+
+fn kind_label(kind: JobKind) -> &'static str {
+    match kind {
+        JobKind::Audit => "Audit",
+        JobKind::Selection => "Selection",
+    }
+}
+
+/// A link to the Audit or Selection a Job recorded.
+fn result_link(job: &Job) -> AnyView {
+    match (job.audit, job.selection) {
+        (Some(audit), _) => {
+            view! { <A href=format!("/audits/{audit}")>{format!("Audit #{audit}")}</A> }.into_any()
+        }
+        (None, Some(selection)) => view! {
+            <A href=format!("/selections/{selection}")>{format!("Selection #{selection}")}</A>
+        }
+        .into_any(),
+        (None, None) => ().into_any(),
     }
 }
 
@@ -127,6 +153,7 @@ fn sorted(mut jobs: Vec<LiveJob>, sorting: &VecDeque<(JobCol, ColumnSort)>) -> V
         jobs.sort_by(|a, b| {
             let (a, b) = (&a.job, &b.job);
             let ord = match sort.column {
+                JobCol::Kind => a.kind.as_str().cmp(b.kind.as_str()),
                 JobCol::State => a.state.as_str().cmp(b.state.as_str()),
                 JobCol::SourceSet => a.source_set.cmp(&b.source_set),
                 JobCol::Created => a.created_at.cmp(&b.created_at),
@@ -183,7 +210,7 @@ pub fn Jobs() -> impl IntoView {
             sorting
             selected
             on_open=Callback::new(|_| crate::screens::audit::focus("job-detail"))
-            empty="No jobs yet. Start an audit from a source set.".to_string()
+            empty="No jobs yet. Start an audit or a selection from a source set.".to_string()
         />
         <section class="detail" id="job-detail" tabindex="-1" aria-label="Selected job">
             {move || match detail() {
@@ -197,8 +224,9 @@ pub fn Jobs() -> impl IntoView {
 fn job_detail(live: &LiveJob) -> AnyView {
     let job = live.job.clone();
     let set_href = format!("/source-sets/{}", api::segment(&job.source_set));
+    let result = (job.audit.is_some() || job.selection.is_some()).then(|| result_link(&job));
     view! {
-        <h3>{format!("Job #{}", job.id)}</h3>
+        <h3>{format!("{} job #{}", kind_label(job.kind), job.id)}</h3>
         <dl class="facts">
             <dt>"State"</dt>
             <dd>{state_view(job.state)} " " {progress_view(live)}</dd>
@@ -210,6 +238,18 @@ fn job_detail(live: &LiveJob) -> AnyView {
             <dd>
                 <code class="hash">{job.dat_revision.clone()}</code>
             </dd>
+            {job
+                .profile
+                .clone()
+                .map(|p| {
+                    view! {
+                        <dt>"Selection profile"</dt>
+                        <dd>
+                            <A href=format!("/profiles/{}", api::segment(&p.name))>{p.name.clone()}</A>
+                            {format!(", version {}", p.version)}
+                        </dd>
+                    }
+                })}
             <dt>"Started by"</dt>
             <dd>{job.actor.clone()}</dd>
             <dt>"Attempt"</dt>
@@ -217,22 +257,30 @@ fn job_detail(live: &LiveJob) -> AnyView {
                 {job.attempt}
                 {job.requeued_from.map(|from| format!(", queued again for interrupted job #{from}"))}
             </dd>
-            <dt>"Workers"</dt>
-            <dd>{format!("{} payload readers, {} hash workers", job.workers.readers, job.workers.hashers)}</dd>
+            {(job.kind == JobKind::Audit)
+                .then(|| {
+                    view! {
+                        <dt>"Workers"</dt>
+                        <dd>
+                            {format!(
+                                "{} payload readers, {} hash workers",
+                                job.workers.readers,
+                                job.workers.hashers,
+                            )}
+                        </dd>
+                    }
+                })}
             <dt>"Queued"</dt>
             <dd>{when(&job.created_at)}</dd>
             <dt>"Started"</dt>
             <dd>{job.started_at.as_deref().map(when)}</dd>
             <dt>"Finished"</dt>
             <dd>{job.finished_at.as_deref().map(when)}</dd>
-            {job
-                .audit
-                .map(|audit| {
+            {result
+                .map(|link| {
                     view! {
-                        <dt>"Audit"</dt>
-                        <dd>
-                            <A href=format!("/audits/{audit}")>{format!("Audit #{audit}")}</A>
-                        </dd>
+                        <dt>"Result"</dt>
+                        <dd>{link}</dd>
                     }
                 })}
             {job

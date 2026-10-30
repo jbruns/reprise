@@ -4,6 +4,8 @@ pub mod audit;
 mod bench;
 mod dats;
 mod jobs;
+mod profiles;
+pub mod selection;
 mod source_sets;
 
 pub use about::About;
@@ -12,4 +14,6 @@ pub use audit::AuditScreen;
 pub use bench::Bench;
 pub use dats::DatRevisions;
 pub use jobs::Jobs;
+pub use profiles::{NewProfile, ProfileScreen, Profiles};
+pub use selection::SelectionScreen;
 pub use source_sets::{SourceSet, SourceSets};

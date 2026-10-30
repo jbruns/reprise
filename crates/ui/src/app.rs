@@ -6,7 +6,10 @@ use leptos_router::path;
 use crate::events::{Stream, provide_live, use_live};
 #[cfg(feature = "bench")]
 use crate::screens::Bench;
-use crate::screens::{About, AuditScreen, DatRevisions, Jobs, SourceSet, SourceSets};
+use crate::screens::{
+    About, AuditScreen, DatRevisions, Jobs, NewProfile, ProfileScreen, Profiles, SelectionScreen,
+    SourceSet, SourceSets,
+};
 
 /// Without the `bench` feature, `/bench` is not a screen.
 #[cfg(not(feature = "bench"))]
@@ -27,6 +30,7 @@ pub fn App() -> impl IntoView {
                 <nav aria-label="Workbench">
                     <A href="/source-sets">"Source sets"</A>
                     <A href="/dat-revisions">"DAT revisions"</A>
+                    <A href="/profiles">"Selection profiles"</A>
                     <A href="/jobs">"Jobs"</A>
                 </nav>
                 <StreamStatus />
@@ -38,6 +42,10 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/source-sets/:name") view=SourceSet />
                     <Route path=path!("/dat-revisions") view=DatRevisions />
                     <Route path=path!("/audits/:id") view=AuditScreen />
+                    <Route path=path!("/profiles") view=Profiles />
+                    <Route path=path!("/profiles/new") view=NewProfile />
+                    <Route path=path!("/profiles/:name") view=ProfileScreen />
+                    <Route path=path!("/selections/:id") view=SelectionScreen />
                     <Route path=path!("/jobs") view=Jobs />
                     <Route path=path!("/about") view=About />
                     <Route path=path!("/bench") view=Bench />
