@@ -234,13 +234,16 @@ a play library build writes to, in a root pointing at the front end's `roms/` fo
 either default here, use another template when you register, or type the path yourself.
 
 The proposed path keeps every character of the provider and DAT name as it is. It must be relative to the root, not
-empty and without `..`, and registration refuses a path that resolves outside the root. A template only proposes:
-when you change it, source sets you already registered keep their paths.
+empty and without `..`, and registration refuses a path that resolves outside the root. Folders are separated with
+`/`: a path with a `\` or a drive such as `C:` is refused. A template that could never give a valid path, such as an
+empty one or one starting with `/` or `../`, is refused when the configuration loads. A template only proposes: when
+you change it, source sets you already registered keep their paths.
 
 `{platform}` comes from a table in this repository, `crates/api/data/platforms.tsv`, of No-Intro and Redump DATs and
-the system folder names ES-DE uses, which RomM also recognises. A dump-format qualifier at the end of a DAT's name,
-such as `(Headered)` or `(Decrypted)`, doesn't change its system. A DAT the table doesn't list has no `{platform}`:
-the workbench says so, and you type the path.
+the system folder names ES-DE uses that RomM also reads as the same system. A system they name differently, such as
+the Commodore Plus/4, isn't listed. A dump-format qualifier at the end of a DAT's name, such as `(Headered)` or
+`(Decrypted)`, doesn't change its system. A DAT the table doesn't list has no `{platform}`: the workbench says so, and
+you type the path.
 
 ## Commands
 

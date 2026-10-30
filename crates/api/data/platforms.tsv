@@ -2,8 +2,11 @@
 #
 # Folder names are ES-DE system names, as listed in ES-DE's `es_systems.xml` (MIT licence):
 #   https://gitlab.com/es-de/emulationstation-de/-/blob/master/resources/systems/linux/es_systems.xml
-# RomM recognises these names as folder names, either as its own platform slugs or as aliases:
+# RomM recognises these names as folder names, either as its own platform slugs or as folder name aliases:
 #   https://docs.romm.app/latest/platforms/supported-platforms/
+# Every folder name here is one RomM reads as the same platform. Where ES-DE and RomM disagree, the system is left
+# out: Commodore Plus/4 (ES-DE plus4; RomM c-plus-4, alias cplus4), Nintendo DSi (ES-DE nds; RomM nintendo-dsi) and
+# New Nintendo 3DS (ES-DE n3ds; RomM new-nintendo-3ds).
 # Where ES-DE has several folders for one system (genesis and megadrive, segacd and megacd), the one RomM also uses as
 # its slug is chosen. Systems ES-DE has no folder for are left out, so their DATs have no `{platform}`.
 #
@@ -23,7 +26,6 @@ No-Intro	Casio - PV-1000	pv1000
 No-Intro	Coleco - ColecoVision	colecovision
 No-Intro	Commodore - Amiga	amiga
 No-Intro	Commodore - Commodore 64	c64
-No-Intro	Commodore - Plus-4	plus4
 No-Intro	Commodore - VIC-20	vic20
 No-Intro	Emerson - Arcadia 2001	arcadia
 No-Intro	Epoch - Super Cassette Vision	scv
@@ -42,12 +44,10 @@ No-Intro	Nintendo - Game & Watch	gameandwatch
 No-Intro	Nintendo - Game Boy	gb
 No-Intro	Nintendo - Game Boy Advance	gba
 No-Intro	Nintendo - Game Boy Color	gbc
-No-Intro	Nintendo - New Nintendo 3DS	n3ds
 No-Intro	Nintendo - Nintendo 3DS	n3ds
 No-Intro	Nintendo - Nintendo 64	n64
 No-Intro	Nintendo - Nintendo 64DD	n64dd
 No-Intro	Nintendo - Nintendo DS	nds
-No-Intro	Nintendo - Nintendo DSi	nds
 No-Intro	Nintendo - Nintendo Entertainment System	nes
 No-Intro	Nintendo - Pokemon Mini	pokemini
 No-Intro	Nintendo - Satellaview	satellaview
