@@ -28,6 +28,60 @@ pub struct SelectionProfile {
     /// Per-system settings, by the system name Retool derives from the DAT header, such as
     /// `Atari - Atari 2600 (No-Intro)`.
     pub systems: BTreeMap<String, SystemSettings>,
+    /// The Operator's choices, by system name and then Game group: the releases checked in that group, applied
+    /// after the engine runs. A choice is stored only where it differs from the engine's picks, or where it confirms
+    /// an unresolved group. An empty set leaves the group out.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub choices: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+}
+
+impl SelectionProfile {
+    /// Records the releases checked in one group. The choice is stored only if it differs from the engine's
+    /// `picks` for the group or confirms an `unresolved` group; otherwise any stored choice is removed, so the
+    /// engine's picks apply.
+    pub fn set_choice(
+        &mut self,
+        system: &str,
+        group: &str,
+        checked: BTreeSet<String>,
+        picks: &BTreeSet<String>,
+        unresolved: bool,
+    ) {
+        if &checked == picks && !unresolved {
+            self.reset_choices(system, Some(group));
+            return;
+        }
+        self.choices
+            .entry(system.to_owned())
+            .or_default()
+            .insert(group.to_owned(), checked);
+    }
+
+    /// Removes the Operator's choices for one group of a system, or, with no group, for the whole system.
+    pub fn reset_choices(&mut self, system: &str, group: Option<&str>) {
+        let Some(groups) = self.choices.get_mut(system) else {
+            return;
+        };
+        match group {
+            Some(group) => {
+                groups.remove(group);
+            }
+            None => groups.clear(),
+        }
+        if groups.is_empty() {
+            self.choices.remove(system);
+        }
+    }
+
+    /// Removes every choice in the Profile.
+    pub fn reset_all_choices(&mut self) {
+        self.choices.clear();
+    }
+
+    /// The Profile as its canonical JSON: compact, with every map sorted by key.
+    pub fn canonical_json(&self) -> String {
+        serde_json::to_string(self).expect("a Selection Profile always serializes")
+    }
 }
 
 /// Settings for one system. An order, `exclude` or `options` that is present replaces the global one; overrides are
@@ -51,6 +105,13 @@ pub struct SystemSettings {
     pub overrides: Overrides,
     pub post_filters: Vec<String>,
     pub replace_post_filters: bool,
+}
+
+impl SystemSettings {
+    /// Whether the system has no settings of its own, so the global settings apply unchanged.
+    pub fn is_empty(&self) -> bool {
+        self == &SystemSettings::default()
+    }
 }
 
 /// A kind of release that can be left out, as Retool categorizes them.
@@ -166,6 +227,9 @@ pub struct Selection {
     pub coverage_drift: CoverageDrift,
     /// Sorted by group name.
     pub groups: Vec<SelectionGroup>,
+    /// The Operator's choices for groups that are gone from the DAT Revision, by group: stale, never dropped.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stale_choices: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// What a Selection was made with, so that it can be reproduced.
@@ -186,6 +250,25 @@ pub struct SelectionSummary {
     pub alternatives: usize,
     pub exclusions: usize,
     pub unresolved: usize,
+    /// Groups whose winners the Operator's choice decided.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub choices: usize,
+    /// Stale choices, including those for groups that are gone.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stale: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub conflicting: usize,
+}
+
+impl SelectionSummary {
+    /// Groups that need a decision: unresolved, or with a stale or conflicting choice.
+    pub fn needs_review(&self) -> usize {
+        self.unresolved + self.stale + self.conflicting
+    }
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Where the clone list and metadata no longer match the DAT.
@@ -211,6 +294,222 @@ pub struct SelectionGroup {
     pub winners: Vec<Winner>,
     pub alternatives: Vec<Alternative>,
     pub exclusions: Vec<Exclusion>,
+    /// The Operator's choice for the group, if the Profile has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<GroupChoice>,
+    /// Coverage drift: a release in the group has no metadata entry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drift: bool,
+}
+
+impl SelectionGroup {
+    /// The engine's picks for the group, before any choice was applied.
+    pub fn picks(&self) -> BTreeSet<String> {
+        match &self.choice {
+            Some(choice) => choice.picks.iter().cloned().collect(),
+            None => self.winners.iter().map(|w| w.title.clone()).collect(),
+        }
+    }
+
+    /// Whether the engine left the group unresolved, before any choice confirmed it.
+    pub fn engine_unresolved(&self) -> bool {
+        match &self.choice {
+            Some(choice) => choice.engine_unresolved,
+            None => self.unresolved,
+        }
+    }
+
+    /// Unresolved, a stale choice or a conflicting choice: the group needs a decision.
+    pub fn needs_review(&self) -> bool {
+        self.unresolved
+            || self.choice.as_ref().is_some_and(|c| {
+                matches!(c.status, ChoiceStatus::Stale | ChoiceStatus::Conflicting)
+            })
+    }
+}
+
+/// The Operator's choice for one group and how it relates to the engine's picks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupChoice {
+    /// The releases checked.
+    pub checked: BTreeSet<String>,
+    pub status: ChoiceStatus,
+    /// The engine's winners, before the choice was applied.
+    pub picks: Vec<String>,
+    /// Whether the engine left the group unresolved.
+    pub engine_unresolved: bool,
+    /// Checked releases that are now excluded (conflicting) or gone from the group (stale).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChoiceStatus {
+    /// The choice decided the group's winners.
+    Applied,
+    /// The engine now picks exactly the checked releases, so the choice can be dropped.
+    MatchesDefault,
+    /// A checked release is now excluded by the settings; the choice is not applied.
+    Conflicting,
+    /// A checked release is gone from the group; the choice is not applied.
+    Stale,
+}
+
+impl ChoiceStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChoiceStatus::Applied => "applied",
+            ChoiceStatus::MatchesDefault => "matches_default",
+            ChoiceStatus::Conflicting => "conflicting",
+            ChoiceStatus::Stale => "stale",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ChoiceStatus> {
+        [
+            ChoiceStatus::Applied,
+            ChoiceStatus::MatchesDefault,
+            ChoiceStatus::Conflicting,
+            ChoiceStatus::Stale,
+        ]
+        .into_iter()
+        .find(|c| c.as_str() == s)
+    }
+}
+
+/// A release's role in its group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    Winner,
+    Alternative,
+    Exclusion,
+}
+
+impl Role {
+    pub const ALL: [Role; 3] = [Role::Winner, Role::Alternative, Role::Exclusion];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Winner => "winner",
+            Role::Alternative => "alternative",
+            Role::Exclusion => "exclusion",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Role> {
+        Role::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+}
+
+/// One release of a Selection, as a row: what `selection_releases` stores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseRow {
+    pub group: String,
+    pub role: Role,
+    pub title: String,
+    /// For an alternative, the winner it is an alternative to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone_of: Option<String>,
+    /// For an exclusion, Retool's reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub rule: Rule,
+    pub unresolved: bool,
+    pub from_choice: bool,
+}
+
+impl Selection {
+    /// Every release, group by group, winners then alternatives then exclusions.
+    pub fn rows(&self) -> Vec<ReleaseRow> {
+        let mut rows = Vec::new();
+        for group in &self.groups {
+            for w in &group.winners {
+                rows.push(ReleaseRow {
+                    group: group.group.clone(),
+                    role: Role::Winner,
+                    title: w.title.clone(),
+                    clone_of: None,
+                    reason: None,
+                    rule: w.rule.clone(),
+                    unresolved: w.unresolved,
+                    from_choice: w.rule.is_choice(),
+                });
+            }
+            for a in &group.alternatives {
+                rows.push(ReleaseRow {
+                    group: group.group.clone(),
+                    role: Role::Alternative,
+                    title: a.title.clone(),
+                    clone_of: Some(a.clone_of.clone()),
+                    reason: None,
+                    rule: a.rule.clone(),
+                    unresolved: false,
+                    from_choice: a.rule.is_choice(),
+                });
+            }
+            for e in &group.exclusions {
+                rows.push(ReleaseRow {
+                    group: group.group.clone(),
+                    role: Role::Exclusion,
+                    title: e.title.clone(),
+                    clone_of: None,
+                    reason: Some(e.reason.clone()),
+                    rule: e.rule.clone(),
+                    unresolved: false,
+                    from_choice: false,
+                });
+            }
+        }
+        rows
+    }
+}
+
+/// How one release's role changed between two Selections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseChange {
+    pub group: String,
+    pub title: String,
+    /// Absent when the release is new.
+    pub before: Option<Role>,
+    /// Absent when the release is gone.
+    pub after: Option<Role>,
+    /// The rule responsible now, or before when the release is gone.
+    pub rule: Rule,
+}
+
+/// Release by release, what changed from one Selection to another. Releases whose role is unchanged are left out.
+pub fn diff_rows(before: &[ReleaseRow], after: &[ReleaseRow]) -> Vec<ReleaseChange> {
+    let key = |r: &ReleaseRow| (r.group.clone(), r.title.clone());
+    let old: BTreeMap<_, _> = before.iter().map(|r| (key(r), r)).collect();
+    let new: BTreeMap<_, _> = after.iter().map(|r| (key(r), r)).collect();
+    let mut changes = Vec::new();
+    for (k, a) in &new {
+        let previous = old.get(k).map(|b| b.role);
+        if previous != Some(a.role) {
+            changes.push(ReleaseChange {
+                group: k.0.clone(),
+                title: k.1.clone(),
+                before: previous,
+                after: Some(a.role),
+                rule: a.rule.clone(),
+            });
+        }
+    }
+    for (k, b) in &old {
+        if !new.contains_key(k) {
+            changes.push(ReleaseChange {
+                group: k.0.clone(),
+                title: k.1.clone(),
+                before: Some(b.role),
+                after: None,
+                rule: b.rule.clone(),
+            });
+        }
+    }
+    changes.sort_by(|a, b| (&a.group, &a.title).cmp(&(&b.group, &b.title)));
+    changes
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +535,25 @@ pub struct Exclusion {
     pub rule: Rule,
     /// Retool's reason, such as `Demos, kiosks, and samples`.
     pub reason: String,
+}
+
+/// The stage of the rule recorded for a release the Operator's choice decided.
+pub const CHOICE_STAGE: &str = "choice";
+
+impl Rule {
+    /// The rule recorded for a release decided by the Operator's choice.
+    pub fn choice() -> Rule {
+        Rule {
+            stage: CHOICE_STAGE.to_owned(),
+            reference: None,
+            message: "your choice".to_owned(),
+        }
+    }
+
+    /// Whether the Operator's choice decided the release.
+    pub fn is_choice(&self) -> bool {
+        self.stage == CHOICE_STAGE
+    }
 }
 
 /// A rule in Retool's selection, as its trace reports it.

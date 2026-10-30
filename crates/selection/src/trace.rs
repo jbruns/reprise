@@ -321,6 +321,8 @@ fn row<'r>(rows: &'r mut BTreeMap<String, SelectionGroup>, name: &str) -> &'r mu
             winners: Vec::new(),
             alternatives: Vec::new(),
             exclusions: Vec::new(),
+            choice: None,
+            drift: false,
         })
 }
 
