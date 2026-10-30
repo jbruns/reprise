@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use title_select_engine::{Finding, GameStatus, Report};
+use title_select_api::selection::SelectionProfile;
+use title_select_engine::{Finding, GameStatus};
 use title_select_server::Settings;
 use title_select_store::config::Config;
 use title_select_store::{ImportOutcome, Store};
@@ -76,6 +77,28 @@ enum Command {
         #[arg(long, env = "TITLE_SELECT_UI")]
         ui: Option<PathBuf>,
     },
+    /// Select from a DAT with a Selection Profile, running the pinned Retool, and print the explained Selection
+    /// as JSON: every group's winner, alternatives and exclusions with the rule responsible for each.
+    ///
+    /// Retool runs in a scratch folder in the store's `tmp` when `--store` is given, else in the system's
+    /// temporary folder, and the folder is deleted afterwards.
+    Select {
+        /// The Logiqx XML DAT file to select from.
+        #[arg(long)]
+        dat: PathBuf,
+        /// The Selection Profile, as JSON.
+        #[arg(long)]
+        profile: PathBuf,
+        /// The Retool install that `tools/retool/setup` builds. Defaults to `/opt/retool`.
+        #[arg(long, env = title_select_selection::RETOOL_ENV)]
+        retool: Option<PathBuf>,
+        /// Seconds Retool may run before it is stopped.
+        #[arg(long, default_value_t = title_select_selection::DEFAULT_TIMEOUT.as_secs(), value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: u64,
+        /// Write the Selection to this file instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Check that a Service is up, for a container healthcheck. Prints nothing on success; exits 1 with the
     /// reason on stderr otherwise.
     Health {
@@ -144,7 +167,7 @@ fn load_config(path: Option<&Path>) -> Result<Config, String> {
     }
 }
 
-fn write_report(report: &Report, output: Option<PathBuf>) -> Result<(), String> {
+fn write_report(report: &impl serde::Serialize, output: Option<PathBuf>) -> Result<(), String> {
     let mut json = serde_json::to_vec_pretty(report).map_err(|e| e.to_string())?;
     json.push(b'\n');
     match output {
@@ -208,6 +231,35 @@ fn run(cli: Cli) -> Result<(), String> {
                 hold_jobs: false,
             })
             .map_err(|e| e.to_string())
+        }
+        Command::Select {
+            dat,
+            profile,
+            retool,
+            timeout,
+            output,
+        } => {
+            let profile: SelectionProfile = serde_json::from_slice(
+                &std::fs::read(&profile).map_err(|e| format!("{}: {e}", profile.display()))?,
+            )
+            .map_err(|e| format!("{}: {e}", profile.display()))?;
+            let work_dir = match store {
+                Some(store) => store.join(title_select_store::TMP),
+                None => std::env::temp_dir(),
+            };
+            let selection = title_select_selection::Engine::locate(retool.as_deref())
+                .and_then(|engine| {
+                    engine.select(
+                        &dat,
+                        &profile,
+                        &title_select_selection::RunOptions {
+                            work_dir,
+                            timeout: std::time::Duration::from_secs(timeout),
+                        },
+                    )
+                })
+                .map_err(|e| e.to_string())?;
+            write_report(&selection, output)
         }
         Command::Health { url, timeout } => {
             client::health(&url, std::time::Duration::from_secs(timeout))

@@ -1,0 +1,280 @@
+{
+  "pins": {
+    "retool_commit": "",
+    "patch_set_sha256": "",
+    "clone_list_commit": "",
+    "trace_schema": 0
+  },
+  "dat_sha256": "c4270a38812ec9c855c9ae539819b2f6624907f34142df44e76a18110bf91d50",
+  "system": "Retool - Clone list filters",
+  "system_settings": false,
+  "summary": {
+    "groups": 9,
+    "winners": 8,
+    "alternatives": 0,
+    "exclusions": 11,
+    "unresolved": 0
+  },
+  "coverage_drift": {
+    "clone_list": true,
+    "metadata": false,
+    "unmatched_clone_list_terms": [],
+    "titles_without_metadata": [
+      "Test Title 0 (Disc 1) (USA)",
+      "Test Title 0 (Disc 2) (USA)",
+      "Test Title 0 (Germany)",
+      "Test Title 1 (Asia) (Disc 1) (Japanese Version)",
+      "Test Title 1 (Asia) (Disc 2) (International Version)",
+      "Test Title 1 (Europe)",
+      "Test Title 1 (Germany)",
+      "Test Title 1 (Italy)",
+      "Test Title 1 (Japan) (Disc 1) (Japanese Version)",
+      "Test Title 1 (Japan) (Disc 2) (International Version)",
+      "Test Title 1 (Spain)",
+      "Test Title 1 (USA)",
+      "Test Title 2 (Europe)",
+      "Test Title 2 (USA)",
+      "Test Title 3 (USA)",
+      "Test Title 3 (USA) (Fr)",
+      "Test Title 4 (USA)",
+      "Test Title 4 (USA) (Pirate)",
+      "Test Titre 1 (France)"
+    ]
+  },
+  "groups": [
+    {
+      "group": "test title 0 (disc 1)",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 0 (Disc 1) (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0074",
+            "message": "Only one title in this region, skipping filtering"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 0 (Germany)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Region remove"
+          },
+          "reason": "Region remove"
+        }
+      ]
+    },
+    {
+      "group": "test title 0 (disc 2)",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 0 (Disc 2) (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0074",
+            "message": "Only one title in this region, skipping filtering"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [],
+      "exclusions": []
+    },
+    {
+      "group": "test title 1",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 1 (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0074",
+            "message": "Only one title in this region, skipping filtering"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 1 (Asia) (Disc 1) (Japanese Version)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Region remove"
+          },
+          "reason": "Region remove"
+        },
+        {
+          "title": "Test Title 1 (Asia) (Disc 2) (International Version)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Region remove"
+          },
+          "reason": "Region remove"
+        },
+        {
+          "title": "Test Title 1 (Europe)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Region remove"
+          },
+          "reason": "Region remove"
+        },
+        {
+          "title": "Test Title 1 (Germany)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Region remove"
+          },
+          "reason": "Region remove"
+        },
+        {
+          "title": "Test Title 1 (Italy)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Region remove"
+          },
+          "reason": "Region remove"
+        },
+        {
+          "title": "Test Title 1 (Japan) (Disc 1) (Japanese Version)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Region remove"
+          },
+          "reason": "Region remove"
+        },
+        {
+          "title": "Test Title 1 (Japan) (Disc 2) (International Version)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Region remove"
+          },
+          "reason": "Region remove"
+        },
+        {
+          "title": "Test Title 1 (Spain)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Region remove"
+          },
+          "reason": "Region remove"
+        },
+        {
+          "title": "Test Titre 1 (France)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Region remove"
+          },
+          "reason": "Region remove"
+        }
+      ]
+    },
+    {
+      "group": "test title 2",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 2 (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0074",
+            "message": "Only one title in this region, skipping filtering"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [],
+      "exclusions": []
+    },
+    {
+      "group": "test title 2 (europe)",
+      "unresolved": false,
+      "winners": [],
+      "alternatives": [],
+      "exclusions": [
+        {
+          "title": "Test Title 2 (Europe)",
+          "rule": {
+            "stage": "Exclusions",
+            "message": "Region remove"
+          },
+          "reason": "Region remove"
+        }
+      ]
+    },
+    {
+      "group": "test title 3",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 3 (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0074",
+            "message": "Only one title in this region, skipping filtering"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [],
+      "exclusions": []
+    },
+    {
+      "group": "test title 3 (french)",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 3 (USA) (Fr)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0074",
+            "message": "Only one title in this region, skipping filtering"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [],
+      "exclusions": []
+    },
+    {
+      "group": "test title 4",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 4 (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0074",
+            "message": "Only one title in this region, skipping filtering"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [],
+      "exclusions": []
+    },
+    {
+      "group": "test title 4 (pirate)",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 4 (USA) (Pirate)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0074",
+            "message": "Only one title in this region, skipping filtering"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [],
+      "exclusions": []
+    }
+  ]
+}

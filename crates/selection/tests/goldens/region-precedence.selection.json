@@ -1,0 +1,143 @@
+{
+  "pins": {
+    "retool_commit": "",
+    "patch_set_sha256": "",
+    "clone_list_commit": "",
+    "trace_schema": 0
+  },
+  "dat_sha256": "3468ce2eea7c72978eed3e2bcc1d8fda974f3c0190ee59abf94b8ec8c0f3dee8",
+  "system": "Retool - World is USA-Europe-Japan",
+  "system_settings": false,
+  "summary": {
+    "groups": 4,
+    "winners": 4,
+    "alternatives": 4,
+    "exclusions": 0,
+    "unresolved": 0
+  },
+  "coverage_drift": {
+    "clone_list": false,
+    "metadata": false,
+    "unmatched_clone_list_terms": [],
+    "titles_without_metadata": [
+      "Test Title (USA)",
+      "Test Title (World)",
+      "Test Title 2 (Jimakuban) (USA)",
+      "Test Title 2 (World)",
+      "Test Title 3 (Jimakuban) (USA, Europe) (En,Fr,De,It,Es)",
+      "Test Title 3 (World)",
+      "Test Title 4 (USA, Europe) (Fr)",
+      "Test Title 4 (World)"
+    ]
+  },
+  "groups": [
+    {
+      "group": "test title",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0102",
+            "message": "Group after fallback higher priority region check"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [
+        {
+          "title": "Test Title (World)",
+          "clone_of": "Test Title (USA)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0102",
+            "message": "Group after fallback higher priority region check"
+          }
+        }
+      ],
+      "exclusions": []
+    },
+    {
+      "group": "test title 2",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 2 (World)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0140",
+            "message": "Group after comparing World titles to USA, Europe, or Japan"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [
+        {
+          "title": "Test Title 2 (Jimakuban) (USA)",
+          "clone_of": "Test Title 2 (World)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0140",
+            "message": "Group after comparing World titles to USA, Europe, or Japan"
+          }
+        }
+      ],
+      "exclusions": []
+    },
+    {
+      "group": "test title 3",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 3 (World)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0140",
+            "message": "Group after comparing World titles to USA, Europe, or Japan"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [
+        {
+          "title": "Test Title 3 (Jimakuban) (USA, Europe) (En,Fr,De,It,Es)",
+          "clone_of": "Test Title 3 (World)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0140",
+            "message": "Group after comparing World titles to USA, Europe, or Japan"
+          }
+        }
+      ],
+      "exclusions": []
+    },
+    {
+      "group": "test title 4",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title 4 (World)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0119",
+            "message": "Group after good dump/production/retail check"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [
+        {
+          "title": "Test Title 4 (USA, Europe) (Fr)",
+          "clone_of": "Test Title 4 (World)",
+          "rule": {
+            "stage": "Parent selection",
+            "ref": "REF0119",
+            "message": "Group after good dump/production/retail check"
+          }
+        }
+      ],
+      "exclusions": []
+    }
+  ]
+}

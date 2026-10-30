@@ -28,6 +28,9 @@ pub const DATABASE: &str = "title-select.sqlite";
 pub const DATS: &str = "dats";
 /// The directory, in the store directory, that holds the backups taken before migrations.
 pub const BACKUPS: &str = "backups";
+/// The directory, in the store directory, that holds per-run scratch folders, such as a Selection's Retool run.
+/// Each run deletes its own folder.
+pub const TMP: &str = "tmp";
 /// The file, in the store directory, that an open store holds an exclusive lock on.
 pub const LOCK: &str = "lock";
 

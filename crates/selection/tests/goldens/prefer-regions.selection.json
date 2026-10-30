@@ -1,0 +1,66 @@
+{
+  "pins": {
+    "retool_commit": "",
+    "patch_set_sha256": "",
+    "clone_list_commit": "",
+    "trace_schema": 0
+  },
+  "dat_sha256": "77105d6d77421ca4d8b0f310aed33799c1c0508b8083555d75e86ea481cef940",
+  "system": "Retool - Prefer regions",
+  "system_settings": false,
+  "summary": {
+    "groups": 1,
+    "winners": 1,
+    "alternatives": 2,
+    "exclusions": 0,
+    "unresolved": 0
+  },
+  "coverage_drift": {
+    "clone_list": true,
+    "metadata": false,
+    "unmatched_clone_list_terms": [],
+    "titles_without_metadata": [
+      "Test Title (Thailand) (En)",
+      "Test Title (World) (El)",
+      "Test Title Genius Edition (Canada)"
+    ]
+  },
+  "groups": [
+    {
+      "group": "test title",
+      "unresolved": false,
+      "winners": [
+        {
+          "title": "Test Title (World) (El)",
+          "rule": {
+            "stage": "Superset parent selection",
+            "ref": "REF0014",
+            "message": "Group after lower priority region, non-superset clones removed"
+          },
+          "unresolved": false
+        }
+      ],
+      "alternatives": [
+        {
+          "title": "Test Title (Thailand) (En)",
+          "clone_of": "Test Title (World) (El)",
+          "rule": {
+            "stage": "Superset parent selection",
+            "ref": "REF0014",
+            "message": "Group after lower priority region, non-superset clones removed"
+          }
+        },
+        {
+          "title": "Test Title Genius Edition (Canada)",
+          "clone_of": "Test Title (World) (El)",
+          "rule": {
+            "stage": "Superset parent selection",
+            "ref": "REF0014",
+            "message": "Group after lower priority region, non-superset clones removed"
+          }
+        }
+      ],
+      "exclusions": []
+    }
+  ]
+}
