@@ -6,7 +6,7 @@ use super::audits::{check_blob_present, choose_revision, delete_audits};
 use super::sets::set_by_name;
 use super::{Error, Result, Store, now};
 use crate::config::Config;
-use title_select_api::{Job, JobState, Workers};
+use title_select_api::{Job, JobKind, JobState, ProfileVersionRef, Workers};
 use title_select_engine::Progress;
 
 /// Why a restart Interrupted a Job.
@@ -32,14 +32,17 @@ pub(super) struct JobRow {
     pub workers: Workers,
 }
 
-const JOB_QUERY: &str =
+pub(super) const JOB_QUERY: &str =
     "SELECT j.id, j.state, s.name, r.sha256, j.actor, j.attempt, j.requeued_from, j.audit_id,
-            j.error, j.readers, j.hashers, j.created_at, j.started_at, j.finished_at, j.version
+            j.error, j.readers, j.hashers, j.created_at, j.started_at, j.finished_at, j.version,
+            j.kind, p.name, v.version, j.selection_id
      FROM jobs j
      JOIN source_sets s ON s.id = j.source_set_id
-     JOIN dat_revisions r ON r.id = j.dat_revision_id";
+     JOIN dat_revisions r ON r.id = j.dat_revision_id
+     LEFT JOIN profile_versions v ON v.id = j.profile_version_id
+     LEFT JOIN profiles p ON p.id = v.profile_id";
 
-fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
+pub(super) fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
     let state: String = row.get(1)?;
     let state = JobState::parse(&state).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -48,8 +51,26 @@ fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
             format!("unknown job state {state}").into(),
         )
     })?;
+    let kind: String = row.get(15)?;
+    let kind = JobKind::parse(&kind).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            15,
+            rusqlite::types::Type::Text,
+            format!("unknown job kind {kind}").into(),
+        )
+    })?;
+    let profile = match row.get::<_, Option<String>>(16)? {
+        Some(name) => Some(ProfileVersionRef {
+            name,
+            version: row.get(17)?,
+        }),
+        None => None,
+    };
     Ok(Job {
         id: row.get(0)?,
+        kind,
+        profile,
+        selection: row.get(18)?,
         state,
         source_set: row.get(2)?,
         dat_revision: row.get(3)?,
@@ -69,14 +90,19 @@ fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
     })
 }
 
-fn job_by_id(c: &Connection, id: i64) -> Result<Job> {
+pub(super) fn job_by_id(c: &Connection, id: i64) -> Result<Job> {
     c.query_row(&format!("{JOB_QUERY} WHERE j.id = ?1"), [id], job_from_row)
         .optional()?
         .ok_or_else(|| Error::NotFound(format!("no job {id}")))
 }
 
 /// Moves the Running Job `id` to `to`, failing if it is not Running.
-fn finish_running(tx: &Transaction, id: i64, to: JobState, error: Option<&str>) -> Result<()> {
+pub(super) fn finish_running(
+    tx: &Transaction,
+    id: i64,
+    to: JobState,
+    error: Option<&str>,
+) -> Result<()> {
     let updated = tx.execute(
         "UPDATE jobs SET state = ?2, error = ?3, finished_at = ?4, version = version + 1
          WHERE id = ?1 AND state = 'running'",
@@ -105,6 +131,30 @@ pub(super) fn fail(tx: &Transaction, id: i64, error: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuses a Job of `kind` while the Source Set has one Queued or Running.
+pub(super) fn check_no_active(
+    c: &Connection,
+    set_id: i64,
+    set_name: &str,
+    kind: JobKind,
+) -> Result<()> {
+    let active: Option<i64> = c
+        .query_row(
+            "SELECT id FROM jobs WHERE source_set_id = ?1 AND kind = ?2 AND state IN ('queued', 'running')",
+            params![set_id, kind.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match active {
+        Some(job) => Err(Error::JobActive {
+            source_set: set_name.to_owned(),
+            job,
+            kind,
+        }),
+        None => Ok(()),
+    }
+}
+
 impl Store {
     /// Queues an Audit of the Source Set `name`, started by `actor`, pinned now to the DAT Revision `revision` (a
     /// SHA-256 prefix) or by default the latest Audit's, else the newest imported revision of its DAT. Refused, naming
@@ -123,19 +173,7 @@ impl Store {
         }
         self.write(|tx| {
             let set = set_by_name(tx, name)?;
-            let active: Option<i64> = tx
-                .query_row(
-                    "SELECT id FROM jobs WHERE source_set_id = ?1 AND state IN ('queued', 'running')",
-                    [set.id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(job) = active {
-                return Err(Error::JobActive {
-                    source_set: set.record.name,
-                    job,
-                });
-            }
+            check_no_active(tx, set.id, &set.record.name, JobKind::Audit)?;
             let (revision_id, chosen) = choose_revision(tx, &set, revision)?;
             check_blob_present(&chosen)?;
             tx.execute(
@@ -185,7 +223,7 @@ impl Store {
     ) -> Result<Job> {
         let row = self.read(|c| {
             c.query_row(
-                "SELECT id, source_set_id, dat_revision_id, readers, hashers, state FROM jobs WHERE id = ?1",
+                "SELECT id, source_set_id, dat_revision_id, readers, hashers, state, kind FROM jobs WHERE id = ?1",
                 [id],
                 |r| {
                     Ok((
@@ -199,13 +237,17 @@ impl Store {
                             },
                         },
                         r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
                     ))
                 },
             )
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("no job {id}")))
         })?;
-        let (row, state) = row;
+        let (row, state, kind) = row;
+        if kind != JobKind::Audit.as_str() {
+            return Err(Error::Refused(format!("job {id} is not an audit")));
+        }
         if state != JobState::Running.as_str() {
             return Err(Error::Refused(format!("job {id} is {state}, not running")));
         }
@@ -262,8 +304,9 @@ impl Store {
                     finish_running(tx, id, JobState::Interrupted, Some(INTERRUPTED))?;
                     tx.execute(
                         "INSERT INTO jobs (state, source_set_id, dat_revision_id, actor, attempt, requeued_from,
-                                           readers, hashers, created_at)
-                         SELECT 'queued', source_set_id, dat_revision_id, actor, attempt + 1, id, ?2, ?3, ?4
+                                           readers, hashers, created_at, kind, profile_version_id)
+                         SELECT 'queued', source_set_id, dat_revision_id, actor, attempt + 1, id, ?2, ?3, ?4,
+                                kind, profile_version_id
                          FROM jobs WHERE id = ?1",
                         params![id, workers.readers as i64, workers.hashers as i64, now()],
                     )?;

@@ -348,6 +348,7 @@ mod tests {
     fn job(state: JobState) -> Job {
         Job {
             id: 1,
+            kind: Default::default(),
             state,
             source_set: "Test - System".into(),
             dat_revision: "0".repeat(64),
@@ -355,6 +356,8 @@ mod tests {
             attempt: 1,
             requeued_from: None,
             audit: None,
+            profile: None,
+            selection: None,
             error: None,
             workers: Workers {
                 readers: 1,

@@ -121,7 +121,8 @@
           },
           "reason": "Language remove"
         }
-      ]
+      ],
+      "drift": true
     }
   ]
 }

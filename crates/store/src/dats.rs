@@ -161,7 +161,8 @@ impl Store {
     pub fn retain_blobs(&self) -> Result<Vec<String>> {
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // An Audit row that is not pruned, including one still running, holds its DAT Revision.
+            // An Audit row that is not pruned, including one still running, holds its DAT Revision; so does a
+            // Selection that is not pruned.
             let shas = tx
                 .prepare(
                     "SELECT r.sha256 FROM dat_revisions r
@@ -171,6 +172,8 @@ impl Store {
                            SELECT 1 FROM audits a WHERE a.dat_revision_id = r.id AND a.pruned_at IS NULL)
                        AND NOT EXISTS (
                            SELECT 1 FROM jobs j WHERE j.dat_revision_id = r.id AND j.state IN ('queued', 'running'))
+                       AND NOT EXISTS (
+                           SELECT 1 FROM selections s WHERE s.dat_revision_id = r.id AND s.pruned_at IS NULL)
                      ORDER BY r.id",
                 )?
                 .query_map([], |r| r.get(0))?

@@ -3,8 +3,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use title_select_api::{Job, JobEvent, JobProgress};
+use title_select_api::{Job, JobEvent, JobKind, JobProgress};
 use title_select_engine::Progress;
+use title_select_selection::Engine;
 use title_select_store::Store;
 use title_select_store::config::Config;
 use tokio::sync::{Notify, Semaphore, broadcast};
@@ -47,7 +48,12 @@ impl Jobs {
 }
 
 /// Claims and runs Queued Jobs forever.
-pub async fn run(store: Arc<Store>, config: Arc<Config>, jobs: Arc<Jobs>) {
+pub async fn run(
+    store: Arc<Store>,
+    config: Arc<Config>,
+    jobs: Arc<Jobs>,
+    engine: Option<Arc<Engine>>,
+) {
     let slots = Arc::new(Semaphore::new(config.jobs.concurrent));
     loop {
         let slot = slots.clone().acquire_owned().await.expect("never closed");
@@ -76,23 +82,29 @@ pub async fn run(store: Arc<Store>, config: Arc<Config>, jobs: Arc<Jobs>) {
             }
         };
         eprintln!(
-            "title-select: job {} started: audit of {}",
-            job.id, job.source_set
+            "title-select: job {} started: {} of {}",
+            job.id,
+            job.kind.as_str(),
+            job.source_set
         );
         jobs.changed(job.clone());
-        let (store, config, jobs) = (store.clone(), config.clone(), jobs.clone());
+        let (store, config, jobs, engine) =
+            (store.clone(), config.clone(), jobs.clone(), engine.clone());
         tokio::spawn(async move {
-            let (id, version) = (job.id, job.version);
+            let (id, version, kind) = (job.id, job.version, job.kind);
             let ended = {
                 let (store, jobs) = (store.clone(), jobs.clone());
-                tokio::task::spawn_blocking(move || run_one(&store, &config, &jobs, id, version))
-                    .await
+                tokio::task::spawn_blocking(move || match kind {
+                    JobKind::Audit => run_one(&store, &config, &jobs, id, version),
+                    JobKind::Selection => run_selection(&store, &config, engine.as_deref(), id),
+                })
+                .await
             };
             let job = match ended {
                 Ok(job) => job,
                 Err(err) => {
                     let store = store.clone();
-                    let message = format!("the audit stopped unexpectedly: {err}");
+                    let message = format!("the {} stopped unexpectedly: {err}", kind.as_str());
                     tokio::task::spawn_blocking(move || store.fail_job(id, &message).ok())
                         .await
                         .ok()
@@ -132,6 +144,40 @@ fn run_one(store: &Store, config: &Config, jobs: &Jobs, id: i64, version: u64) -
             match store.job(id) {
                 Ok(job) if job.state.is_final() => Some(job),
                 _ => store.fail_job(id, &err.to_string()).ok(),
+            }
+        }
+    }
+}
+
+/// Runs one claimed Selection Job: the engine on its DAT Revision with its Profile version. Returns the Job as it
+/// ended.
+fn run_selection(store: &Store, config: &Config, engine: Option<&Engine>, id: i64) -> Option<Job> {
+    let made = (|| {
+        let engine = engine.ok_or_else(|| crate::selections::UNAVAILABLE.to_owned())?;
+        let input = store.selection_input(id).map_err(|e| e.to_string())?;
+        crate::selections::select(
+            store,
+            engine,
+            &input.dat,
+            &input.dat_revision.file,
+            &input.profile,
+            None,
+        )
+        .map_err(|e| e.to_string())
+    })();
+    let ended = match made {
+        Ok(selection) => store
+            .record_selection(config, id, &selection)
+            .map_err(|e| e.to_string()),
+        Err(message) => Err(message),
+    };
+    match ended {
+        Ok(job) => Some(job),
+        Err(message) => {
+            eprintln!("title-select: job {id}: {message}");
+            match store.job(id) {
+                Ok(job) if job.state.is_final() => Some(job),
+                _ => store.fail_job(id, &message).ok(),
             }
         }
     }

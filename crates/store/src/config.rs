@@ -9,6 +9,8 @@ use title_select_api::Workers;
 
 /// How many full Audits a Source Set keeps when the configuration does not say.
 pub const DEFAULT_AUDITS_KEPT: usize = 20;
+/// How many full Selections a Source Set keeps when the configuration does not say.
+pub const DEFAULT_SELECTIONS_KEPT: usize = 20;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +20,8 @@ pub struct Config {
     pub roots: BTreeMap<String, Root>,
     #[serde(default)]
     pub audits: Audits,
+    #[serde(default)]
+    pub selections: Selections,
     #[serde(default)]
     pub auth: Auth,
     #[serde(default)]
@@ -49,6 +53,26 @@ impl Default for Audits {
     fn default() -> Self {
         Audits {
             keep: DEFAULT_AUDITS_KEPT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Selections {
+    /// The latest full Selections kept per Source Set; older ones are pruned to their record.
+    #[serde(default = "default_selections_keep")]
+    pub keep: usize,
+}
+
+fn default_selections_keep() -> usize {
+    DEFAULT_SELECTIONS_KEPT
+}
+
+impl Default for Selections {
+    fn default() -> Self {
+        Selections {
+            keep: DEFAULT_SELECTIONS_KEPT,
         }
     }
 }
@@ -143,6 +167,7 @@ impl Default for Config {
         Config {
             roots: BTreeMap::new(),
             audits: Audits::default(),
+            selections: Selections::default(),
             auth: Auth::default(),
             jobs: Jobs::default(),
         }
@@ -164,6 +189,9 @@ impl Config {
         let config: Config = toml::from_str(text).map_err(|e| Error(e.to_string()))?;
         if config.audits.keep == 0 {
             return Err(Error("audits.keep must be at least 1".into()));
+        }
+        if config.selections.keep == 0 {
+            return Err(Error("selections.keep must be at least 1".into()));
         }
         if config.jobs.concurrent == 0 {
             return Err(Error("jobs.concurrent must be at least 1".into()));

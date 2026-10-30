@@ -5,13 +5,17 @@
 //! (`/opt/retool`), in a per-run folder that is deleted afterwards. It never reaches the network: it reads only
 //! the pinned clone lists, metadata, MIA and RetroAchievements files beside it.
 
+pub mod choices;
 mod config;
+mod patterns;
 mod trace;
 
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -39,6 +43,9 @@ pub enum Error {
     Install(String),
     #[error("selection profile: {0}")]
     Profile(String),
+    /// Regular expressions in the Profile that the engine cannot compile, one message each.
+    #[error("{}", .0.join("\n"))]
+    Patterns(Vec<String>),
     #[error("{context}: {source}")]
     Io {
         context: String,
@@ -48,6 +55,8 @@ pub enum Error {
     Retool { status: String, output: String },
     #[error("selection did not finish within {} s", .0.as_secs())]
     Timeout(Duration),
+    #[error("selection was cancelled")]
+    Cancelled,
     #[error("the selection engine's trace: {0}")]
     Trace(String),
 }
@@ -63,6 +72,18 @@ pub struct RunOptions {
     /// The folder the per-run folder is made in, such as the store's `tmp`.
     pub work_dir: PathBuf,
     pub timeout: Duration,
+    /// Set to stop the run: the subprocess is killed and the run fails with `Error::Cancelled`.
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl RunOptions {
+    pub fn new(work_dir: impl Into<PathBuf>) -> RunOptions {
+        RunOptions {
+            work_dir: work_dir.into(),
+            timeout: DEFAULT_TIMEOUT,
+            cancel: None,
+        }
+    }
 }
 
 /// A Selection and the trace it was derived from.
@@ -71,6 +92,8 @@ pub struct Outcome {
     pub selection: Selection,
     /// Retool's trace, as JSON Lines.
     pub trace: String,
+    /// What Retool warned about on a run that succeeded, one line each.
+    pub warnings: Vec<String>,
 }
 
 /// A verified Retool install.
@@ -172,7 +195,35 @@ impl Engine {
             .map(|outcome| outcome.selection)
     }
 
-    /// Selects from `dat` with `profile`, and keeps the trace.
+    fn vocabulary(&self) -> Result<config::Vocabulary, Error> {
+        let internal = self
+            .root
+            .join("retool")
+            .join("config")
+            .join("internal-config.json");
+        config::Vocabulary::parse(
+            &std::fs::read(&internal).map_err(io(internal.display().to_string()))?,
+        )
+    }
+
+    /// The region, language and video names a Profile may use.
+    pub fn names(&self) -> Result<Names, Error> {
+        let vocabulary = self.vocabulary()?;
+        Ok(Names {
+            regions: vocabulary.regions,
+            languages: vocabulary.languages.into_iter().collect(),
+            videos: vocabulary.videos,
+        })
+    }
+
+    /// Checks that the engine can read `profile`: every name is known and every override and post filter is
+    /// well formed.
+    pub fn check(&self, profile: &SelectionProfile) -> Result<(), Error> {
+        self.vocabulary()?.check(profile)?;
+        patterns::check(&self.python(), profile)
+    }
+
+    /// Selects from `dat` with `profile`, applies the Profile's choices for the DAT's system, and keeps the trace.
     pub fn run(
         &self,
         dat: &Path,
@@ -180,11 +231,9 @@ impl Engine {
         options: &RunOptions,
     ) -> Result<Outcome, Error> {
         let retool = self.root.join("retool");
-        let internal = retool.join("config").join("internal-config.json");
-        let vocabulary = config::Vocabulary::parse(
-            &std::fs::read(&internal).map_err(io(internal.display().to_string()))?,
-        )?;
+        let vocabulary = self.vocabulary()?;
         vocabulary.check(profile)?;
+        patterns::check(&self.python(), profile)?;
         let dat = std::path::absolute(dat).map_err(io(dat.display().to_string()))?;
         let dat_sha256 = sha256_file(&dat)?;
 
@@ -264,6 +313,15 @@ impl Engine {
             {
                 break status;
             }
+            if options
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::Relaxed))
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Cancelled);
+            }
             if started.elapsed() >= options.timeout {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -289,20 +347,73 @@ impl Engine {
         let trace =
             std::fs::read_to_string(&trace_path).map_err(io(trace_path.display().to_string()))?;
         let derived = trace::derive(&trace)?;
+        let warnings = warnings(&std::fs::read_to_string(&stderr_path).unwrap_or_default());
         run.close().map_err(io("removing the run folder"))?;
+        let mut selection = Selection {
+            pins: self.pins.clone(),
+            dat_sha256,
+            system_settings: profile.systems.contains_key(&derived.system),
+            summary: derived.summary,
+            coverage_drift: derived.coverage_drift,
+            groups: derived.groups,
+            stale_choices: Default::default(),
+            system: derived.system,
+        };
+        let choices = profile.choices.get(&selection.system);
+        choices::apply(&mut selection, choices);
         Ok(Outcome {
-            selection: Selection {
-                pins: self.pins.clone(),
-                dat_sha256,
-                system_settings: profile.systems.contains_key(&derived.system),
-                system: derived.system,
-                summary: derived.summary,
-                coverage_drift: derived.coverage_drift,
-                groups: derived.groups,
-            },
+            selection,
             trace,
+            warnings,
         })
     }
+}
+
+/// The warnings and errors in Retool's console output, a line each and without their colours. Retool colours
+/// them yellow (`ESC[93m`) and red (`ESC[91m`) until `ESC[0m`; its banner and progress notes are uncoloured.
+fn warnings(stderr: &str) -> Vec<String> {
+    let mut flagged = String::new();
+    let mut on = false;
+    let mut chars = stderr.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            if on || c == '\n' {
+                flagged.push(c);
+            }
+            continue;
+        }
+        let mut sequence = String::new();
+        for c in chars.by_ref() {
+            if c.is_ascii_alphabetic() {
+                sequence.push(c);
+                break;
+            }
+            sequence.push(c);
+        }
+        if let Some(params) = sequence.strip_prefix('[').and_then(|s| s.strip_suffix('m')) {
+            for param in params.split(';') {
+                match param {
+                    "93" | "91" => on = true,
+                    "" | "0" | "35" | "36" | "90" | "92" => on = false,
+                    _ => {}
+                }
+            }
+        }
+    }
+    flagged
+        .lines()
+        .map(|l| l.trim().trim_start_matches('•').trim())
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The names a Profile may use, from the engine's internal configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Names {
+    pub regions: Vec<String>,
+    pub languages: Vec<String>,
+    pub videos: Vec<String>,
 }
 
 /// The upstream projects this binary's Selection is pinned to, from `third_party/retool/pins.toml`.
@@ -372,4 +483,23 @@ fn sha256_file(path: &Path) -> Result<String, Error> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn warnings_are_retools_console_lines_without_colours() {
+        let stderr = "\u{1b}[0m\n\n\u{1b}[1mRetool 2.4.9\u{1b}[22m\u{1b}[0m\n\u{1b}[0m• Creating folder\n  \"\u{1b}[1m/out\
+                      \u{1b}[22m\"\u{1b}[0m\n\u{1b}[0m\u{1b}[93m• The following global post filter regexes are invalid \
+                      and will be\nskipped:\n\u{1b}[0m\n\u{1b}[0m\u{1b}[93m  • \u{1b}[1m/[\u{1b}[22m\u{1b}[0m\n";
+
+        assert_eq!(
+            super::warnings(stderr),
+            [
+                "The following global post filter regexes are invalid and will be",
+                "skipped:",
+                "/["
+            ]
+        );
+    }
 }

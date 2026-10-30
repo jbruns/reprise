@@ -109,12 +109,26 @@ refused:
   "post_filters": [],
   "systems": {                                 // keyed by the system name derived from the DAT header
     "Atari - Atari 2600 (No-Intro)": { "region_order": ["Europe", "USA"], "replace_post_filters": false }
+  },
+  "choices": {                                 // your choices, by system and then group: the releases you checked
+    "Atari - Atari 2600 (No-Intro)": { "pong": ["Pong (Europe)"], "parachute": [] }
   }
 }
 ```
 
 A per-system order, `exclude` or `options` replaces the global one; its overrides are added to the global ones, and
 its post filters too unless `replace_post_filters` is set.
+
+In overrides and post filters, plain text matches part of a release's name, `|` the full name and `/` a regular
+expression (Python syntax, ignoring case). A profile with a regular expression that doesn't compile is refused, so it
+can't silently match nothing. Anything else the engine warns about on a run that succeeds goes to the server's log, or
+to standard error for `title-select select`.
+
+A choice replaces the selection's winners in one group with the releases you checked, zero or more, after the engine
+has run. It is kept only where it differs from what the engine picks, or where you confirmed an unresolved group's
+pick. A choice is not applied, and is flagged, when a checked release is now excluded by your settings (conflicting)
+or gone from the group (stale); a choice for a group that is gone is kept and listed until you drop it. A choice that
+the engine now makes anyway is flagged as matching the default, so you can drop it.
 
 ```jsonc
 {
@@ -149,12 +163,17 @@ its post filters too unless `replace_post_filters` is set.
 - Each winner, alternative and exclusion carries the rule that decided it: the stage, the engine's trace reference and
   its message. `ref` is absent when no trace record names the release, for example a release filtered out by region.
 - A group is `unresolved` when its deciding rule is the engine's fail-safe (choosing the highest string) or a
-  compilation tie-breaker. The engine's pick stays as the provisional winner: review it.
+  compilation tie-breaker. The engine's pick stays as the provisional winner: review it. Confirming it, or choosing
+  other releases, resolves it.
+- A group with your choice carries `choice`: the releases you checked, its `status` (`applied`, `matches_default`,
+  `conflicting` or `stale`), the engine's `picks` and whether the engine left it unresolved. Releases it moved carry
+  a rule whose stage is `choice`. The selection's `stale_choices` lists your choices for groups that are gone.
+- A group has `drift` when a release in it has no metadata, or the clone list names it but no longer matches the DAT.
 
 ## Store
 
 The store is one directory: a SQLite database (`title-select.sqlite`), the unmodified DAT files under `dats/<sha256>`,
-`backups/`, and `tmp/`, where selections run. Pass it with `--store <dir>` or `TITLE_SELECT_STORE`; it is created on
+`backups/`, and `tmp/`, where selections and previews run. Pass it with `--store <dir>` or `TITLE_SELECT_STORE`; it is created on
 first use. Only one Title Select process may have a store open at a time: it holds an exclusive lock on
 `<store>/lock`, and another process fails at once with "the store is in use by another Title Select process".
 
@@ -180,6 +199,9 @@ writable = false            # the default; every root is read-only until change 
 
 [audits]
 keep = 20                   # full audits kept per source set (the default)
+
+[selections]
+keep = 20                   # full selections kept per source set (the default)
 
 [auth]                      # how the Service knows it is you; see "Service"
 identity_header = "Remote-User"
@@ -230,14 +252,16 @@ one-row summary; the latest audit, and any audit cited as provenance, are never 
 ## Service
 
 ```sh
-title-select serve [--listen <address:port>] [--ui <dir>]
+title-select serve [--listen <address:port>] [--ui <dir>] [--retool <dir>]
 ```
 
-Runs the Service: the `/api/v1` JSON API, and the jobs that run audits. It listens on `--listen` or
+Runs the Service: the `/api/v1` JSON API, and the jobs that run audits and selections. It listens on `--listen` or
 `TITLE_SELECT_LISTEN`, by default `127.0.0.1:8080`, and holds the store, and its lock, until it stops on SIGTERM or
 Ctrl-C. While it runs, the store commands above fail with "the store is in use"; use the API, or the headless audit
 below, instead. This is the supported way to run Title Select on your server. With `--ui` or `TITLE_SELECT_UI` naming
-the workbench's built bundle, it also serves the workbench at `/`; see "Workbench".
+the workbench's built bundle, it also serves the workbench at `/`; see "Workbench". Selections and previews use the
+selection engine install named by `--retool` or `TITLE_SELECT_RETOOL`, else `/opt/retool`, as for `select`. Without
+one the Service still starts and runs audits, and refuses selections and previews, saying why.
 
 ### Auth
 
@@ -276,6 +300,18 @@ decompress ZIP members, and checksums them on `hashers` threads. The pace sets b
 
 `[jobs] readers` or `hashers` overrides the pace's count. A job records the counts it was queued with.
 
+A selection is a job too, of kind `selection`. It runs one version of a selection profile against the source set's
+DAT revision, chosen as for an audit, and records the selection in the transaction that ends the job. A source set
+may have one audit job and one selection job queued or running at once. Afterwards, selections beyond the newest
+`selections.keep` are pruned to their summary; the latest is never pruned.
+
+### Selection profiles
+
+A selection profile is named, and every save is a new version, numbered from 1, that is never changed or deleted.
+A version is stored as canonical JSON with its SHA-256, so saving a profile with nothing changed creates no version.
+A save names the version it started from, and is refused with `409` if a newer version was saved since. A save may
+queue a selection for one or more source sets with the new version.
+
 ### API
 
 Every body is JSON, and every error is `{"error": "...", "job": <id, when one is named>}`.
@@ -297,6 +333,22 @@ Every body is JSON, and every error is `{"error": "...", "job": <id, when one is
 | `GET /api/v1/audits/{id}/entries`                  | entries, paged; `?finding=`                                  |
 | `GET /api/v1/audits/{id}/entries.ndjson`           | every entry, one JSON object per line                        |
 | `GET /api/v1/audits/{id}/games`                    | game statuses, paged; `?status=`                             |
+| `GET /api/v1/vocabulary`                           | the regions, languages, video standards and categories       |
+| `POST /api/v1/check`                               | check a selection profile: `{"problems": [...]}`             |
+| `GET /api/v1/profiles`                             | the selection profiles, each with its newest version         |
+| `POST /api/v1/profiles`                            | create one with no versions: `{"name"}`                      |
+| `GET /api/v1/profiles/{name}`                      | one selection profile                                        |
+| `GET /api/v1/profiles/{name}/versions`             | its versions, newest first                                   |
+| `POST /api/v1/profiles/{name}/versions`            | save: `{"profile", "base_version"?, "queue"?}`; creates it   |
+| `GET /api/v1/profiles/{name}/versions/{version}`   | one version                                                  |
+| `POST /api/v1/preview`                             | the selection a profile would make: `{"source_set", "profile", "revision"?}`, with the changes from the latest saved selection |
+| `GET /api/v1/selections?source_set=`               | a source set's selections, newest first                      |
+| `POST /api/v1/selections`                          | queue a selection job: `{"source_set", "profile", "version"?, "revision"?}`; `202` |
+| `GET /api/v1/selections/{id}`                      | a selection's record and summary                             |
+| `GET /api/v1/selections/{id}/selection`            | the explained selection, as `select` prints it               |
+| `GET /api/v1/selections/{id}/releases`             | releases, paged, with availability; `?role=`, `?group=`      |
+| `GET /api/v1/selections/{id}/availability`         | game statuses of the latest audit against its DAT revision   |
+| `GET /api/v1/selections/{id}/diff`                 | what changed from the previous selection; `?against=`        |
 | `GET /api/v1/jobs`                                 | the latest 100 jobs, newest first                            |
 | `GET /api/v1/jobs/{id}`                            | one job                                                      |
 | `GET /api/v1/jobs/{id}/events`                     | server-sent events for one job, ending at its final state    |
@@ -376,7 +428,8 @@ The workbench is your browser interface to the Service: a Leptos app compiled to
 
 - **Source sets** lists each source set with its latest audit and the DAT revision it was last verified against, and
   registers another from a root, a path in it and a DAT. Opening a source set shows its facts, starts an audit against
-  the default DAT revision or a newer one, and lists its history, latest first, with a Re-audit for each row.
+  the default DAT revision or a newer one, makes a selection with a selection profile, lists its selections, and
+  lists its audit history, latest first, with a Re-audit for each row.
 - **DAT revisions** lists every DAT revision, newest import first within each DAT, with its provenance (provider,
   source URL, file, SHA-256, import time), whether its file is kept, and the audits that refer to it. It uploads a DAT
   file as a new DAT revision.
@@ -386,7 +439,19 @@ The workbench is your browser interface to the Service: a Leptos app compiled to
   one request from the bulk NDJSON endpoint, then filter by name, finding, state, game status and evidence algorithm,
   and sort by any column, in the browser as each key is typed. Selecting an entry shows its evidence and the ROMs it
   matches. A pruned audit shows only its summary.
-- **Jobs** lists the latest jobs with their state and progress, live: it follows `/api/v1/events`, applies `state`
+- **Selection profiles** lists your selection profiles. A new one starts as an unsaved draft with the defaults:
+  preview what it selects, change anything, and confirm to save version 1. The editor has a global settings tab and
+  a tab per system; each system setting says whether it comes from your global settings or is set for that system,
+  with "Use global setting" to go back. "Reset to defaults" and "Reset to default choices" work per group, per system
+  and for the whole profile. The preview follows your edits 500 ms after you stop, cancelling a preview still
+  running; when a preview of a source set takes more than 2 seconds, it waits for the Preview button instead. It
+  shows what changed from the latest saved selection. Saving creates the next version and can make a selection.
+- **Selection** explains every group: each release's role, the rule that decided it, its availability in the latest
+  audit against the same DAT revision, and flags for unresolved, stale, conflicting and drift. Its releases filter by
+  name, role, availability and flag as you type. Opening a group lets you check the releases you want, confirm an
+  unresolved pick, include an excluded release, or reset the group to the default choices; your choices are staged
+  until you save them as the next version of the profile, which makes a new selection.
+- **Jobs** lists the latest jobs with their kind, state, progress and result, live: it follows `/api/v1/events`, applies `state`
   and `progress` events by the job `version` rule above, and replaces what it holds with each `resync` snapshot,
   which also arrives after a reconnect.
 - **About**, linked from every screen's footer, says where selection comes from and shows the licence texts of Title
@@ -411,7 +476,7 @@ mkdir -p target/site/licences && cp LICENSE target/site/licences/title-select.tx
   && cp .retool/retool/LICENSE target/site/licences/retool.txt \
   && cp .retool/retool/clonelists-LICENSE target/site/licences/retool-clonelists-metadata.txt
 printf '[roots.sets]\npath = "/data/source-sets"\n\n[auth]\ndev_identity = "Developer"\n' > dev.toml
-target/release/title-select --store dev-store --config dev.toml serve --ui target/site
+target/release/title-select --store dev-store --config dev.toml serve --ui target/site --retool .retool
 ```
 
 Then open `http://127.0.0.1:8080/`.

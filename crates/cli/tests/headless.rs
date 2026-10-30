@@ -49,6 +49,7 @@ impl Env {
             listen: "127.0.0.1:0".parse().unwrap(),
             token_file: Some(fx.dat_dir.path().join("token")),
             ui: None,
+            retool: None,
             hold_jobs: false,
         })
         .unwrap();

@@ -798,3 +798,327 @@ fn failing_a_job_whose_audit_panicked_discards_its_running_audit_and_releases_it
         "nothing holds the revision any more"
     );
 }
+
+mod profiles_and_selections {
+    use super::*;
+    use std::collections::BTreeSet;
+    use title_select_api::selection::{
+        Alternative, ChoiceStatus, CoverageDrift, GroupChoice, Rule, Selection, SelectionGroup,
+        SelectionPins, SelectionProfile, SelectionSummary, Winner,
+    };
+    use title_select_api::{GameStatus, JobKind, JobState, StartSelectionFor};
+
+    const NAME: &str = "Mine";
+
+    fn save(
+        env: &Env,
+        profile: &SelectionProfile,
+        base: Option<u32>,
+    ) -> title_select_api::SavedProfile {
+        env.store
+            .save_profile(NAME, profile, base, "Operator", &[], WORKERS)
+            .unwrap()
+    }
+
+    fn rule(stage: &str) -> Rule {
+        Rule {
+            stage: stage.into(),
+            reference: Some("REF0001".into()),
+            message: "m".into(),
+        }
+    }
+
+    /// A Selection of revision 1 of the test DAT, as the engine and a choice might make it.
+    fn selection(sha256: &str) -> Selection {
+        Selection {
+            pins: SelectionPins::default(),
+            dat_sha256: sha256.into(),
+            system: "Test - System".into(),
+            system_settings: false,
+            summary: SelectionSummary {
+                groups: 2,
+                winners: 1,
+                alternatives: 1,
+                choices: 1,
+                ..SelectionSummary::default()
+            },
+            coverage_drift: CoverageDrift::default(),
+            groups: vec![
+                SelectionGroup {
+                    group: "combat".into(),
+                    unresolved: false,
+                    winners: vec![Winner {
+                        title: "Combat (USA)".into(),
+                        rule: rule("Parent selection"),
+                        unresolved: false,
+                    }],
+                    alternatives: vec![],
+                    exclusions: vec![],
+                    choice: None,
+                    drift: true,
+                },
+                SelectionGroup {
+                    group: "pong".into(),
+                    unresolved: false,
+                    winners: vec![],
+                    alternatives: vec![Alternative {
+                        title: "Pong (USA)".into(),
+                        clone_of: "pong".into(),
+                        rule: Rule::choice(),
+                    }],
+                    exclusions: vec![],
+                    choice: Some(GroupChoice {
+                        checked: BTreeSet::new(),
+                        status: ChoiceStatus::Applied,
+                        picks: vec!["Pong (USA)".into()],
+                        engine_unresolved: false,
+                        problems: vec![],
+                    }),
+                    drift: false,
+                },
+            ],
+            stale_choices: BTreeMap::from([(
+                "gone".to_owned(),
+                BTreeSet::from(["Gone (USA)".to_owned()]),
+            )]),
+        }
+    }
+
+    #[test]
+    fn profile_versions_are_immutable_and_a_save_with_nothing_changed_creates_none() {
+        let env = Env::new(20);
+        let mut profile = SelectionProfile::default();
+
+        let first = save(&env, &profile, None);
+        assert!(first.created);
+        assert_eq!(first.version.version, 1);
+        let again = save(&env, &profile, Some(1));
+        assert!(!again.created);
+        assert_eq!(again.version, first.version);
+
+        profile.region_order = vec!["USA".into()];
+        let second = save(&env, &profile, Some(1));
+        assert!(second.created);
+        assert_eq!(second.version.version, 2);
+        assert_ne!(second.version.sha256, first.version.sha256);
+        assert_eq!(second.version.profile, profile);
+
+        // An edit of version 1 made while version 2 was saved is refused, not applied over it.
+        profile.region_order = vec!["Europe".into()];
+        let stale = env
+            .store
+            .save_profile(NAME, &profile, Some(1), "Operator", &[], WORKERS);
+        assert!(matches!(stale, Err(Error::Conflict(_))), "{stale:?}");
+
+        let versions = env.store.profile_versions(NAME).unwrap();
+        assert_eq!(
+            versions.iter().map(|v| v.version).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert_eq!(versions[1], first.version);
+        let db = database(&env.store);
+        assert!(
+            db.execute("UPDATE profile_versions SET json = '{}'", [])
+                .is_err()
+        );
+        assert!(db.execute("DELETE FROM profile_versions", []).is_err());
+        assert_eq!(env.store.profile_versions(NAME).unwrap(), versions);
+    }
+
+    #[test]
+    fn a_selection_job_records_its_selection_whole_with_availability_from_an_audit_of_the_same_revision()
+     {
+        let env = Env::new(20);
+        env.add_dat_and_set();
+        write_file(&env.set_dir().join("Combat (USA).a26"), b"combat");
+        let (sha256, _) = env.import(1);
+        let saved = env
+            .store
+            .save_profile(
+                NAME,
+                &SelectionProfile::default(),
+                None,
+                "Operator",
+                &[StartSelectionFor {
+                    source_set: "Test - System".into(),
+                    revision: None,
+                }],
+                WORKERS,
+            )
+            .unwrap();
+        let queued = &saved.jobs[0];
+        assert_eq!(queued.kind, JobKind::Selection);
+        assert_eq!(queued.profile.as_ref().unwrap().version, 1);
+        // An Audit may be queued beside the Selection; a second Selection may not.
+        let audit_job = env
+            .store
+            .enqueue_audit("Test - System", None, "Operator", WORKERS)
+            .unwrap();
+        let second =
+            env.store
+                .enqueue_selection("Test - System", None, NAME, None, "Operator", WORKERS);
+        assert!(
+            matches!(second, Err(Error::JobActive { job, kind: JobKind::Selection, .. }) if job == queued.id),
+            "{second:?}"
+        );
+
+        let claimed = env.store.claim_job().unwrap().unwrap();
+        assert_eq!(claimed.id, queued.id);
+        let input = env.store.selection_input(claimed.id).unwrap();
+        assert_eq!(input.dat_revision.sha256, sha256);
+        assert!(input.dat.is_file());
+        let made = selection(&sha256);
+        let done = env
+            .store
+            .record_selection(&env.config, claimed.id, &made)
+            .unwrap();
+        assert_eq!(done.state, JobState::Succeeded);
+        let id = done.selection.unwrap();
+
+        assert_eq!(env.store.selection(id).unwrap(), made);
+        assert_eq!(env.store.selection_rows(id).unwrap(), made.rows());
+        let record = env.store.selection_record(id).unwrap();
+        assert_eq!(
+            (record.profile.version, record.latest_profile_version),
+            (1, 1)
+        );
+        let (rows, _) = env
+            .store
+            .selection_releases(id, None, 10, None, None)
+            .unwrap();
+        assert!(rows.iter().all(|r| r.availability.is_none()));
+        assert_eq!(env.store.selection_availability(id).unwrap().audit, None);
+
+        // Availability comes from the Audit against the same revision: the chosen Combat is there, and Pong,
+        // which the choice left out, is Missing.
+        env.store.claim_job().unwrap();
+        env.store
+            .run_audit_job(&env.config, audit_job.id, None)
+            .unwrap();
+        let (rows, _) = env
+            .store
+            .selection_releases(id, None, 10, None, None)
+            .unwrap();
+        let availability: Vec<_> = rows
+            .iter()
+            .map(|r| (r.release.title.as_str(), r.availability))
+            .collect();
+        assert_eq!(
+            availability,
+            [
+                ("Combat (USA)", Some(GameStatus::Complete)),
+                ("Pong (USA)", Some(GameStatus::Missing)),
+            ]
+        );
+        assert_eq!(
+            env.store
+                .latest_selection("Test - System", &sha256)
+                .unwrap(),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn selections_beyond_the_kept_number_are_pruned_and_no_longer_hold_their_dat_revision() {
+        let mut env = Env::new(20);
+        env.config.selections.keep = 1;
+        env.add_dat_and_set();
+        let (old, _) = env.import(1);
+        save(&env, &SelectionProfile::default(), None);
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let job = env
+                .store
+                .enqueue_selection("Test - System", Some(&old), NAME, None, "Operator", WORKERS)
+                .unwrap();
+            env.store.claim_job().unwrap();
+            let done = env
+                .store
+                .record_selection(&env.config, job.id, &selection(&old))
+                .unwrap();
+            ids.push(done.selection.unwrap());
+            // A newer revision would drop the old blob, were it not held.
+            env.import(2);
+            assert!(env.blob_present(&old));
+        }
+        assert!(env.store.selection_record(ids[0]).unwrap().pruned);
+        assert!(matches!(
+            env.store.selection(ids[0]),
+            Err(Error::Refused(_))
+        ));
+        assert!(!env.store.selection_record(ids[1]).unwrap().pruned);
+    }
+
+    /// Reading a Selection while a newer one prunes it gives the whole Selection or a refusal, never a Selection
+    /// with its groups or releases gone.
+    #[test]
+    fn a_selection_read_while_it_is_pruned_is_whole_or_refused() {
+        let mut env = Env::new(20);
+        env.config.selections.keep = 1;
+        env.add_dat_and_set();
+        let (sha256, _) = env.import(1);
+        save(&env, &SelectionProfile::default(), None);
+        let expected = selection(&sha256);
+        let make = || {
+            let job = env
+                .store
+                .enqueue_selection("Test - System", None, NAME, None, "Operator", WORKERS)
+                .unwrap();
+            env.store.claim_job().unwrap();
+            env.store
+                .record_selection(&env.config, job.id, &expected)
+                .unwrap()
+                .selection
+                .unwrap()
+        };
+        let mut id = make();
+        let mut whole = 0;
+        for _ in 0..50 {
+            let pruned = id;
+            std::thread::scope(|scope| {
+                let reader = scope.spawn(|| {
+                    let mut whole = 0;
+                    loop {
+                        match env.store.selection(pruned) {
+                            Ok(read) => {
+                                assert_eq!(read, expected, "selection {pruned}");
+                                whole += 1;
+                            }
+                            Err(Error::Refused(_)) => {}
+                            Err(err) => panic!("selection {pruned}: {err}"),
+                        }
+                        match env.store.selection_rows(pruned) {
+                            Ok(rows) => assert_eq!(rows.len(), 2, "selection {pruned}'s rows"),
+                            Err(Error::Refused(_)) => return whole,
+                            Err(err) => panic!("selection {pruned}'s rows: {err}"),
+                        }
+                    }
+                });
+                id = make();
+                whole += reader.join().unwrap();
+            });
+        }
+        assert!(
+            whole > 0,
+            "no read finished before its selection was pruned"
+        );
+    }
+
+    #[test]
+    fn a_restart_queues_a_running_selection_job_again_with_its_profile_version() {
+        let env = Env::new(20);
+        env.add_dat_and_set();
+        save(&env, &SelectionProfile::default(), None);
+        let job = env
+            .store
+            .enqueue_selection("Test - System", None, NAME, None, "Operator", WORKERS)
+            .unwrap();
+        env.store.claim_job().unwrap();
+
+        let (_tmp, store) = env.reopen();
+        let recovered = store.recover_jobs(WORKERS).unwrap();
+        let again = recovered[0].requeued.clone().unwrap();
+        assert_eq!(again.kind, JobKind::Selection);
+        assert_eq!(again.profile, job.profile);
+    }
+}

@@ -57,6 +57,7 @@ impl Env {
             listen: "127.0.0.1:0".parse().unwrap(),
             token_file: Some(self.tmp.path().join("token")),
             ui: None,
+            retool: None,
             hold_jobs: false,
         }
     }
@@ -640,4 +641,467 @@ fn the_service_holds_the_store_lock() {
     assert!(refused.is_err());
     drop(service);
     title_select_store::Store::open(&env.store()).unwrap();
+}
+
+/// Selection Profiles and Selections, run by the pinned selection engine (`tools/retool/setup` builds it).
+mod selections {
+    use super::*;
+    use serde_json::{Value, json};
+    use title_select_api::selection::{ChoiceStatus, Role, Selection};
+    use title_select_api::{
+        GameStatus, Preview, ProfileRecord, SavedProfile, SelectionDiff, SelectionRecord,
+        SelectionReleaseRow,
+    };
+
+    const PROFILE: &str = "/profiles/Everyday/versions";
+
+    /// The Test - System DAT with a Pong clone and a demo, as revision `version`; `pong_europe` leaves the clone
+    /// out.
+    fn dat(env: &Env, version: &str, pong_europe: bool) -> Vec<u8> {
+        let mut games = vec![
+            ("Pong (USA)", vec![rom("Pong (USA).a26", b"pong")]),
+            ("Combat (USA)", vec![rom("Combat (USA).a26", b"combat")]),
+            (
+                "Breakout (USA) (Demo)",
+                vec![rom("Breakout (USA) (Demo).a26", b"break")],
+            ),
+        ];
+        if pong_europe {
+            games.push(("Pong (Europe)", vec![rom("Pong (Europe).a26", b"pong-eu")]));
+        }
+        let path = write_dat_version(
+            &env.tmp.path().join("in"),
+            &format!("Test - System ({version}).dat"),
+            version,
+            &games,
+        );
+        std::fs::read(path).unwrap()
+    }
+
+    /// A Service with the DAT uploaded, the Source Set registered and audited.
+    fn ready(env: &Env) -> (Handle, Client) {
+        let service = env.start();
+        let client = Client::new(&service);
+        let (status, _) =
+            client.upload("Test - System (20260101).dat", &dat(env, "20260101", true));
+        assert_eq!(status, 201);
+        client.add_set();
+        let mut response = client.start_audit();
+        assert_eq!(response.status(), 202);
+        let job: Job = response.body_mut().read_json().unwrap();
+        assert_eq!(client.follow(job.id).1.state, JobState::Succeeded);
+        (service, client)
+    }
+
+    fn send(request: ureq::RequestBuilder<ureq::typestate::WithBody>, body: Value) -> (u16, Value) {
+        let mut response = request.send_json(body).unwrap();
+        let status = response.status().as_u16();
+        (status, response.body_mut().read_json().unwrap())
+    }
+
+    /// The Profile's newest version, if it has one.
+    fn latest(client: &Client) -> Option<u32> {
+        let response = client.get("/profiles/Everyday").call().unwrap();
+        if response.status() == 404 {
+            return None;
+        }
+        let record: ProfileRecord = response.into_body().read_json().unwrap();
+        record.latest.map(|v| v.version)
+    }
+
+    /// Saves `profile` as the next version, queueing a Selection, and returns the save and the Selection made.
+    fn save(client: &Client, profile: Value) -> (SavedProfile, SelectionRecord) {
+        save_on(client, profile, None)
+    }
+
+    /// Saves `profile`, queueing a Selection on the DAT Revision `revision`, by default the one last audited.
+    fn save_on(
+        client: &Client,
+        profile: Value,
+        revision: Option<&str>,
+    ) -> (SavedProfile, SelectionRecord) {
+        let (status, saved) = send(
+            client.post(PROFILE),
+            json!({
+                "profile": profile,
+                "base_version": latest(client),
+                "queue": [{"source_set": SET, "revision": revision}],
+            }),
+        );
+        assert!(status == 201 || status == 200, "{status}: {saved}");
+        let saved: SavedProfile = serde_json::from_value(saved).unwrap();
+        let (_, job) = client.follow(saved.jobs[0].id);
+        assert_eq!(job.state, JobState::Succeeded, "{job:?}");
+        let record = client.json(&format!("/selections/{}", job.selection.unwrap()));
+        (saved, record)
+    }
+
+    fn selection(client: &Client, id: i64) -> Selection {
+        client.json(&format!("/selections/{id}/selection"))
+    }
+
+    fn group<'a>(
+        selection: &'a Selection,
+        name: &str,
+    ) -> &'a title_select_api::selection::SelectionGroup {
+        selection.groups.iter().find(|g| g.group == name).unwrap()
+    }
+
+    fn winners(selection: &Selection, name: &str) -> Vec<String> {
+        group(selection, name)
+            .winners
+            .iter()
+            .map(|w| w.title.clone())
+            .collect()
+    }
+
+    /// A client that goes away mid-preview stops the engine run: its run folder under the store's `tmp` goes at
+    /// once instead of when the run would have finished.
+    #[test]
+    fn a_preview_whose_client_goes_away_stops_the_engine() {
+        use std::io::Write as _;
+        let env = Env::new();
+        let names: Vec<String> = (0..10_000)
+            .flat_map(|i| {
+                [
+                    format!("Game {i:05} (USA)"),
+                    format!("Game {i:05} (Europe)"),
+                ]
+            })
+            .collect();
+        let games: Vec<(&str, Vec<RomSpec>)> = names
+            .iter()
+            .map(|name| {
+                let file: &'static str = Box::leak(format!("{name}.a26").into_boxed_str());
+                (name.as_str(), vec![rom(file, name.as_bytes())])
+            })
+            .collect();
+        let path = write_dat_version(
+            &env.tmp.path().join("in"),
+            "Test - System (20260101).dat",
+            "20260101",
+            &games,
+        );
+        let service = env.start();
+        let client = Client::new(&service);
+        let (status, _) = client.upload(
+            "Test - System (20260101).dat",
+            &std::fs::read(path).unwrap(),
+        );
+        assert_eq!(status, 201);
+        client.add_set();
+        let job: Job = client.start_audit().body_mut().read_json().unwrap();
+        assert_eq!(client.follow(job.id).1.state, JobState::Succeeded);
+        let runs = || -> Vec<PathBuf> {
+            std::fs::read_dir(env.store().join("tmp"))
+                .into_iter()
+                .flatten()
+                .map(|e| e.unwrap().path())
+                .filter(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("selection-")
+                })
+                .collect()
+        };
+        let wait_for = |what: &str, done: &dyn Fn() -> bool, within: std::time::Duration| {
+            let started = std::time::Instant::now();
+            while !done() {
+                assert!(started.elapsed() < within, "{what} within {within:?}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        let body = json!({"source_set": SET, "profile": {}}).to_string();
+        let address = service.url().trim_start_matches("http://").to_owned();
+        let mut connection = std::net::TcpStream::connect(address).unwrap();
+        write!(
+            connection,
+            "POST /api/v1/preview HTTP/1.1\r\nhost: test\r\nauthorization: Bearer {TOKEN}\r\n\
+             content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        wait_for(
+            "the engine to start",
+            &|| !runs().is_empty(),
+            std::time::Duration::from_secs(60),
+        );
+        drop(connection);
+        wait_for(
+            "the engine to stop",
+            &|| runs().is_empty(),
+            std::time::Duration::from_secs(5),
+        );
+        let stopped = started.elapsed();
+
+        // Done before the run could have finished: a whole preview of this DAT takes several seconds.
+        let (_, whole) = send(
+            client.post("/preview"),
+            json!({"source_set": SET, "profile": {}}),
+        );
+        let elapsed = std::time::Duration::from_millis(whole["elapsed_ms"].as_u64().unwrap());
+        assert!(
+            stopped < elapsed,
+            "stopped after {stopped:?}, a whole run takes {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_first_run_previews_a_draft_and_saves_it_only_when_confirmed() {
+        let env = Env::new();
+        let (_service, client) = ready(&env);
+        let draft = json!({"region_order": ["USA", "Europe"]});
+
+        let (status, preview) = send(
+            client.post("/preview"),
+            json!({"source_set": SET, "profile": draft}),
+        );
+        assert_eq!(status, 200, "{preview}");
+        let preview: Preview = serde_json::from_value(preview).unwrap();
+        assert_eq!(winners(&preview.selection, "pong"), ["Pong (USA)"]);
+        assert_eq!(preview.against, None);
+        let profiles: Vec<ProfileRecord> = client.json("/profiles");
+        assert!(profiles.is_empty(), "a preview saves nothing");
+        assert!(
+            client
+                .json::<Vec<SelectionRecord>>("/selections?source_set=Test%20-%20System")
+                .is_empty()
+        );
+
+        let (saved, record) = save(&client, draft.clone());
+        assert!(saved.created);
+        assert_eq!(saved.version.version, 1);
+        assert_eq!(
+            (record.profile.name.as_str(), record.profile.version),
+            ("Everyday", 1)
+        );
+        assert_eq!(selection(&client, record.id), preview.selection);
+        let rows: Page<SelectionReleaseRow> =
+            client.json(&format!("/selections/{}/releases?role=winner", record.id));
+        let breakout = rows
+            .items
+            .iter()
+            .find(|r| r.release.group == "breakout")
+            .unwrap();
+        assert_eq!(
+            breakout.availability,
+            Some(GameStatus::Missing),
+            "a preferred release that is missing stays missing without a choice"
+        );
+
+        let (status, again) = send(
+            client.post(PROFILE),
+            json!({"profile": draft, "base_version": 1}),
+        );
+        assert_eq!(
+            status, 200,
+            "a save with nothing changed creates no version"
+        );
+        assert_eq!(again["created"], json!(false));
+        assert_eq!(again["version"]["version"], json!(1));
+    }
+
+    #[test]
+    fn a_selection_is_explained_joined_to_availability_and_reproduced_by_a_rerun() {
+        let env = Env::new();
+        let (_service, client) = ready(&env);
+        let (_, first) = save(
+            &client,
+            json!({"region_order": ["USA", "Europe"], "exclude": ["demos"]}),
+        );
+        assert!(!first.system_settings);
+
+        let rows: Page<SelectionReleaseRow> =
+            client.json(&format!("/selections/{}/releases", first.id));
+        let find = |title: &str| {
+            rows.items
+                .iter()
+                .find(|r| r.release.title == title)
+                .unwrap()
+        };
+        assert_eq!(find("Pong (USA)").release.role, Role::Winner);
+        assert_eq!(find("Pong (USA)").availability, Some(GameStatus::Complete));
+        assert_eq!(find("Pong (Europe)").release.role, Role::Alternative);
+        assert_eq!(
+            find("Pong (Europe)").availability,
+            Some(GameStatus::Missing)
+        );
+        let demo = find("Breakout (USA) (Demo)");
+        assert_eq!(demo.release.role, Role::Exclusion);
+        assert!(
+            !demo.release.rule.message.is_empty(),
+            "every release names its rule"
+        );
+        let excluded: Page<SelectionReleaseRow> =
+            client.json(&format!("/selections/{}/releases?role=exclusion", first.id));
+        assert_eq!(excluded.items.len(), 1);
+
+        let mut response = client
+            .post("/selections")
+            .send_json(json!({"source_set": SET, "profile": "Everyday", "version": 1}))
+            .unwrap();
+        assert_eq!(response.status(), 202);
+        let job: Job = response.body_mut().read_json().unwrap();
+        let (_, job) = client.follow(job.id);
+        let second = job.selection.unwrap();
+        assert_eq!(selection(&client, second), selection(&client, first.id));
+        let diff: SelectionDiff = client.json(&format!("/selections/{second}/diff"));
+        assert_eq!((diff.from, diff.changes.len()), (first.id, 0));
+    }
+
+    #[test]
+    fn a_choice_is_recorded_as_the_rule_and_flagged_as_the_profile_and_dat_change() {
+        let env = Env::new();
+        let (_service, client) = ready(&env);
+        let choice = json!({"Test - System": {"pong": ["Pong (Europe)"]}});
+
+        let (_, chosen) = save(
+            &client,
+            json!({"region_order": ["USA", "Europe"], "choices": choice}),
+        );
+        let made = selection(&client, chosen.id);
+        let pong = group(&made, "pong");
+        assert_eq!(winners(&made, "pong"), ["Pong (Europe)"]);
+        assert_eq!(pong.winners[0].rule.stage, "choice");
+        assert_eq!(pong.winners[0].rule.message, "your choice");
+        let choice_state = pong.choice.as_ref().unwrap();
+        assert_eq!(choice_state.status, ChoiceStatus::Applied);
+        assert_eq!(choice_state.picks, ["Pong (USA)"]);
+        assert_eq!(made.summary.choices, 1);
+
+        let (_, now_default) = save(
+            &client,
+            json!({"region_order": ["Europe", "USA"], "choices": choice}),
+        );
+        let made = selection(&client, now_default.id);
+        assert_eq!(
+            group(&made, "pong").choice.as_ref().unwrap().status,
+            ChoiceStatus::MatchesDefault
+        );
+
+        let (_, conflicting) = save(
+            &client,
+            json!({
+                "region_order": ["USA", "Europe"],
+                "exclude": ["demos"],
+                "choices": {"Test - System": {"breakout": ["Breakout (USA) (Demo)"]}},
+            }),
+        );
+        let made = selection(&client, conflicting.id);
+        let breakout = group(&made, "breakout");
+        assert_eq!(
+            breakout.choice.as_ref().unwrap().status,
+            ChoiceStatus::Conflicting
+        );
+        assert!(
+            breakout.winners.is_empty(),
+            "a conflicting choice is not applied"
+        );
+        assert_eq!(made.summary.conflicting, 1);
+
+        let (_, upload) = client.upload(
+            "Test - System (20260201).dat",
+            &dat(&env, "20260201", false),
+        );
+        assert_eq!(upload.dat_revision.version, "20260201");
+        let (_, stale) = save_on(
+            &client,
+            json!({"region_order": ["USA", "Europe"], "choices": choice}),
+            Some(&upload.dat_revision.sha256),
+        );
+        assert_eq!(stale.dat_revision_version, "20260201");
+        let made = selection(&client, stale.id);
+        let pong = group(&made, "pong");
+        assert_eq!(pong.choice.as_ref().unwrap().status, ChoiceStatus::Stale);
+        assert_eq!(winners(&made, "pong"), ["Pong (USA)"]);
+        assert_eq!(made.summary.stale, 1);
+        let availability: title_select_api::Availability =
+            client.json(&format!("/selections/{}/availability", stale.id));
+        assert_eq!(
+            availability.audit, None,
+            "no audit against the newer revision"
+        );
+    }
+
+    #[test]
+    fn system_settings_override_the_global_ones_until_removed() {
+        let env = Env::new();
+        let (_service, client) = ready(&env);
+        let (_, own) = save(
+            &client,
+            json!({
+                "region_order": ["USA", "Europe"],
+                "systems": {"Test - System": {"region_order": ["Europe", "USA"]}},
+            }),
+        );
+        assert!(own.system_settings);
+        assert_eq!(
+            winners(&selection(&client, own.id), "pong"),
+            ["Pong (Europe)"]
+        );
+
+        let (saved, global) = save(&client, json!({"region_order": ["USA", "Europe"]}));
+        assert_eq!(saved.version.version, 2);
+        assert!(!global.system_settings);
+        assert_eq!(
+            winners(&selection(&client, global.id), "pong"),
+            ["Pong (USA)"]
+        );
+        let diff: SelectionDiff = client.json(&format!("/selections/{}/diff", global.id));
+        assert!(
+            diff.changes
+                .iter()
+                .any(|c| c.title == "Pong (USA)" && c.after == Some(Role::Winner))
+        );
+    }
+
+    #[test]
+    fn a_save_from_an_older_version_and_an_unreadable_profile_are_refused() {
+        let env = Env::new();
+        let (_service, client) = ready(&env);
+        save(&client, json!({"region_order": ["USA"]}));
+        save(&client, json!({"region_order": ["Europe"]}));
+
+        let (status, body) = send(
+            client.post(PROFILE),
+            json!({"profile": {"region_order": ["Japan"]}, "base_version": 1}),
+        );
+        assert_eq!(status, 409, "{body}");
+        let (status, body) = send(
+            client.post(PROFILE),
+            json!({"profile": {"region_order": ["Atlantis"]}, "base_version": 2}),
+        );
+        assert_eq!(status, 400, "{body}");
+        let (status, check) = send(client.post("/check"), json!({"region_order": ["Atlantis"]}));
+        assert_eq!(status, 200);
+        assert!(
+            check["problems"][0].as_str().unwrap().contains("Atlantis"),
+            "{check}"
+        );
+        let vocabulary: title_select_api::Vocabulary = client.json("/vocabulary");
+        assert!(vocabulary.regions.iter().any(|r| r == "USA"));
+    }
+
+    #[test]
+    fn without_an_engine_selections_are_unavailable_and_audits_still_run() {
+        let env = Env::new();
+        let service = title_select_server::spawn(Settings {
+            retool: Some(env.tmp.path().join("no-engine")),
+            ..env.settings("")
+        })
+        .unwrap();
+        let client = Client::new(&service);
+        client.upload("Test - System (20260101).dat", &env.dat());
+        client.add_set();
+
+        let (status, body) = send(
+            client.post("/preview"),
+            json!({"source_set": SET, "profile": {}}),
+        );
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(client.start_audit().status(), 202);
+    }
 }

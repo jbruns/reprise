@@ -6,6 +6,8 @@ pub mod config;
 mod dats;
 mod jobs;
 mod migrations;
+mod profiles;
+mod selections;
 mod sets;
 
 use std::fs::{File, OpenOptions, TryLockError};
@@ -17,6 +19,7 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
 pub use audits::StoredAudit;
 pub use jobs::Interruption;
+pub use selections::SelectionInput;
 pub use title_select_api::{
     AuditSummary, DatRevisionRecord, ImportOutcome, Job, JobState, LastVerified, SourceSetRecord,
     Workers,
@@ -50,9 +53,16 @@ pub enum Error {
     /// What the request names does not exist.
     #[error("{0}")]
     NotFound(String),
-    /// A Source Set already has an Audit Job Queued or Running.
-    #[error("source set {source_set} already has an active audit: job {job}")]
-    JobActive { source_set: String, job: i64 },
+    /// The request was made against a state that has since changed, such as an edit of an older Profile version.
+    #[error("{0}")]
+    Conflict(String),
+    /// A Source Set already has a Job of this kind Queued or Running.
+    #[error("source set {source_set} already has an active {}: job {job}", .kind.as_str())]
+    JobActive {
+        source_set: String,
+        job: i64,
+        kind: title_select_api::JobKind,
+    },
     #[error(transparent)]
     Audit(#[from] title_select_engine::Error),
 }
@@ -270,6 +280,67 @@ mod tests {
     }
 
     const DAT: &str = "<datafile><header><name>Test</name><version>1</version></header></datafile>";
+
+    #[test]
+    fn the_selections_migration_keeps_existing_jobs_as_audits_and_one_active_job_of_each_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = &migrations::MIGRATIONS[..2];
+        let store = Store::open_with(dir.path(), before).unwrap();
+        // The rows a store at schema 2 holds, written as that schema's code wrote them.
+        store
+            .write(|tx| {
+                tx.execute_batch(
+                    "INSERT INTO dats (provider, name) VALUES ('Test', 'Test');
+                     INSERT INTO dat_revisions (dat_id, sha256, version, file_name, imported_at)
+                         SELECT id, 'abc', '1', 'Test.dat', 'then' FROM dats;
+                     INSERT INTO source_sets (name, root, path, dat_id, added_at)
+                         SELECT 'Set', 'sets', 'Set', id, 'then' FROM dats;
+                     INSERT INTO jobs (state, source_set_id, dat_revision_id, actor, readers, hashers, created_at)
+                         SELECT 'queued', s.id, r.id, 'Operator', 1, 1, 'then' FROM source_sets s, dat_revisions r;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(dir.path()).unwrap();
+
+        let jobs = store.jobs(10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind, title_select_api::JobKind::Audit);
+        assert_eq!((jobs[0].profile.clone(), jobs[0].selection), (None, None));
+        let insert = |kind: &str, profile: &str| {
+            store.write(|tx| {
+                tx.execute_batch(&format!(
+                    "INSERT INTO jobs (state, kind, profile_version_id, source_set_id, dat_revision_id, actor,
+                                       readers, hashers, created_at)
+                         SELECT 'queued', '{kind}', {profile}, source_set_id, dat_revision_id, 'Operator', 1, 1,
+                                'now' FROM jobs LIMIT 1;"
+                ))?;
+                Ok(())
+            })
+        };
+        assert!(insert("audit", "NULL").is_err(), "a second active audit");
+        assert!(
+            insert("selection", "NULL").is_err(),
+            "a selection with no profile version"
+        );
+        store
+            .save_profile(
+                "Mine",
+                &Default::default(),
+                None,
+                "Operator",
+                &[],
+                Workers {
+                    readers: 1,
+                    hashers: 1,
+                },
+            )
+            .unwrap();
+        insert("selection", "(SELECT id FROM profile_versions)").unwrap();
+        assert!(insert("selection", "(SELECT id FROM profile_versions)").is_err());
+    }
 
     #[test]
     fn a_store_from_a_newer_schema_is_refused() {

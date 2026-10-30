@@ -11,6 +11,7 @@ use super::{BACKUPS, Error, Result, io_error};
 pub(super) const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_initial.sql"),
     include_str!("migrations/0002_jobs.sql"),
+    include_str!("migrations/0003_selections.sql"),
 ];
 
 pub(super) fn migrate(conn: &mut Connection, dir: &Path, migrations: &[&str]) -> Result<()> {
