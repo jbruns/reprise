@@ -6,9 +6,40 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
 use title_select_api::{
-    ErrorBody, Finding, GameStatus, Job, JobEvent, JobProgress, JobState, PREFIX, Report,
+    ErrorBody, Finding, GameStatus, Health, Job, JobEvent, JobProgress, JobState, PREFIX, Report,
     SSE_KEEP_ALIVE, StartAudit,
 };
+
+/// Succeeds only when `url` answers 200 with `{"status": "ok"}` within `timeout`.
+pub fn health(url: &str, timeout: Duration) -> Result<(), String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .build()
+        .into();
+    let mut response = agent.get(url).call().map_err(|e| match e {
+        ureq::Error::Timeout(_) => format!(
+            "the Service at {url} did not answer within {} s",
+            timeout.as_secs()
+        ),
+        e => format!("cannot reach the Service at {url}: {e}"),
+    })?;
+    let status = response.status();
+    if status != ureq::http::StatusCode::OK {
+        return Err(format!("the Service at {url} answered {status}"));
+    }
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("cannot read the Service's answer at {url}: {e}"))?;
+    match serde_json::from_str::<Health>(&body) {
+        Ok(health) if health.status == "ok" => Ok(()),
+        _ => Err(format!(
+            "the Service at {url} is not healthy: {:?}",
+            body.trim()
+        )),
+    }
+}
 
 pub struct Request<'a> {
     pub server: &'a str,

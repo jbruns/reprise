@@ -272,6 +272,21 @@ docker run --read-only -p 8080:8080 -v title-select-store:/store \
 CI publishes `sha-<commit>` (the full commit SHA) for each push to `main`, and `<version>` and `<major>.<minor>` for
 each `v<version>` tag.
 
+### Health
+
+```sh
+title-select health [--url <url>] [--timeout <seconds>]
+```
+
+Checks a running Service, for a container healthcheck in an image with no shell or curl. `--url` defaults to
+`http://127.0.0.1:8080/api/v1/health` and `--timeout` to 5 seconds. Exits 0, printing nothing, when the Service
+answers 200 with `{"status": "ok"}`; otherwise exits 1 with one line on stderr saying why: the Service cannot be
+reached, did not answer in time, answered another status, or answered another body. In Compose:
+
+```yaml
+healthcheck: { test: ["CMD", "/title-select", "health"] }
+```
+
 ## Workbench
 
 The workbench is the Operator's browser interface to the Service (ADR 0005): a Leptos app compiled to WebAssembly that

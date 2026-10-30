@@ -133,3 +133,61 @@ fn the_headless_client_fails_on_a_wrong_token_an_unreachable_server_or_a_failed_
     assert!(stderr(&failed).contains("failed"), "{}", stderr(&failed));
     assert!(failed.stdout.is_empty());
 }
+
+fn health(url: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_title-select"))
+        .args(["health", "--timeout", "1", "--url", url])
+        .output()
+        .unwrap()
+}
+
+/// A server that answers its first request with `response`, then closes.
+fn answering(response: &'static str) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/api/v1/health", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = stream.read(&mut [0; 4096]);
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    url
+}
+
+#[test]
+fn health_exits_0_quietly_against_a_running_service() {
+    let env = Env::new();
+
+    let out = health(&format!("{}/api/v1/health", env.service.url()));
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(out.stdout.is_empty());
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn health_exits_1_with_a_reason_when_the_service_is_not_healthy() {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_url = format!("http://{}/api/v1/health", closed.local_addr().unwrap());
+    drop(closed);
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let silent_url = format!("http://{}/api/v1/health", silent.local_addr().unwrap());
+    let not_found = answering("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+    let wrong_body = answering(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\n\r\n{\"status\": \"failed\"}",
+    );
+
+    for (url, reason) in [
+        (&closed_url, "cannot reach"),
+        (&silent_url, "did not answer"),
+        (&not_found, "404"),
+        (&wrong_body, "failed"),
+    ] {
+        let out = health(url);
+        assert_eq!(out.status.code(), Some(1), "{url}: {}", stderr(&out));
+        assert!(out.stdout.is_empty());
+        let err = stderr(&out);
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(err.contains(reason), "{url}: {err}");
+    }
+}
