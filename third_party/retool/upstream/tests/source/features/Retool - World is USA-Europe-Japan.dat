@@ -1,0 +1,64 @@
+<?xml version="1.0"?>
+<!DOCTYPE datafile PUBLIC "-//Logiqx//DTD ROM Management Datafile//EN" "https://raw.githubusercontent.com/unexpectedpanda/retool/main/datafile.dtd">
+<datafile>
+	<header>
+		<name>Retool - World is USA-Europe-Japan</name>
+		<description>Retool - World is USA-Europe-Japan (2024-02-25)</description>
+		<version>2024-02-24 00-00-00</version>
+		<date>2024-02-24 00-00-00</date>
+		<author>unexpectedpanda</author>
+		<url>https://unexpectedpanda.github.io/retool</url>
+	</header>
+    <!-- Should choose USA -->
+    <game name="Test Title (USA)">
+		<category>Games</category>
+		<description>Test Title (USA)</description>
+		<rom name="Test Title (USA).cue" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+		<rom name="Test Title (USA).bin" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+	</game>
+    <game name="Test Title (World)">
+		<category>Games</category>
+		<description>Test Title (World)</description>
+		<rom name="Test Title (World).cue" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+		<rom name="Test Title (World).bin" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+	</game>
+    <!-- Should choose World due to demoteEdition tag -->
+    <game name="Test Title 2 (Jimakuban) (USA)">
+        <category>Games</category>
+        <description>Test Title 2 (Jimakuban) (USA)</description>
+        <rom name="Test Title 2 (Jimakuban) (USA).cue" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+        <rom name="Test Title 2 (Jimakuban) (USA).bin" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+    </game>
+    <game name="Test Title 2 (World)">
+        <category>Games</category>
+        <description>Test Title 2 (World)</description>
+        <rom name="Test Title 2 (World).cue" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+        <rom name="Test Title 2 (World).bin" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+    </game>
+    <!-- Should choose World due to demoteEdition tag -->
+    <game name="Test Title 3 (Jimakuban) (USA, Europe) (En,Fr,De,It,Es)">
+        <category>Games</category>
+        <description>Test Title 3 (Jimakuban) (USA, Europe) (En,Fr,De,It,Es)</description>
+        <rom name="Test Title 3 (Jimakuban) (USA, Europe) (En,Fr,De,It,Es).cue" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+        <rom name="Test Title 3 (Jimakuban) (USA, Europe) (En,Fr,De,It,Es).bin" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+    </game>
+    <game name="Test Title 3 (World)">
+        <category>Games</category>
+        <description>Test Title 3 (World)</description>
+        <rom name="Test Title 3 (World).cue" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+        <rom name="Test Title 3 (World).bin" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+    </game>
+    <!-- Should choose World due to supported language -->
+    <game name="Test Title 4 (USA, Europe) (Fr)">
+        <category>Games</category>
+        <description>Test Title 4 (USA, Europe) (Fr)</description>
+        <rom name="Test Title 4 (USA, Europe) (Fr).cue" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+        <rom name="Test Title 4 (USA, Europe) (Fr).bin" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+    </game>
+    <game name="Test Title 4 (World)">
+        <category>Games</category>
+        <description>Test Title 4 (World)</description>
+        <rom name="Test Title 4 (World).cue" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+        <rom name="Test Title 4 (World).bin" size="1000" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+    </game>
+</datafile>
