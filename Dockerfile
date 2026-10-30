@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-# The Service image: one static binary, the workbench's bundle and the patched Retool that Selection runs, on
-# distroless Python, run as the nonroot user. It needs no writable path but the store volume, so it runs with a
+# The Service image: one static binary, the workbench's bundle with the licence texts its About page shows, and the
+# patched Retool that Selection runs, on distroless Python, run as the nonroot user. It needs no writable path but the store volume, so it runs with a
 # read-only root filesystem.
 
 FROM rust:1.99.1-alpine@sha256:b1d5dd5a22a09404d3e798c0cf051b689077360374eb505fa5bb93c479693d87 AS build
@@ -32,7 +32,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo leptos build --release --precompress --cargo-locked \
     && cp target/release/title-select /title-select \
-    && cp -r target/site /ui
+    && cp -r target/site /ui \
+    && mkdir /ui/licences && cp LICENSE /ui/licences/title-select.txt
 RUN mkdir /store
 
 # Retool for Selection (ADR 0001): its runtime files, patched, with the pinned clone lists and a venv from the
@@ -55,6 +56,9 @@ COPY --from=build /title-select /title-select
 COPY --from=build /ui /ui
 COPY --from=build --chown=65532:65532 /store /store
 COPY --from=retool /opt/retool /opt/retool
+# The vendored Retool's licence and the fetched clone lists' licence, for the workbench's About page.
+COPY --from=retool /opt/retool/retool/LICENSE /ui/licences/retool.txt
+COPY --from=retool /opt/retool/retool/clonelists-LICENSE /ui/licences/retool-clonelists-metadata.txt
 ENV TITLE_SELECT_STORE=/store \
     TITLE_SELECT_LISTEN=0.0.0.0:8080 \
     TITLE_SELECT_UI=/ui \

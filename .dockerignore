@@ -6,6 +6,8 @@
 crates/*/tests/
 crates/ui/bench/
 !docs/brand-kit/title-select-tokens.css
+# Title Select's licence, for the workbench's About page.
+!LICENSE
 # Retool for Selection: only the files the image runs, which build.py checks against pins.toml's runtime_sha256.
 !third_party/retool/pins.toml
 !third_party/retool/requirements.txt

@@ -6,7 +6,7 @@ use leptos_router::path;
 use crate::events::{Stream, provide_live, use_live};
 #[cfg(feature = "bench")]
 use crate::screens::Bench;
-use crate::screens::{AuditScreen, DatRevisions, Jobs, SourceSet, SourceSets};
+use crate::screens::{About, AuditScreen, DatRevisions, Jobs, SourceSet, SourceSets};
 
 /// Without the `bench` feature, `/bench` is not a screen.
 #[cfg(not(feature = "bench"))]
@@ -25,8 +25,8 @@ pub fn App() -> impl IntoView {
                     "Title Select"
                 </a>
                 <nav aria-label="Workbench">
-                    <A href="/source-sets">"Source Sets"</A>
-                    <A href="/dat-revisions">"DAT Revisions"</A>
+                    <A href="/source-sets">"Source sets"</A>
+                    <A href="/dat-revisions">"DAT revisions"</A>
                     <A href="/jobs">"Jobs"</A>
                 </nav>
                 <StreamStatus />
@@ -39,9 +39,13 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/dat-revisions") view=DatRevisions />
                     <Route path=path!("/audits/:id") view=AuditScreen />
                     <Route path=path!("/jobs") view=Jobs />
+                    <Route path=path!("/about") view=About />
                     <Route path=path!("/bench") view=Bench />
                 </Routes>
             </main>
+            <footer class="footer">
+                <A href="/about">"About Title Select and its licences"</A>
+            </footer>
         </Router>
     }
 }
@@ -54,7 +58,7 @@ fn StreamStatus() -> impl IntoView {
         <p class="stream" aria-live="polite">
             <span class=move || format!("dot {}", live.stream.get().label().to_lowercase())></span>
             {move || match live.stream.get() {
-                Stream::Live => format!("Live · {} Jobs active", active()),
+                Stream::Live => format!("Live · {} jobs active", active()),
                 other => other.label().to_string(),
             }}
         </p>

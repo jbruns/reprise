@@ -150,6 +150,29 @@ fn a_registered_source_set_is_audited_into_the_store_and_listed_in_its_history()
 }
 
 #[test]
+fn version_prints_the_pinned_upstream_commits() {
+    let pins = include_str!("../../../third_party/retool/pins.toml");
+    let commits: Vec<&str> = pins
+        .lines()
+        .filter_map(|l| l.strip_prefix("commit = \""))
+        .map(|l| l.trim_end_matches('"'))
+        .collect();
+    assert_eq!(commits.len(), 2, "the selection and clone-list commits");
+
+    let out = title_select().arg("--version").output().unwrap();
+
+    assert!(out.status.success());
+    let version = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        version.starts_with(&format!("title-select {}\n", env!("CARGO_PKG_VERSION"))),
+        "{version}"
+    );
+    for commit in commits {
+        assert!(version.contains(commit), "{commit} in {version}");
+    }
+}
+
+#[test]
 fn a_stored_audit_without_a_store_fails_with_a_message() {
     let out = title_select()
         .env_remove("TITLE_SELECT_STORE")

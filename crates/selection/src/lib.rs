@@ -35,20 +35,20 @@ const STDERR_TAIL_LINES: usize = 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Retool install: {0} (build it with tools/retool/setup)")]
+    #[error("selection engine install: {0} (build it with tools/retool/setup)")]
     Install(String),
-    #[error("Selection Profile: {0}")]
+    #[error("selection profile: {0}")]
     Profile(String),
     #[error("{context}: {source}")]
     Io {
         context: String,
         source: std::io::Error,
     },
-    #[error("Retool failed ({status}):\n{output}")]
+    #[error("the selection engine failed ({status}):\n{output}")]
     Retool { status: String, output: String },
-    #[error("Retool did not finish within {} s", .0.as_secs())]
+    #[error("selection did not finish within {} s", .0.as_secs())]
     Timeout(Duration),
-    #[error("Retool's trace: {0}")]
+    #[error("the selection engine's trace: {0}")]
     Trace(String),
 }
 
@@ -258,7 +258,10 @@ impl Engine {
             .map_err(io(format!("starting {}", self.python().display())))?;
         let started = Instant::now();
         let status = loop {
-            if let Some(status) = child.try_wait().map_err(io("waiting for Retool"))? {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(io("waiting for the selection engine"))?
+            {
                 break status;
             }
             if started.elapsed() >= options.timeout {
@@ -302,17 +305,30 @@ impl Engine {
     }
 }
 
-/// The pins this binary was built with: those in `third_party/retool/pins.toml`.
-fn expected_pins() -> Result<SelectionPins, Error> {
+/// The upstream projects this binary's Selection is pinned to, from `third_party/retool/pins.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstream {
+    /// Retool's repository and the commit vendored in `third_party/retool/upstream`.
+    pub retool: Pinned,
+    /// The sha256 of the patches applied to it, as every Selection reports it.
+    pub patch_set_sha256: String,
+    /// The clone lists and metadata repository and the commit whose archive is fetched.
+    pub clone_lists: Pinned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct Pinned {
+    pub repository: String,
+    pub commit: String,
+}
+
+/// The upstream commits this binary was built with.
+pub fn upstream() -> Result<Upstream, Error> {
     #[derive(serde::Deserialize)]
     struct Pins {
-        retool: Commit,
+        retool: Pinned,
         patches: Vec<Patch>,
-        clone_lists: Commit,
-    }
-    #[derive(serde::Deserialize)]
-    struct Commit {
-        commit: String,
+        clone_lists: Pinned,
     }
     #[derive(serde::Deserialize)]
     struct Patch {
@@ -320,10 +336,20 @@ fn expected_pins() -> Result<SelectionPins, Error> {
     }
     let pins: Pins = toml::from_str(PINS).map_err(|e| Error::Install(format!("pins.toml: {e}")))?;
     let concatenated: String = pins.patches.iter().map(|p| p.sha256.as_str()).collect();
-    Ok(SelectionPins {
-        retool_commit: pins.retool.commit,
+    Ok(Upstream {
+        retool: pins.retool,
         patch_set_sha256: hex(&Sha256::digest(concatenated.as_bytes())),
-        clone_list_commit: pins.clone_lists.commit,
+        clone_lists: pins.clone_lists,
+    })
+}
+
+/// The pins this binary was built with: those in `third_party/retool/pins.toml`.
+fn expected_pins() -> Result<SelectionPins, Error> {
+    let upstream = upstream()?;
+    Ok(SelectionPins {
+        retool_commit: upstream.retool.commit,
+        patch_set_sha256: upstream.patch_set_sha256,
+        clone_list_commit: upstream.clone_lists.commit,
         trace_schema: SELECTION_TRACE_SCHEMA,
     })
 }

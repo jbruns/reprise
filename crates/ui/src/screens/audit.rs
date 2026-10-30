@@ -58,12 +58,12 @@ pub fn AuditScreen() -> impl IntoView {
         async move {
             match id {
                 Some(id) => api::get::<AuditSummary>(&format!("/audits/{id}")).await,
-                None => Err("That is not an Audit's number.".into()),
+                None => Err("That is not an audit number.".into()),
             }
         }
     });
     move || match summary.get() {
-        None => view! { <Loading what="the Audit" /> }.into_any(),
+        None => view! { <Loading what="the audit" /> }.into_any(),
         Some(Err(message)) => view! {
             <h1>"Audit"</h1>
             <Problem message />
@@ -99,11 +99,11 @@ fn AuditView(audit: AuditSummary) -> impl IntoView {
     view! {
         <h1>{format!("Audit #{id}")}</h1>
         <dl class="facts">
-            <dt>"Source Set"</dt>
+            <dt>"Source set"</dt>
             <dd>
                 <A href=set_href>{audit.source_set.clone()}</A>
             </dd>
-            <dt>"DAT Revision"</dt>
+            <dt>"DAT revision"</dt>
             <dd>
                 {audit.dat_revision_version.clone()} " "
                 <code class="hash">{audit.dat_revision_sha256.clone()}</code>
@@ -141,7 +141,7 @@ fn AuditView(audit: AuditSummary) -> impl IntoView {
                 </li>
                 <li class="count review">
                     <span class="n">{needs_review}</span>
-                    <span class="what">"Needs Review"</span>
+                    <span class="what">"Needs review"</span>
                 </li>
                 {Finding::ALL
                     .iter()
@@ -160,7 +160,7 @@ fn AuditView(audit: AuditSummary) -> impl IntoView {
                         view! {
                             <li class="count game">
                                 <span class="n">{games.get(s).copied().unwrap_or(0)}</span>
-                                <span class="what">{format!("{} Games", game_status_label(*s))}</span>
+                                <span class="what">{format!("{} games", game_status_label(*s))}</span>
                             </li>
                         }
                     })
@@ -170,21 +170,21 @@ fn AuditView(audit: AuditSummary) -> impl IntoView {
                 .then(|| {
                     view! {
                         <p class="note">
-                            "This Audit is pruned: only its summary is kept, so its Entries, Game Statuses and Verified count are gone."
+                            "This audit is pruned: only its summary is kept, so its entries, game statuses and verified count are gone."
                         </p>
                     }
                 })}
         </section>
 
         {move || match data.get() {
-            None => view! { <Loading what="the Entries" /> }.into_any(),
+            None => view! { <Loading what="the entries" /> }.into_any(),
             Some(None) => ().into_any(),
             Some(Some(Err(message))) => view! { <Problem message /> }.into_any(),
             Some(Some(Ok(loaded))) => {
                 view! {
                     <div class="tabs" role="tablist" aria-label="Audit details">
                         <TabButton tab which=Tab::Entries label="Entries" />
-                        <TabButton tab which=Tab::Games label="Game Statuses" />
+                        <TabButton tab which=Tab::Games label="Game statuses" />
                     </div>
                     <div
                         role="tabpanel"
@@ -311,12 +311,12 @@ pub fn queued(job: &Job) -> impl IntoView + use<> {
     view! {
         <p class="done" role="status">
             {format!(
-                "Job #{} is Queued to audit {} against DAT Revision {}. ",
+                "Job #{} is queued to audit {} against DAT revision {}. ",
                 job.id,
                 job.source_set,
                 short_sha(&job.dat_revision),
             )}
-            <A href="/jobs">"Follow it in Jobs"</A>
+            <A href="/jobs">"Follow it on the Jobs screen"</A>
         </p>
     }
 }
@@ -378,7 +378,7 @@ fn state_badge(state: Option<Derived>) -> AnyView {
             view! { <span class="state verified">"Verified"</span> }.into_any()
         }
         Some(Derived::NeedsReview) => {
-            view! { <span class="state review">"Needs Review"</span> }.into_any()
+            view! { <span class="state review">"Needs review"</span> }.into_any()
         }
         None => ().into_any(),
     }
@@ -402,7 +402,7 @@ impl Grid for EntryItem {
             EntryCol::Finding => "Finding",
             EntryCol::State => "State",
             EntryCol::Game => "Game",
-            EntryCol::GameStatus => "Game Status",
+            EntryCol::GameStatus => "Game status",
             EntryCol::Evidence => "Evidence",
             EntryCol::Reason => "Reason",
         }
@@ -505,11 +505,11 @@ pub fn EntriesPanel(entries: Arc<AuditEntries>) -> impl IntoView {
         <div class="panel" node_ref=panel>
             <form class="filters" on:submit=|ev| ev.prevent_default()>
                 <label>
-                    "Filter Entries"
+                    "Filter entries"
                     <input
                         type="search"
                         class="filter-text"
-                        placeholder="Entry or Game name"
+                        placeholder="Entry or game name"
                         autocomplete="off"
                         on:input=move |ev| {
                             let text = event_target_value(&ev);
@@ -546,11 +546,11 @@ pub fn EntriesPanel(entries: Arc<AuditEntries>) -> impl IntoView {
                     }>
                         <option value="">"Any"</option>
                         <option value="verified">"Verified"</option>
-                        <option value="needs-review">"Needs Review"</option>
+                        <option value="needs-review">"Needs review"</option>
                     </select>
                 </label>
                 <label>
-                    "Game Status"
+                    "Game status"
                     <select on:change=move |ev| {
                         let v = event_target_value(&ev);
                         refilter(
@@ -567,7 +567,7 @@ pub fn EntriesPanel(entries: Arc<AuditEntries>) -> impl IntoView {
                             .iter()
                             .map(|s| view! { <option value=s.as_str()>{game_status_label(*s)}</option> })
                             .collect_view()}
-                        <option value="none">"No Game"</option>
+                        <option value="none">"No game"</option>
                     </select>
                 </label>
                 <label>
@@ -587,7 +587,7 @@ pub fn EntriesPanel(entries: Arc<AuditEntries>) -> impl IntoView {
                 data-query=move || filter.with(|f| f.text.clone())
                 data-shown=move || shown.with(|s| s.len())
             >
-                {move || format!("{} of {total} Entries", shown.with(|s| s.len()))}
+                {move || format!("{} of {total} entries", shown.with(|s| s.len()))}
             </p>
             <DataTable
                 id="entries"
@@ -596,15 +596,15 @@ pub fn EntriesPanel(entries: Arc<AuditEntries>) -> impl IntoView {
                 sorting
                 selected
                 on_open=Callback::new(|_| focus("entry-detail"))
-                empty="No Entries match these filters.".to_string()
+                empty="No entries match these filters.".to_string()
             />
-            <section class="detail" id="entry-detail" tabindex="-1" aria-label="Selected Entry">
+            <section class="detail" id="entry-detail" tabindex="-1" aria-label="Selected entry">
                 {move || {
                     detail()
                         .unwrap_or_else(|| {
                             view! {
                                 <p class="note">
-                                    "Select an Entry with the arrow keys or a click to see its details."
+                                    "Select an entry with the arrow keys or a click to see its details."
                                 </p>
                             }
                                 .into_any()
@@ -719,7 +719,7 @@ impl Grid for GameItem {
     fn header(col: GameCol) -> &'static str {
         match col {
             GameCol::Name => "Game",
-            GameCol::Status => "Game Status",
+            GameCol::Status => "Game status",
             GameCol::Absent => "Absent ROMs",
         }
     }
@@ -793,7 +793,7 @@ fn GamesPanel(games: Arc<AuditGames>) -> impl IntoView {
         });
         Some(view! {
             <h3>{game.name.clone()}</h3>
-            <p>{format!("Game Status: {}", game_status_label(game.status))}</p>
+            <p>{format!("Game status: {}", game_status_label(game.status))}</p>
             {absent}
         })
     };
@@ -802,7 +802,7 @@ fn GamesPanel(games: Arc<AuditGames>) -> impl IntoView {
         <div class="panel">
             <form class="filters" on:submit=|ev| ev.prevent_default()>
                 <label>
-                    "Filter Game Statuses"
+                    "Filter game statuses"
                     <input
                         type="search"
                         placeholder="Game or absent ROM name"
@@ -815,7 +815,7 @@ fn GamesPanel(games: Arc<AuditGames>) -> impl IntoView {
                     />
                 </label>
                 <label>
-                    "Game Status"
+                    "Game status"
                     <select on:change=move |ev| {
                         let v = event_target_value(&ev);
                         filter.update(|f| f.status = GameStatus::parse(&v));
@@ -830,21 +830,21 @@ fn GamesPanel(games: Arc<AuditGames>) -> impl IntoView {
                 </label>
             </form>
             <p class="shown" aria-live="polite">
-                {move || format!("{} of {total} Game Statuses", shown.with(|s| s.len()))}
+                {move || format!("{} of {total} game statuses", shown.with(|s| s.len()))}
             </p>
             <DataTable
                 id="games"
-                label="Game Statuses".to_string()
+                label="Game statuses".to_string()
                 rows
                 sorting
                 selected
                 on_open=Callback::new(|_| focus("game-detail"))
-                empty="No Game Statuses match these filters.".to_string()
+                empty="No game statuses match these filters.".to_string()
             />
-            <section class="detail" id="game-detail" tabindex="-1" aria-label="Selected Game Status">
+            <section class="detail" id="game-detail" tabindex="-1" aria-label="Selected game status">
                 {move || match detail() {
                     Some(view) => view.into_any(),
-                    None => view! { <p class="note">"Select a Game to see its absent ROMs."</p> }.into_any(),
+                    None => view! { <p class="note">"Select a game to see its absent ROMs."</p> }.into_any(),
                 }}
             </section>
         </div>

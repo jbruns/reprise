@@ -43,7 +43,7 @@ impl Derived {
     pub fn label(self) -> &'static str {
         match self {
             Derived::Verified => "Verified",
-            Derived::NeedsReview => "Needs Review",
+            Derived::NeedsReview => "Needs review",
         }
     }
 }
@@ -431,6 +431,16 @@ pub fn when(timestamp: &str) -> String {
         }
         _ => timestamp.to_string(),
     }
+}
+
+/// Whether a response is a plain-text file. The Service answers a path it has no file for with the workbench's
+/// HTML page, so a missing licence text arrives as `200 text/html`.
+pub fn is_plain_text(content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|t| {
+        t.split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/plain"))
+    })
 }
 
 #[cfg(test)]
@@ -825,5 +835,13 @@ mod tests {
         assert_eq!(when("2026-10-29T15:04:05Z"), "2026-10-29 15:04:05 UTC");
         assert_eq!(when("yesterday"), "yesterday");
         assert_eq!(short_sha(&"ab".repeat(32)), "abababababab");
+    }
+
+    #[test]
+    fn a_licence_text_is_plain_text_and_the_workbench_page_is_not() {
+        assert!(is_plain_text(Some("text/plain; charset=utf-8")));
+        assert!(is_plain_text(Some("text/plain")));
+        assert!(!is_plain_text(Some("text/html")));
+        assert!(!is_plain_text(None));
     }
 }

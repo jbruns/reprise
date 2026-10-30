@@ -10,10 +10,10 @@ use title_select_api::{Job, JobState, Workers};
 use title_select_engine::Progress;
 
 /// Why a restart Interrupted a Job.
-const INTERRUPTED: &str = "the Service stopped while the Job was running";
+const INTERRUPTED: &str = "the Service stopped while the job was running";
 /// Why a restart Failed a Job that was already queued again once.
 const INTERRUPTED_AGAIN: &str =
-    "the Service stopped while the Job was running, after it had already been queued again once";
+    "the Service stopped while the job was running, after it had already been queued again once";
 
 /// What starting the Service did to a Job it found Running.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +45,7 @@ fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
         rusqlite::Error::FromSqlConversionFailure(
             1,
             rusqlite::types::Type::Text,
-            format!("unknown Job state {state}").into(),
+            format!("unknown job state {state}").into(),
         )
     })?;
     Ok(Job {
@@ -72,7 +72,7 @@ fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
 fn job_by_id(c: &Connection, id: i64) -> Result<Job> {
     c.query_row(&format!("{JOB_QUERY} WHERE j.id = ?1"), [id], job_from_row)
         .optional()?
-        .ok_or_else(|| Error::NotFound(format!("no Job {id}")))
+        .ok_or_else(|| Error::NotFound(format!("no job {id}")))
 }
 
 /// Moves the Running Job `id` to `to`, failing if it is not Running.
@@ -83,7 +83,7 @@ fn finish_running(tx: &Transaction, id: i64, to: JobState, error: Option<&str>) 
         params![id, to.as_str(), error, now()],
     )?;
     if updated != 1 {
-        return Err(Error::Io(format!("Job {id} is no longer running")));
+        return Err(Error::Io(format!("job {id} is no longer running")));
     }
     Ok(())
 }
@@ -118,7 +118,7 @@ impl Store {
     ) -> Result<Job> {
         if workers.readers == 0 || workers.hashers == 0 {
             return Err(Error::Refused(
-                "a Job needs at least one payload reader and one hash worker".into(),
+                "a job needs at least one payload reader and one hash worker".into(),
             ));
         }
         self.write(|tx| {
@@ -203,11 +203,11 @@ impl Store {
                 },
             )
             .optional()?
-            .ok_or_else(|| Error::NotFound(format!("no Job {id}")))
+            .ok_or_else(|| Error::NotFound(format!("no job {id}")))
         })?;
         let (row, state) = row;
         if state != JobState::Running.as_str() {
-            return Err(Error::Refused(format!("Job {id} is {state}, not running")));
+            return Err(Error::Refused(format!("job {id} is {state}, not running")));
         }
         let outcome = self
             .begin_job_audit(config, &row)

@@ -63,20 +63,20 @@ pub async fn run(store: Arc<Store>, config: Arc<Config>, jobs: Arc<Jobs>) {
                 continue;
             }
             Ok(Err(err)) => {
-                eprintln!("title-select: cannot claim a Job: {err}");
+                eprintln!("title-select: cannot claim a job: {err}");
                 drop(slot);
                 tokio::time::sleep(RETRY).await;
                 continue;
             }
             Err(err) => {
-                eprintln!("title-select: cannot claim a Job: {err}");
+                eprintln!("title-select: cannot claim a job: {err}");
                 drop(slot);
                 tokio::time::sleep(RETRY).await;
                 continue;
             }
         };
         eprintln!(
-            "title-select: Job {} started: Audit of {}",
+            "title-select: job {} started: audit of {}",
             job.id, job.source_set
         );
         jobs.changed(job.clone());
@@ -92,7 +92,7 @@ pub async fn run(store: Arc<Store>, config: Arc<Config>, jobs: Arc<Jobs>) {
                 Ok(job) => job,
                 Err(err) => {
                     let store = store.clone();
-                    let message = format!("the Audit stopped unexpectedly: {err}");
+                    let message = format!("the audit stopped unexpectedly: {err}");
                     tokio::task::spawn_blocking(move || store.fail_job(id, &message).ok())
                         .await
                         .ok()
@@ -100,7 +100,7 @@ pub async fn run(store: Arc<Store>, config: Arc<Config>, jobs: Arc<Jobs>) {
                 }
             };
             if let Some(job) = job {
-                eprintln!("title-select: Job {} {}", job.id, job.state.as_str());
+                eprintln!("title-select: job {} {}", job.id, job.state.as_str());
                 jobs.changed(job);
             }
             drop(slot);
@@ -128,7 +128,7 @@ fn run_one(store: &Store, config: &Config, jobs: &Jobs, id: i64, version: u64) -
     match store.run_audit_job(config, id, Some(&progress)) {
         Ok(job) => Some(job),
         Err(err) => {
-            eprintln!("title-select: Job {id}: {err}");
+            eprintln!("title-select: job {id}: {err}");
             match store.job(id) {
                 Ok(job) if job.state.is_final() => Some(job),
                 _ => store.fail_job(id, &err.to_string()).ok(),

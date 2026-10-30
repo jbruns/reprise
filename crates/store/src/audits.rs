@@ -110,7 +110,7 @@ pub(super) fn choose_revision(
         let prefix = prefix.to_ascii_lowercase();
         if prefix.is_empty() || !prefix.chars().all(|ch| ch.is_ascii_hexdigit()) {
             return Err(Error::Refused(format!(
-                "{prefix:?}: a DAT Revision is chosen by a prefix of its SHA-256"
+                "{prefix:?}: a DAT revision is chosen by a prefix of its SHA-256"
             )));
         }
         let mut stmt = c.prepare(&format!(
@@ -122,10 +122,10 @@ pub(super) fn choose_revision(
         return match found.len() {
             1 => Ok(found.remove(0)),
             0 => Err(Error::Refused(format!(
-                "no DAT Revision of {dat} has a SHA-256 starting {prefix}"
+                "no DAT revision of {dat} has a SHA-256 starting {prefix}"
             ))),
             _ => Err(Error::Refused(format!(
-                "{prefix} matches more than one DAT Revision of {dat}"
+                "{prefix} matches more than one DAT revision of {dat}"
             ))),
         };
     }
@@ -149,7 +149,7 @@ pub(super) fn choose_revision(
         revision_from_row,
     )
     .optional()?
-    .ok_or_else(|| Error::Refused(format!("no DAT Revision of {dat} has been imported")))
+    .ok_or_else(|| Error::Refused(format!("no DAT revision of {dat} has been imported")))
 }
 
 /// Finishes the running Audit `id`: its counts and times, its Entries and its Game Statuses.
@@ -183,7 +183,7 @@ fn finish_audit(tx: &Transaction, id: i64, report: &Report) -> Result<()> {
         params_from_iter(values),
     )?;
     if updated != 1 {
-        return Err(Error::Io(format!("Audit {id} is no longer running")));
+        return Err(Error::Io(format!("audit {id} is no longer running")));
     }
     // The Audit now holds its revision, so a restored blob needs no other hold.
     tx.execute(
@@ -320,11 +320,11 @@ fn read_report(c: &Connection, audit_id: i64) -> Result<Report> {
             },
         )
         .optional()?
-        .ok_or_else(|| Error::NotFound(format!("no finished Audit {audit_id}")))?;
+        .ok_or_else(|| Error::NotFound(format!("no finished audit {audit_id}")))?;
     let ((source_set, started_at, finished_at, pruned), dat_revision, (findings, games)) = head;
     if pruned {
         return Err(Error::Refused(format!(
-            "Audit {audit_id} was pruned; only its summary is kept"
+            "audit {audit_id} was pruned; only its summary is kept"
         )));
     }
     let mut stmt = c.prepare(&format!(
@@ -533,7 +533,7 @@ impl Store {
                 summary_from_row,
             )
             .optional()?
-            .ok_or_else(|| Error::NotFound(format!("no finished Audit {audit_id}")))
+            .ok_or_else(|| Error::NotFound(format!("no finished audit {audit_id}")))
         })
     }
 
@@ -680,9 +680,9 @@ fn check_full(c: &Connection, audit_id: i64) -> Result<()> {
         )
         .optional()?;
     match pruned {
-        None => Err(Error::NotFound(format!("no finished Audit {audit_id}"))),
+        None => Err(Error::NotFound(format!("no finished audit {audit_id}"))),
         Some(true) => Err(Error::Refused(format!(
-            "Audit {audit_id} was pruned; only its summary is kept"
+            "audit {audit_id} was pruned; only its summary is kept"
         ))),
         Some(false) => Ok(()),
     }
@@ -693,7 +693,7 @@ pub(super) fn check_blob_present(revision: &DatRevisionRecord) -> Result<()> {
         return Ok(());
     }
     Err(Error::Refused(format!(
-        "DAT Revision {} of {} is no longer kept; import its file ({}) again to restore it",
+        "DAT revision {} of {} is no longer kept; import its file ({}) again to restore it",
         revision.sha256,
         revision.dat(),
         revision.file

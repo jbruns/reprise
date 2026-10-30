@@ -51,7 +51,7 @@ pub enum Error {
     #[error("{0}")]
     NotFound(String),
     /// A Source Set already has an Audit Job Queued or Running.
-    #[error("Source Set {source_set} already has an active Audit: Job {job}")]
+    #[error("source set {source_set} already has an active audit: job {job}")]
     JobActive { source_set: String, job: i64 },
     #[error(transparent)]
     Audit(#[from] title_select_engine::Error),

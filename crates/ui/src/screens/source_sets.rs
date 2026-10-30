@@ -61,10 +61,10 @@ impl Grid for SetItem {
 
     fn header(col: SetCol) -> &'static str {
         match col {
-            SetCol::Name => "Source Set",
+            SetCol::Name => "Source set",
             SetCol::Dat => "DAT",
             SetCol::Location => "Root and path",
-            SetCol::Latest => "Latest Audit",
+            SetCol::Latest => "Latest audit",
             SetCol::LastVerified => "Last verified against",
         }
     }
@@ -144,23 +144,23 @@ pub fn SourceSets() -> impl IntoView {
     let go = navigator();
 
     view! {
-        <h1>"Source Sets"</h1>
+        <h1>"Source sets"</h1>
         <p class="lede">
-            "A Source Set is a folder in a Root, audited against its DAT. Open one to start an Audit or see its history."
+            "A source set is a folder in a root, audited against its DAT. Open one to start an audit or see its history."
         </p>
         {move || match sets.get() {
-            None => view! { <Loading what="the Source Sets" /> }.into_any(),
+            None => view! { <Loading what="the source sets" /> }.into_any(),
             Some(Err(message)) => view! { <Problem message /> }.into_any(),
             Some(Ok(_)) => ().into_any(),
         }}
         <DataTable
             id="source-sets"
-            label="Source Sets".to_string()
+            label="Source sets".to_string()
             rows
             sorting
             selected
             on_open=Callback::new(move |item: SetItem| go.run(set_href(&item.set.name)))
-            empty="No Source Sets yet. Register a folder in a Root below.".to_string()
+            empty="No source sets yet. Register a folder in a root below.".to_string()
         />
         <Register on_added=Callback::new(move |name: String| go.run(set_href(&name))) />
     }
@@ -213,7 +213,7 @@ fn Register(on_added: Callback<String>) -> impl IntoView {
 
     view! {
         <section aria-labelledby="register-title">
-            <h2 id="register-title">"Register a Source Set"</h2>
+            <h2 id="register-title">"Register a source set"</h2>
             <form class="form" on:submit=submit>
                 <label>
                     "Root"
@@ -233,7 +233,7 @@ fn Register(on_added: Callback<String>) -> impl IntoView {
                     </select>
                 </label>
                 <label>
-                    "Path in the Root"
+                    "Path in the root"
                     <input
                         type="text"
                         required
@@ -322,9 +322,9 @@ impl Grid for HistoryItem {
         match col {
             HistoryCol::Audit => "Audit",
             HistoryCol::Finished => "Finished",
-            HistoryCol::Revision => "DAT Revision",
+            HistoryCol::Revision => "DAT revision",
             HistoryCol::Findings => "Findings",
-            HistoryCol::Games => "Game Statuses",
+            HistoryCol::Games => "Game statuses",
             HistoryCol::Action => "Action",
         }
     }
@@ -357,13 +357,14 @@ impl Grid for HistoryItem {
             .into_any(),
             HistoryCol::Findings => {
                 let review = needs_review_from_counts(&audit.findings);
-                format!("{review} Needs Review · {}", findings_text(audit)).into_any()
+                let verb = if review == 1 { "needs" } else { "need" };
+                format!("{review} {verb} review · {}", findings_text(audit)).into_any()
             }
             HistoryCol::Games => games_text(audit).into_any(),
             HistoryCol::Action => {
                 let reaudit = self.reaudit;
                 let label = format!(
-                    "Re-audit against DAT Revision {}",
+                    "Re-audit against DAT revision {}",
                     audit.dat_revision_version
                 );
                 view! {
@@ -389,9 +390,9 @@ pub fn SourceSet() -> impl IntoView {
         }
     });
     move || match set.get() {
-        None => view! { <Loading what="the Source Set" /> }.into_any(),
+        None => view! { <Loading what="the source set" /> }.into_any(),
         Some(Err(message)) => view! {
-            <h1>"Source Set"</h1>
+            <h1>"Source set"</h1>
             <Problem message />
         }
         .into_any(),
@@ -480,7 +481,7 @@ fn SourceSetView(set: SourceSetRecord) -> impl IntoView {
             </dd>
             <dt>"Registered"</dt>
             <dd>{when(&set.added_at)}</dd>
-            <dt>"Latest Audit"</dt>
+            <dt>"Latest audit"</dt>
             <dd>
                 {move || {
                     let latest = history.get().and_then(Result::ok).and_then(|h| h.into_iter().next());
@@ -500,10 +501,10 @@ fn SourceSetView(set: SourceSetRecord) -> impl IntoView {
         </dl>
 
         <section aria-labelledby="start-title">
-            <h2 id="start-title">"Start an Audit"</h2>
+            <h2 id="start-title">"Start an audit"</h2>
             <form class="form" on:submit=start>
                 <label>
-                    "DAT Revision"
+                    "DAT revision"
                     <select prop:value=revision on:change=move |ev| revision.set(event_target_value(&ev))>
                         {move || {
                             let (default, newer) = choices.get();
@@ -527,7 +528,7 @@ fn SourceSetView(set: SourceSetRecord) -> impl IntoView {
                     </select>
                 </label>
                 <button type="submit" class="primary">
-                    "Start Audit"
+                    "Start audit"
                 </button>
             </form>
             {move || {
@@ -542,7 +543,7 @@ fn SourceSetView(set: SourceSetRecord) -> impl IntoView {
 
         <section aria-labelledby="history-title">
             <h2 id="history-title">"History"</h2>
-            <p class="lede">"Latest first. A pruned Audit keeps only its summary."</p>
+            <p class="lede">"Latest first. A pruned audit keeps only its summary."</p>
             {move || match history.get() {
                 None => view! { <Loading what="the history" /> }.into_any(),
                 Some(Err(message)) => view! { <Problem message /> }.into_any(),

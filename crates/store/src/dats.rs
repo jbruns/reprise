@@ -35,7 +35,7 @@ pub(super) fn revision_by_id(c: &Connection, id: i64) -> Result<(i64, DatRevisio
     );
     c.query_row(&sql, [id], revision_from_row)
         .optional()?
-        .ok_or_else(|| Error::NotFound(format!("no DAT Revision {id}")))
+        .ok_or_else(|| Error::NotFound(format!("no DAT revision {id}")))
 }
 
 fn revision_by_sha(c: &Connection, sha256: &str) -> Result<Option<(i64, DatRevisionRecord)>> {

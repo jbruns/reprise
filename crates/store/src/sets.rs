@@ -57,13 +57,13 @@ pub(super) fn set_by_name(c: &Connection, name: &str) -> Result<SourceSetRow> {
         set_from_row,
     )
     .optional()?
-    .ok_or_else(|| Error::NotFound(format!("no Source Set named {name}")))
+    .ok_or_else(|| Error::NotFound(format!("no source set named {name}")))
 }
 
 pub(super) fn set_by_id(c: &Connection, id: i64) -> Result<SourceSetRow> {
     c.query_row(&format!("{SET_QUERY} WHERE s.id = ?1"), [id], set_from_row)
         .optional()?
-        .ok_or_else(|| Error::NotFound(format!("no Source Set {id}")))
+        .ok_or_else(|| Error::NotFound(format!("no source set {id}")))
 }
 
 /// A Source Set's folder, checked to lie inside its Root.
@@ -82,11 +82,11 @@ pub(super) struct Resolved {
 pub(super) fn resolve(config: &Config, root: &str, rel: &str) -> Result<Resolved> {
     let root_config = config
         .root(root)
-        .ok_or_else(|| Error::Refused(format!("no Root named {root} is configured")))?;
+        .ok_or_else(|| Error::Refused(format!("no root named {root} is configured")))?;
     let rel_path = Path::new(rel);
     if rel_path.has_root() || rel_path.is_absolute() {
         return Err(Error::Refused(format!(
-            "{rel}: a Source Set's path must be relative to its Root"
+            "{rel}: a source set's path must be relative to its root"
         )));
     }
     let mut parts = Vec::new();
@@ -96,23 +96,23 @@ pub(super) fn resolve(config: &Config, root: &str, rel: &str) -> Result<Resolved
             Component::CurDir => {}
             Component::ParentDir => {
                 return Err(Error::Refused(format!(
-                    "{rel}: a Source Set's path must not contain `..`"
+                    "{rel}: a source set's path must not contain `..`"
                 )));
             }
             Component::RootDir | Component::Prefix(_) => {
                 return Err(Error::Refused(format!(
-                    "{rel}: a Source Set's path must be relative to its Root"
+                    "{rel}: a source set's path must be relative to its root"
                 )));
             }
         }
     }
     if parts.is_empty() {
         return Err(Error::Refused(
-            "a Source Set's path must name a folder inside its Root".into(),
+            "a source set's path must name a folder inside its root".into(),
         ));
     }
     let canonical_root = root_config.path.canonicalize().map_err(|e| {
-        Error::Refused(format!("Root {root} ({}): {e}", root_config.path.display()))
+        Error::Refused(format!("root {root} ({}): {e}", root_config.path.display()))
     })?;
     let configured = parts
         .iter()
@@ -122,7 +122,7 @@ pub(super) fn resolve(config: &Config, root: &str, rel: &str) -> Result<Resolved
         .map_err(|e| Error::Refused(format!("{}: {e}", configured.display())))?;
     if !canonical.starts_with(&canonical_root) {
         return Err(Error::Refused(format!(
-            "{rel}: resolves outside Root {root}"
+            "{rel}: resolves outside root {root}"
         )));
     }
     if !canonical.is_dir() {
@@ -168,7 +168,7 @@ impl Store {
                 .optional()?;
             if let Some(clash) = clash {
                 return Err(Error::Refused(format!(
-                    "a Source Set named {clash} already uses that name or folder"
+                    "a source set named {clash} already uses that name or folder"
                 )));
             }
             tx.execute(

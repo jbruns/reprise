@@ -50,7 +50,7 @@ impl Auth {
         let token_sha256 = token_file.map(read_token).transpose()?;
         if identity_header.is_none() && token_sha256.is_none() && config.dev_identity.is_none() {
             return Err(StartError::Auth(
-                "no way to authenticate the Operator: set [auth] identity_header and trusted_proxies, or \
+                "no way to authenticate requests: set [auth] identity_header and trusted_proxies, or \
                  TITLE_SELECT_OPERATOR_TOKEN_FILE, or [auth] dev_identity on a loopback address"
                     .into(),
             ));
@@ -83,7 +83,7 @@ impl Auth {
         }
         if let Some(presented) = headers.get(AUTHORIZATION) {
             let Some(expected) = &self.token_sha256 else {
-                return Err("the Operator token is not enabled");
+                return Err("the operator token is not enabled");
             };
             let token = presented
                 .to_str()
@@ -94,7 +94,7 @@ impl Auth {
             return if bool::from(presented.ct_eq(expected)) {
                 Ok(Actor(TOKEN_ACTOR.into()))
             } else {
-                Err("wrong Operator token")
+                Err("wrong operator token")
             };
         }
         match &self.dev_identity {
@@ -106,11 +106,11 @@ impl Auth {
 
 fn read_token(path: &Path) -> Result<[u8; 32], StartError> {
     let text = std::fs::read_to_string(path)
-        .map_err(|e| StartError::Auth(format!("Operator token file {}: {e}", path.display())))?;
+        .map_err(|e| StartError::Auth(format!("operator token file {}: {e}", path.display())))?;
     let token = text.trim();
     if token.is_empty() {
         return Err(StartError::Auth(format!(
-            "Operator token file {} is empty",
+            "operator token file {} is empty",
             path.display()
         )));
     }

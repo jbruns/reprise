@@ -63,6 +63,12 @@ jobs:
           curl -fsS localhost:8080/ | grep -q '/boot.js'
           curl -fsS -o /dev/null -H 'Accept-Encoding: br' localhost:8080/pkg/title-select.wasm
           curl -fsS localhost:8080/source-sets | grep -q '/boot.js'
+          # The About page's licence texts are served as plain text.
+          for licence in title-select retool retool-clonelists-metadata; do
+            curl -fsS -D - -o "$RUNNER_TEMP/$licence.txt" "localhost:8080/licences/$licence.txt" \
+              | grep -qi '^content-type: text/plain'
+            grep -q 'Copyright' "$RUNNER_TEMP/$licence.txt"
+          done
       # A Selection runs the image's Retool offline, writing only to the store's tmp.
       - name: select smoke test
         run: |
@@ -74,6 +80,7 @@ jobs:
             title-select:ci select --dat '/dats/Retool - Prefer regions.dat' --profile /run/profile.json \
             > "$RUNNER_TEMP/selection.json"
           jq -e '.summary.groups > 0 and (.pins.retool_commit | length == 40)' "$RUNNER_TEMP/selection.json"
+          docker run --rm title-select:ci --version | grep -q "$(grep -m1 '^commit = ' third_party/retool/pins.toml | cut -d'"' -f2)"
       - if: always()
         run: docker logs service
 
