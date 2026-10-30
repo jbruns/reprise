@@ -2,8 +2,9 @@
 
 Audits ROM collections against DAT files, and records exactly what was verified and against which DAT revision.
 
-Status: early pilot. A headless Audit command, a store of DAT Revisions, Source Sets and Audits, and the Service: a
-JSON API that runs Audits as durable Jobs. Selection, Change Plans and a UI follow.
+Status: early pilot. A headless Audit command, a store of DAT Revisions, Source Sets and Audits, the Service: a
+JSON API that runs Audits as durable Jobs, and a headless Selection command. Selection Jobs, Change Plans and more of
+the UI follow.
 Vocabulary is defined in [GLOSSARY.md](GLOSSARY.md), decisions in [docs/adr/](docs/adr/).
 
 ## Audit
@@ -72,11 +73,88 @@ writes a JSON report to stdout, or to `--output`. It only reads: the Source Set 
   CRC32, the lookup that found no matching ROM. An Unreadable Entry has no Evidence and a `reason` instead.
 - A Game is `complete`, `incomplete` or `missing`; `missing_roms` lists its ROMs no Entry's payload matched.
 
+## Selection
+
+```sh
+title-select select --dat <DAT file> --profile <Selection Profile file> [--output <file>] [--timeout <seconds>]
+```
+
+Chooses releases from a DAT with a Selection Profile and prints the explained Selection as JSON on stdout, or to
+`--output`. Selection runs a pinned, patched Retool (ADR 0001) as a subprocess: offline, with `--singlecpu`, in a
+scratch folder under `<store>/tmp` (or the system's temp folder without a store) that is deleted afterwards, and
+killed after `--timeout` seconds (600 by default). Retool's output DAT is never read: the Selection is derived from
+the JSON trace the patch adds. The Retool install is `--retool`, else `TITLE_SELECT_RETOOL`, else `/opt/retool`; an
+install built from other pins than this binary's is refused.
+
+The Selection Profile is JSON; every field is optional, and an unknown field, region, language or video standard is
+refused:
+
+```jsonc
+{
+  "region_order": ["USA", "World", "Europe"],  // a region left out is filtered out; empty: Retool's default order
+  "language_order": ["En"],                    // empty: the languages implied by the region order
+  "localization_order": [],                    // local names only: no effect on what is chosen
+  "video_order": [],                           // empty: Retool's default order
+  "exclude": ["demos", "bad_dumps"],           // add_ons, aftermarket, applications, audio, bad_dumps, bios,
+                                               // bonus_discs, coverdiscs, demos, educational, games, manuals, mia,
+                                               // multimedia, pirate, preproduction, promotional, unlicensed, video
+  "options": {
+    "prefer_retroachievements": false, "prefer_oldest": false, "prefer_regions": false,
+    "prefer_licensed": false, "prefer_modern_rips": false, "filter_languages": false,
+    "disable_1g1r": false,
+    "compilations": "default"                  // default, individual, keep or optimize
+  },
+  "overrides": { "exclude": ["/^Pong"], "include": ["|Pong (USA)"] },  // Retool's syntax: text, |full name, /regex
+  "post_filters": [],
+  "systems": {                                 // keyed by the system name Retool derives from the DAT header
+    "Atari - Atari 2600 (No-Intro)": { "region_order": ["Europe", "USA"], "replace_post_filters": false }
+  }
+}
+```
+
+A per-system order, `exclude` or `options` replaces the global one; its overrides are added to the global ones, and
+its post filters too unless `replace_post_filters` is set.
+
+```jsonc
+{
+  "pins": {                          // what the Selection was made with
+    "retool_commit": "59f169f5…", "patch_set_sha256": "…", "clone_list_commit": "cdeb391e…", "trace_schema": 1
+  },
+  "dat_sha256": "254e…",             // the DAT Revision
+  "system": "Atari - Atari 2600 (No-Intro)",
+  "system_settings": false,          // whether the Profile has settings for this system
+  "summary": { "groups": 601, "winners": 602, "alternatives": 270, "exclusions": 0, "unresolved": 2 },
+  "coverage_drift": {                // where the clone list and metadata no longer match the DAT
+    "clone_list": true, "metadata": true,
+    "unmatched_clone_list_terms": ["…"], "titles_without_metadata": ["…"]
+  },
+  "groups": [
+    {
+      "group": "parachute",
+      "unresolved": true,            // decided by a tie-breaker: the winner is provisional
+      "winners": [
+        { "title": "…", "unresolved": true,
+          "rule": { "stage": "Parent selection", "ref": "REF0059", "message": "…" } }
+      ],
+      "alternatives": [
+        { "title": "…", "clone_of": "…", "rule": { "stage": "…", "ref": "…", "message": "…" } }
+      ],
+      "exclusions": [ { "title": "…", "reason": "Demos, kiosks, and samples", "rule": { "…": "…" } } ]
+    }
+  ]
+}
+```
+
+- Each winner, alternative and exclusion carries the rule that decided it: the stage, Retool's trace reference and
+  its message. `ref` is absent when no trace record names the release, for example a release filtered out by region.
+- A group is `unresolved` when its deciding rule is Retool's fail-safe (choosing the highest string) or a compilation
+  tie-breaker. Retool's pick stays as the provisional winner.
+
 ## Store
 
-The store is one directory: a SQLite database (`title-select.sqlite`), the unmodified DAT files under
-`dats/<sha256>`, and `backups/` (ADR 0003). Pass it with `--store <dir>` or `TITLE_SELECT_STORE`; it is created on
-first use. Only one Title Select process may have a store open at a time: it holds an exclusive lock on
+The store is one directory: a SQLite database (`title-select.sqlite`), the unmodified DAT files under `dats/<sha256>`,
+`backups/` (ADR 0003), and `tmp/`, where Selections run. Pass it with `--store <dir>` or `TITLE_SELECT_STORE`; it is
+created on first use. Only one Title Select process may have a store open at a time: it holds an exclusive lock on
 `<store>/lock`, and another process fails at once with "the store is in use by another Title Select process".
 
 - The database runs in WAL mode. Every connection uses `synchronous=FULL`, `foreign_keys=ON` and a busy timeout.
@@ -257,10 +335,10 @@ the token is refused or the Service cannot be reached.
 
 ### Image
 
-`ghcr.io/jbruns/title-select` is a static binary and the workbench's bundle (at `/ui`) on
-`gcr.io/distroless/static:nonroot`, for linux/amd64. It runs `serve` on `0.0.0.0:8080` as the nonroot user, with the
-store at the volume `/store`, and serves the workbench at `/`. It needs nothing else writable, so it runs with a
-read-only root filesystem:
+`ghcr.io/jbruns/title-select` is a static binary, the workbench's bundle (at `/ui`) and the patched Retool with its
+pinned clone lists and venv (at `/opt/retool`) on `gcr.io/distroless/python3-debian12:nonroot`, for linux/amd64. It runs
+`serve` on `0.0.0.0:8080` as the nonroot user, with the store at the volume `/store`, and serves the workbench at `/`.
+It needs nothing else writable, so it runs with a read-only root filesystem:
 
 ```sh
 docker run --read-only -p 8080:8080 -v title-select-store:/store \
@@ -345,8 +423,39 @@ A Cargo workspace: `crates/api` (the API's and the report's types), `crates/engi
 (the store and configuration), `crates/server` (the Service), `crates/cli` (the `title-select` binary) and
 `crates/ui` (the workbench). The workbench's filtering, sorting, derived states and Job event handling are plain Rust,
 tested on the host with `cargo test`; `cargo clippy --package title-select-ui --target wasm32-unknown-unknown` checks
-it as the browser runs it.
+it as the browser runs it. `crates/selection` runs Retool and derives the Selection from its trace.
+
+### Retool
+
+`third_party/retool/` holds Retool for Selection (ADR 0001):
+
+- `upstream/`: the pristine Retool tree at a pinned commit, without its GUI, never edited in place. Its `tests/`
+  fixtures seed the conformance tests.
+- `patches/`: applied in order at build time. `0001-no-network` turns every download into an error, so a missing
+  clone-list or metadata folder or config file fails instead of being fetched; `0002-run-paths` adds `--clonelist-dir`,
+  `--metadata-dir`, `--mia-dir`, `--ra-dir` and `--system-config-dir`; `0003-trace-json` adds `--trace-json <path>`.
+- `pins.toml`: the Retool commit and the sha256 of its tree, each patch's sha256, and the clone-list and metadata
+  commit with the sha256 of its archive. `tools/retool/build.py` checks every one before it builds.
+- `requirements.in` and the hash-locked `requirements.txt`: Retool's runtime dependencies, without its GUI's.
+
+`tools/retool/setup [dir]` builds `.retool/` (gitignored), which the Selection tests use through
+`TITLE_SELECT_RETOOL` (cargo sets it): the patched Retool with the pinned clone lists, the pristine Retool for the
+patch-neutrality test, and a Python 3.11 venv made with [uv](https://docs.astral.sh/uv/). Run it after changing a pin
+or a patch; the tests fail, rather than skip, without it.
+
+- **Clone-list pin:** Renovate proposes upstream's newest `main` commit in `pins.toml`, and the `clone-list pin`
+  workflow writes the new archive's sha256 on its branch and runs CI. By hand: change `commit`, run
+  `python3 tools/retool/build.py pin-clone-lists`, then `tools/retool/setup` and the tests.
+- **Retool pin:** frozen; it changes only by hand. Vendor the new tree into `upstream/`, rework the patches, and copy
+  the hashes `python3 tools/retool/build.py hash-tree` prints into `pins.toml`.
+- **Goldens:** `crates/selection/tests/goldens/` holds each conformance case's Selection and trace (its records that
+  don't depend on set order). After a deliberate change to a patch, a pin or the derivation, regenerate them with
+  `TITLE_SELECT_REGENERATE_GOLDENS=1 cargo test -p title-select-selection --test conformance` and review the diff.
+- **A real DAT:** `TITLE_SELECT_ATARI_DAT=<DAT file> cargo test -p title-select-selection --test selection --
+  --ignored --nocapture` selects from it, checks every group has a rule and prints the counts. Never commit the DAT.
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The vendored Retool is BSD-3-Clause
+([third_party/retool/upstream/LICENSE](third_party/retool/upstream/LICENSE)); the image ships the clone lists and
+metadata with their BSD-3-Clause licence beside them.

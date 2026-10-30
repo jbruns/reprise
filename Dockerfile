@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
-# The Service image: one static binary and the workbench's bundle on distroless, run as the nonroot user. It needs no
-# writable path but the store volume, so it runs with a read-only root filesystem.
+# The Service image: one static binary, the workbench's bundle and the patched Retool that Selection runs, on
+# distroless Python, run as the nonroot user. It needs no writable path but the store volume, so it runs with a
+# read-only root filesystem.
 
 FROM rust:1.99.1-alpine@sha256:b1d5dd5a22a09404d3e798c0cf051b689077360374eb505fa5bb93c479693d87 AS build
 ARG TARGETARCH
@@ -34,13 +35,30 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp -r target/site /ui
 RUN mkdir /store
 
-FROM gcr.io/distroless/static:nonroot@sha256:18f4cc26c9ffa7f20a359298be7deadac5c607c8e03a02b8119f1a5fc2f82c99
+# Retool for Selection (ADR 0001): its runtime files, patched, with the pinned clone lists and a venv from the
+# hash-locked requirements. The builder's Python is Debian 12's, the same 3.11 the runtime image runs.
+FROM debian:12-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS retool
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY third_party/retool third_party/retool
+COPY tools/retool tools/retool
+RUN python3 -m venv /opt/retool/venv \
+    && /opt/retool/venv/bin/pip install --no-cache-dir --no-deps --only-binary :all: --require-hashes \
+      -r third_party/retool/requirements.txt \
+    && python3 tools/retool/build.py build --dest /opt/retool --runtime-only --no-pristine \
+    && rm -r /opt/retool/cache
+
+FROM gcr.io/distroless/python3-debian12:nonroot@sha256:7d1042ce588ab97019fe95c24ffca7bc5a82ccdac572511d5e09bda4435c89c5
 COPY --from=build /title-select /title-select
 COPY --from=build /ui /ui
 COPY --from=build --chown=65532:65532 /store /store
+COPY --from=retool /opt/retool /opt/retool
 ENV TITLE_SELECT_STORE=/store \
     TITLE_SELECT_LISTEN=0.0.0.0:8080 \
-    TITLE_SELECT_UI=/ui
+    TITLE_SELECT_UI=/ui \
+    TITLE_SELECT_RETOOL=/opt/retool
 VOLUME /store
 EXPOSE 8080
 USER nonroot:nonroot

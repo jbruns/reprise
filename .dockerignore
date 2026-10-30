@@ -6,3 +6,11 @@
 crates/*/tests/
 crates/ui/bench/
 !docs/brand-kit/title-select-tokens.css
+# Retool for Selection: only the files the image runs, which build.py checks against pins.toml's runtime_sha256.
+!third_party/retool/pins.toml
+!third_party/retool/requirements.txt
+!third_party/retool/patches/
+!third_party/retool/upstream/LICENSE
+!third_party/retool/upstream/retool.py
+!third_party/retool/upstream/modules/
+!tools/retool/build.py
