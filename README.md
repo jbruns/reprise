@@ -279,9 +279,10 @@ title-select health [--url <url>] [--timeout <seconds>]
 ```
 
 Checks a running Service, for a container healthcheck in an image with no shell or curl. `--url` defaults to
-`http://127.0.0.1:8080/api/v1/health` and `--timeout` to 5 seconds. Exits 0, printing nothing, when the Service
-answers 200 with `{"status": "ok"}`; otherwise exits 1 with one line on stderr saying why: the Service cannot be
-reached, did not answer in time, answered another status, or answered another body. In Compose:
+`http://127.0.0.1:8080/api/v1/health` and `--timeout` to 5 seconds (1 to 300). It follows no redirect and ignores
+proxy settings. Exits 0, printing nothing, when the Service answers 200 with `{"status": "ok"}`; otherwise exits 1
+with one line on stderr saying why: the Service cannot be reached, did not answer in time, answered another status, or
+answered another body. In Compose:
 
 ```yaml
 healthcheck: { test: ["CMD", "/title-select", "health"] }

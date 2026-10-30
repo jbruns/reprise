@@ -82,8 +82,8 @@ enum Command {
         /// The Service's health endpoint.
         #[arg(long, default_value = "http://127.0.0.1:8080/api/v1/health")]
         url: String,
-        /// Seconds to wait for the whole check.
-        #[arg(long, default_value_t = 5)]
+        /// Seconds to wait for the whole check, from 1 to 300.
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=300))]
         timeout: u64,
     },
 }
