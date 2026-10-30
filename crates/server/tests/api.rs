@@ -785,6 +785,18 @@ mod selections {
             ("Everyday", 1)
         );
         assert_eq!(selection(&client, record.id), preview.selection);
+        let rows: Page<SelectionReleaseRow> =
+            client.json(&format!("/selections/{}/releases?role=winner", record.id));
+        let breakout = rows
+            .items
+            .iter()
+            .find(|r| r.release.group == "breakout")
+            .unwrap();
+        assert_eq!(
+            breakout.availability,
+            Some(GameStatus::Missing),
+            "a preferred release that is missing stays missing without a choice"
+        );
 
         let (status, again) = send(
             client.post(PROFILE),
