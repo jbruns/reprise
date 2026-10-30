@@ -1,6 +1,7 @@
 //! The types of Title Select's versioned JSON API (`/api/v1`), shared by the Service, the headless client and the UI
 //! (ADR 0005). Every response body is one of these, or the `schema: 2` [`Report`].
 
+pub mod paths;
 pub mod report;
 pub mod selection;
 

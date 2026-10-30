@@ -1,0 +1,93 @@
+# The platform table: a DAT's provider and header name, and the front-end folder name its `{platform}` token gives.
+#
+# Folder names are ES-DE system names, as listed in ES-DE's `es_systems.xml` (MIT licence):
+#   https://gitlab.com/es-de/emulationstation-de/-/blob/master/resources/systems/linux/es_systems.xml
+# RomM recognises these names as folder names, either as its own platform slugs or as aliases:
+#   https://docs.romm.app/latest/platforms/supported-platforms/
+# Where ES-DE has several folders for one system (genesis and megadrive, segacd and megacd), the one RomM also uses as
+# its slug is chosen. Systems ES-DE has no folder for are left out, so their DATs have no `{platform}`.
+#
+# DAT names are header names without dump-format qualifiers such as "(Headered)" or "(Decrypted)", which a lookup
+# ignores. Each line is: provider, a tab, DAT name, a tab, folder name. Every provider and DAT name pair is unique.
+
+No-Intro	Atari - Atari 2600	atari2600
+No-Intro	Atari - Atari 5200	atari5200
+No-Intro	Atari - Atari 7800	atari7800
+No-Intro	Atari - Atari Jaguar	atarijaguar
+No-Intro	Atari - Atari Lynx	atarilynx
+No-Intro	Atari - Atari ST	atarist
+No-Intro	Bandai - WonderSwan	wonderswan
+No-Intro	Bandai - WonderSwan Color	wonderswancolor
+No-Intro	Bit Corporation - Gamate	gamate
+No-Intro	Casio - PV-1000	pv1000
+No-Intro	Coleco - ColecoVision	colecovision
+No-Intro	Commodore - Amiga	amiga
+No-Intro	Commodore - Commodore 64	c64
+No-Intro	Commodore - Plus-4	plus4
+No-Intro	Commodore - VIC-20	vic20
+No-Intro	Emerson - Arcadia 2001	arcadia
+No-Intro	Epoch - Super Cassette Vision	scv
+No-Intro	Fairchild - Channel F	channelf
+No-Intro	Funtech - Super Acan	supracan
+No-Intro	GCE - Vectrex	vectrex
+No-Intro	Hartung - Game Master	gmaster
+No-Intro	Magnavox - Odyssey 2	odyssey2
+No-Intro	Mattel - Intellivision	intellivision
+No-Intro	Microsoft - MSX	msx
+No-Intro	Microsoft - MSX2	msx2
+No-Intro	NEC - PC Engine - TurboGrafx-16	pcengine
+No-Intro	NEC - PC Engine SuperGrafx	supergrafx
+No-Intro	Nintendo - Family Computer Disk System	fds
+No-Intro	Nintendo - Game & Watch	gameandwatch
+No-Intro	Nintendo - Game Boy	gb
+No-Intro	Nintendo - Game Boy Advance	gba
+No-Intro	Nintendo - Game Boy Color	gbc
+No-Intro	Nintendo - New Nintendo 3DS	n3ds
+No-Intro	Nintendo - Nintendo 3DS	n3ds
+No-Intro	Nintendo - Nintendo 64	n64
+No-Intro	Nintendo - Nintendo 64DD	n64dd
+No-Intro	Nintendo - Nintendo DS	nds
+No-Intro	Nintendo - Nintendo DSi	nds
+No-Intro	Nintendo - Nintendo Entertainment System	nes
+No-Intro	Nintendo - Pokemon Mini	pokemini
+No-Intro	Nintendo - Satellaview	satellaview
+No-Intro	Nintendo - Sufami Turbo	sufami
+No-Intro	Nintendo - Super Nintendo Entertainment System	snes
+No-Intro	Nintendo - Virtual Boy	virtualboy
+No-Intro	Nokia - N-Gage	ngage
+No-Intro	Sega - 32X	sega32x
+No-Intro	Sega - Game Gear	gamegear
+No-Intro	Sega - Master System - Mark III	mastersystem
+No-Intro	Sega - Mega Drive - Genesis	genesis
+No-Intro	Sega - SG-1000	sg-1000
+No-Intro	SNK - NeoGeo Pocket	ngp
+No-Intro	SNK - NeoGeo Pocket Color	ngpc
+No-Intro	Tiger - Game.com	gamecom
+No-Intro	VTech - CreatiVision	crvision
+No-Intro	VTech - V.Smile	vsmile
+No-Intro	Watara - SuperVision	supervision
+No-Intro	Welback - Mega Duck	megaduck
+Redump	Apple - Macintosh	macintosh
+Redump	Atari - Jaguar CD Interactive Multimedia System	atarijaguarcd
+Redump	Commodore - Amiga CD32	amigacd32
+Redump	Fujitsu - FM-Towns	fmtowns
+Redump	Microsoft - Xbox	xbox
+Redump	Microsoft - Xbox 360	xbox360
+Redump	Microsoft - Xbox One	xboxone
+Redump	NEC - PC Engine CD & TurboGrafx CD	pcenginecd
+Redump	NEC - PC-98 series	pc98
+Redump	NEC - PC-FX & PC-FXGA	pcfx
+Redump	Nintendo - GameCube	gc
+Redump	Nintendo - Wii	wii
+Redump	Nintendo - Wii U	wiiu
+Redump	Panasonic - 3DO Interactive Multiplayer	3do
+Redump	Philips - CD-i	cdimono1
+Redump	Sega - Dreamcast	dreamcast
+Redump	Sega - Mega CD & Sega CD	segacd
+Redump	Sega - Saturn	saturn
+Redump	SNK - Neo Geo CD	neogeocd
+Redump	Sony - PlayStation	psx
+Redump	Sony - PlayStation 2	ps2
+Redump	Sony - PlayStation 3	ps3
+Redump	Sony - PlayStation 4	ps4
+Redump	Sony - PlayStation Portable	psp
