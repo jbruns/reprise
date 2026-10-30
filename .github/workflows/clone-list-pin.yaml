@@ -3,6 +3,9 @@ name: clone-list pin
 # Renovate moves the clone-list commit in third_party/retool/pins.toml but can't know the new archive's
 # sha256. This writes it on the Renovate branch, then runs CI on the result: a push made with the workflow's
 # token starts no workflows by itself.
+#
+# The job holds a write token, so it runs no code from the branch: the default branch's build.py hashes the
+# archive the branch's pins.toml names, and only the push and the CI dispatch see the token.
 
 on:
   push:
@@ -19,14 +22,30 @@ concurrency:
 jobs:
   pin:
     name: clone-list archive sha256
+    if: github.actor == 'renovate[bot]'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
       actions: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: python3 tools/retool/build.py pin-clone-lists
+      - name: check out the default branch's tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+      - name: check out the Renovate branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: branch
+          persist-credentials: false
+      - name: hash the archive
+        run: |
+          cp branch/third_party/retool/pins.toml trusted/third_party/retool/pins.toml
+          python3 trusted/tools/retool/build.py pin-clone-lists
+          cp trusted/third_party/retool/pins.toml branch/third_party/retool/pins.toml
       - name: commit and run CI
+        working-directory: branch
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ github.ref_name }}
@@ -38,5 +57,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git commit -am 'Pin the clone-list archive sha256'
-          git push origin "HEAD:$BRANCH"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" push origin "HEAD:$BRANCH"
           gh workflow run ci.yaml --ref "$BRANCH"
