@@ -174,6 +174,8 @@ mod tests {
             audit: (state == JobState::Succeeded).then_some(7),
             profile: None,
             selection: None,
+            managed_folder: None,
+            plan: None,
             error: None,
             workers: Workers {
                 readers: 1,

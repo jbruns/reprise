@@ -11,6 +11,7 @@ publish.workspace = true
 title-select-api.workspace = true
 title-select-engine.workspace = true
 jiff.workspace = true
+rustix.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

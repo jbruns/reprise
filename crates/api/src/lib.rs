@@ -1,6 +1,7 @@
 //! The types of Title Select's versioned JSON API (`/api/v1`), shared by the Service, the headless client and the UI
 //! (ADR 0005). Every response body is one of these, or the `schema: 2` [`Report`].
 
+pub mod build;
 pub mod paths;
 pub mod report;
 pub mod selection;
@@ -368,6 +369,8 @@ pub enum JobKind {
     #[default]
     Audit,
     Selection,
+    /// Carries out an approved Change Plan into a Managed Folder.
+    Build,
 }
 
 impl JobKind {
@@ -375,11 +378,12 @@ impl JobKind {
         match self {
             JobKind::Audit => "audit",
             JobKind::Selection => "selection",
+            JobKind::Build => "build",
         }
     }
 
     pub fn parse(s: &str) -> Option<JobKind> {
-        [JobKind::Audit, JobKind::Selection]
+        [JobKind::Audit, JobKind::Selection, JobKind::Build]
             .into_iter()
             .find(|k| k.as_str() == s)
     }
@@ -416,6 +420,12 @@ pub struct Job {
     /// The Selection a Succeeded Selection Job recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<i64>,
+    /// The Managed Folder a Build Job builds into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_folder: Option<i64>,
+    /// The approved plan a Build Job carries out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<i64>,
     /// Why a Job Failed or was Interrupted.
     pub error: Option<String>,
     pub workers: Workers,

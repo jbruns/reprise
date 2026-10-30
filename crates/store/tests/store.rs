@@ -496,10 +496,20 @@ fn the_store_uses_wal_mode() {
 }
 
 #[test]
-fn a_writable_root_is_refused_in_this_slice() {
-    let refused = Config::parse("[roots.sets]\npath = \"/sets\"\nwritable = true\n");
+fn a_source_set_in_a_writable_root_is_refused() {
+    let env = Env::new(20);
+    let config = Config::parse(&format!(
+        "[roots.sets]\npath = {:?}\nwritable = true\n",
+        env.root().display().to_string()
+    ))
+    .unwrap();
+    env.import(1);
 
-    assert!(refused.is_err());
+    let refused = env
+        .store
+        .add_source_set(&config, "sets", SET, "No-Intro/Test - System");
+
+    assert!(matches!(refused, Err(Error::Refused(_))), "{refused:?}");
 }
 
 fn database(store: &Store) -> rusqlite::Connection {

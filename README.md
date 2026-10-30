@@ -3,8 +3,9 @@
 Audits ROM collections against DAT files, and records exactly what was verified and against which DAT revision.
 
 Status: early pilot. You get a headless audit command; a store of DAT revisions, source sets and audits; the Service,
-a JSON API that runs audits as durable jobs; and a headless selection command. Selection jobs, change plans and more
-of the workbench follow.
+a JSON API that runs audits, selections and builds as durable jobs; and a headless selection command. A build writes a
+selection into a managed folder for your front end, as TorrentZips, once you approve its change plan. Removing and
+replacing built files follow.
 The words used here are defined in [GLOSSARY.md](GLOSSARY.md).
 
 ## Audit
@@ -195,7 +196,11 @@ read. Without it there are no roots, so Title Select reads none of your folders.
 ```toml
 [roots.sets]                # a root called `sets`
 path = "/data/source-sets"
-writable = false            # the default; every root is read-only until change plans exist
+writable = false            # the default
+
+[roots.play]                # a root for your front end's `roms/` folder
+path = "/data/roms"
+writable = true             # only managed folders may live in a writable root
 
 [audits]
 keep = 20                   # full audits kept per source set (the default)
@@ -229,8 +234,8 @@ Its tokens are:
 - `{platform}`: the front end's folder name for the system, such as `atari2600`.
 
 A source set's path is proposed from `path_templates.source_set`, by default `{provider}/{dat}`: the Atari 2600 DAT
-gives `No-Intro/Atari - Atari 2600`. `path_templates.managed_folder`, by default `{platform}`, will propose the folder
-a play library build writes to, in a root pointing at the front end's `roms/` folder: `atari2600`. You can change
+gives `No-Intro/Atari - Atari 2600`. `path_templates.managed_folder`, by default `{platform}`, proposes the managed folder
+a play library build writes to, in a writable root pointing at the front end's `roms/` folder: `atari2600`. You can change
 either default here, use another template when you register, or type the path yourself.
 
 The proposed path keeps every character of the provider and DAT name as it is. It must be relative to the root, not
@@ -343,6 +348,65 @@ A version is stored as canonical JSON with its SHA-256, so saving a profile with
 A save names the version it started from, and is refused with `409` if a newer version was saved since. A save may
 queue a selection for one or more source sets with the new version.
 
+### Managed folders and builds
+
+A managed folder is a folder in a writable root that Title Select builds selections into, for your front end to play
+from. It is bound to a source set and a selection profile, and so to a system; a system may have several, each with
+its own profile. A source set cannot be registered in a writable root, and nothing else is ever written to one.
+
+Registering a managed folder needs a folder that is empty or missing; registration creates it and writes a
+`.title-select` marker holding the store's id, the folder's id and its build generation. A plan refuses a folder whose
+marker is missing, names another store or folder, or has another generation, as after restoring a backup or mounting
+the wrong share.
+
+A plan lists, for each selected release, what a build would do, from the selection and the source set's latest audit
+against the selection's DAT revision:
+
+- **copy** a source that is already the game's TorrentZip, holding exactly its ROMs;
+- **repack** the game's ROMs into a new TorrentZip;
+- **unchanged**: the folder already holds the file, as built;
+- **no source**: no audited file holds every ROM;
+- **conflict**: a file the store did not build, or one changed since it was built, is at the target. It is never
+  overwritten;
+- **blocked**: the game's name is not a valid file name on every filesystem, two names differ only in case, or the
+  game is not in the DAT.
+
+Each ROM's source is ranked: matched before misnamed or conflicting, payload evidence before metadata, a copyable
+archive before another, then by path. No source, conflict and blocked items are skipped and shown. A plan cannot be
+approved while the source set has no audit against the selection's DAT revision, a group is unresolved and you have
+not confirmed a choice, the root is not writable, the folder or its marker is wrong, or a built file would be removed
+or replaced; removing and replacing built files need a later build step. It shows what changed since the current
+build, and whether your settings, your choices or the DAT revision caused it.
+
+A plan is stored with the SHA-256 of its content, its digest, and you approve it by sending that digest. The approval
+queues a job of kind `build`, which plans again and refuses, writing nothing, when the plan changed since you
+approved it, storing the new plan for you to review. Otherwise it writes each file into a staging folder inside the
+managed folder, re-hashes its ROMs against the DAT, checks the TorrentZip's structure, and renames it into place
+without replacing anything; a source that fails its re-hash fails only its own file. Files get your umask's
+permissions and the build's time as their modification time. The marker's generation goes up last, when the build
+succeeds. Every write goes through the managed folder as it was opened, never a symlink, and the build checks the
+marker again before each file and before the marker; if the marker changed, or the folder itself fails a write, the
+build fails and the marker stays where it was. Renaming without replacing needs a filesystem that supports it; when
+yours does not, the build fails rather than risk overwriting a file. A ROM name with a path separator, a `..`
+part, a drive or a device name such as `CON` is a blocked item.
+
+The staging folder is private to the server's user. Each file is renamed into place only while the staged file is
+still the one verified, and recorded only if the file then in place is that one; otherwise it is left and the build
+fails. The store records the next generation before the marker follows it, and a marker is never moved back.
+While a build is queued or running, its selection and audit are kept from being pruned.
+
+A build cut off by a stop or a failure is not run again. When the server starts, it cleans up after such a build only
+if the managed folder's root is still writable and the folder's marker is still this store's and matches what the
+store recorded. It removes only what the build recorded creating, by device and inode: the staging folder, the files
+in it, and a marker temporary file. It records each file already put in place whose content it re-hashes and finds
+as planned, and marks any other file at that target uncertain, leaving it as it is. A marker that did not follow the
+generation the store recorded is moved forward to it. Otherwise it changes nothing, and planning for that folder is
+blocked until you resolve it and restart the server; this includes a marker newer than the store, as after you
+restore the store from a backup. Anything else in the staging folder, or at the marker's temporary name, also blocks
+planning until you remove it.
+
+The current build of each managed folder keeps its selection and its audit from being pruned.
+
 ### API
 
 Every body is JSON, and every error is `{"error": "...", "job": <id, when one is named>}`.
@@ -381,6 +445,16 @@ Every body is JSON, and every error is `{"error": "...", "job": <id, when one is
 | `GET /api/v1/selections/{id}/releases`             | releases, paged, with availability; `?role=`, `?group=`      |
 | `GET /api/v1/selections/{id}/availability`         | game statuses of the latest audit against its DAT revision   |
 | `GET /api/v1/selections/{id}/diff`                 | what changed from the previous selection; `?against=`        |
+| `GET /api/v1/managed-folders`                      | the managed folders, each with its current build             |
+| `POST /api/v1/managed-folders`                     | register one: `{"root", "path"?, "template"?, "source_set", "profile"}`; `201` |
+| `GET /api/v1/managed-folders/{id}`                 | one managed folder                                           |
+| `PATCH /api/v1/managed-folders/{id}`               | rebind it: `{"source_set"?, "profile"?}`                     |
+| `GET /api/v1/managed-folders/{id}/builds`          | its builds, newest first                                     |
+| `GET /api/v1/managed-folders/{id}/files`           | the files built into it, with their provenance               |
+| `POST /api/v1/managed-folders/{id}/plans`          | plan building a selection into it: `{"selection"}`; `201`    |
+| `GET /api/v1/plans/{id}`                           | a plan, with its digest, summary and changes                 |
+| `POST /api/v1/plans/{id}/approval`                 | approve it: `{"digest"}`; `202` with the build job, `409` when the plan changed |
+| `GET /api/v1/builds/{id}`                          | a build and each file it wrote                               |
 | `GET /api/v1/jobs`                                 | the latest 100 jobs, newest first                            |
 | `GET /api/v1/jobs/{id}`                            | one job                                                      |
 | `GET /api/v1/jobs/{id}/events`                     | server-sent events for one job, ending at its final state    |
@@ -424,8 +498,8 @@ the token is refused or the Service cannot be reached.
 with its pinned clone lists and venv (at `/opt/retool`) on `gcr.io/distroless/python3-debian12:nonroot`, for
 linux/amd64. The licence texts the About page shows are at `/ui/licences`: Title Select's, the selection engine's and
 the clone lists and metadata's. It runs `serve` on `0.0.0.0:8080` as the nonroot user, with the store at the volume
-`/store`, and serves the workbench at `/`. It needs nothing else writable, so you can run it with a read-only root
-filesystem:
+`/store`, and serves the workbench at `/`. It needs nothing else writable but your writable roots, so you can run it
+with a read-only root filesystem:
 
 ```sh
 docker run --read-only -p 8080:8080 -v title-select-store:/store \
@@ -484,7 +558,13 @@ The workbench is your browser interface to the Service: a Leptos app compiled to
   audit against the same DAT revision, and flags for unresolved, stale, conflicting and drift. Its releases filter by
   name, role, availability and flag as you type. Opening a group lets you check the releases you want, confirm an
   unresolved pick, include an excluded release, or reset the group to the default choices; your choices are staged
-  until you save them as the next version of the profile, which makes a new selection.
+  until you save them as the next version of the profile, which makes a new selection. "Plan a build" plans building
+  it into a managed folder bound to its source set and selection profile.
+- **Managed folders** lists each managed folder with its current build, and registers another in a writable root,
+  with the path proposed from the source set's DAT as for a source set. Opening one plans a build of a selection,
+  shows the plan's files by what they do, what blocks it and what changed, approves it and follows the build live. It
+  rebinds the folder, and lists its builds and the files built into it. Each build shows every file it wrote or
+  failed to write.
 - **Jobs** lists the latest jobs with their kind, state, progress and result, live: it follows `/api/v1/events`, applies `state`
   and `progress` events by the job `version` rule above, and replaces what it holds with each `resync` snapshot,
   which also arrives after a reconnect.

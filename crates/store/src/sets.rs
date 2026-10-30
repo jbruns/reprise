@@ -158,6 +158,12 @@ impl Store {
         rel: &str,
         dat: &str,
     ) -> Result<SourceSetRecord> {
+        if config.root(root).is_some_and(|r| r.writable) {
+            return Err(Error::Refused(format!(
+                "root {root} is writable, and only managed folders go in a writable root; add the source set from a \
+                 read-only root"
+            )));
+        }
         let rel = resolve(config, root, rel)?.rel;
         let name = rel.rsplit('/').next().unwrap_or(&rel).to_owned();
         let (provider, dat_name) = split_dat(dat)?;

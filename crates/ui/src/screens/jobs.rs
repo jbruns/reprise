@@ -31,7 +31,7 @@ pub enum JobCol {
 #[derive(Clone, PartialEq)]
 struct JobItem(LiveJob);
 
-fn progress_view(live: &LiveJob) -> AnyView {
+pub(crate) fn progress_view(live: &LiveJob) -> AnyView {
     match (live.job.state, live.progress) {
         (JobState::Running, Some(p)) => view! {
             <span class="progress">
@@ -45,7 +45,7 @@ fn progress_view(live: &LiveJob) -> AnyView {
     }
 }
 
-fn state_view(state: JobState) -> AnyView {
+pub(crate) fn state_view(state: JobState) -> AnyView {
     view! { <span class=format!("job-state job-{}", state.as_str())>{state_label(state)}</span> }
         .into_any()
 }
@@ -130,11 +130,18 @@ fn kind_label(kind: JobKind) -> &'static str {
     match kind {
         JobKind::Audit => "Audit",
         JobKind::Selection => "Selection",
+        JobKind::Build => "Build",
     }
 }
 
-/// A link to the Audit or Selection a Job recorded.
+/// A link to the Audit or Selection a Job recorded, or the Managed Folder a Build Job built into.
 fn result_link(job: &Job) -> AnyView {
+    if let Some(folder) = job.managed_folder {
+        return view! {
+            <A href=format!("/managed-folders/{folder}")>{format!("Managed folder #{folder}")}</A>
+        }
+        .into_any();
+    }
     match (job.audit, job.selection) {
         (Some(audit), _) => {
             view! { <A href=format!("/audits/{audit}")>{format!("Audit #{audit}")}</A> }.into_any()
@@ -191,7 +198,7 @@ pub fn Jobs() -> impl IntoView {
         <p class="lede">
             {move || match live.stream.get() {
                 Stream::Live => "Live: state and progress arrive as they happen.".to_string(),
-                Stream::Connecting => "Connecting to the Service's events…".to_string(),
+                Stream::Connecting => "Connecting to the service's events…".to_string(),
                 Stream::Reconnecting => {
                     "The event stream dropped; reconnecting. What is shown may be out of date.".to_string()
                 }

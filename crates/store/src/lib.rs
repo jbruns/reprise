@@ -2,10 +2,14 @@
 
 mod audits;
 mod blobs;
+mod builds;
 pub mod config;
 mod dats;
+mod folder_dir;
+mod folders;
 mod jobs;
 mod migrations;
+mod plans;
 mod profiles;
 mod selections;
 mod sets;
@@ -85,6 +89,25 @@ pub struct Store {
     readers: Mutex<Vec<Connection>>,
     /// Holds the exclusive lock on `lock` until the store is dropped.
     _lock: File,
+    fault: Mutex<Option<FaultHook>>,
+}
+
+/// What a test runs at each [`Fault`] point.
+#[doc(hidden)]
+pub type FaultHook = std::sync::Arc<dyn Fn(Fault) + Send + Sync>;
+
+/// A point at which a Build stops as if the service were killed there, for tests of its recovery.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// After the publish intent of the item with this sequence number is committed, before its file is renamed.
+    BeforePublish(i64),
+    /// After the file of the item with this sequence number is renamed into place, before the store records it.
+    AfterPublish(i64),
+    /// After the store commits the folder's next generation, before the marker advances to it.
+    AfterFinalize,
+    /// After the marker advances, before the store records the Build finished.
+    AfterMarker,
 }
 
 /// Takes the store directory's exclusive lock, failing at once if another process holds it.
@@ -139,12 +162,38 @@ impl Store {
             writer: Mutex::new(writer),
             readers: Mutex::new(Vec::new()),
             _lock: lock,
+            fault: Mutex::new(None),
         };
         // Retention is not run here: it runs after an import or an Audit, so a blob restored by one command is
         // still there for the Audit the next command runs.
         store.discard_unfinished_audits()?;
         store.collect_garbage()?;
         Ok(store)
+    }
+
+    #[doc(hidden)]
+    pub fn inject_fault(&self, fault: Option<Fault>) {
+        self.hook_faults(fault.map(|fault| {
+            std::sync::Arc::new(move |at: Fault| {
+                if at == fault {
+                    panic!("injected fault: {fault:?}");
+                }
+            }) as FaultHook
+        }));
+    }
+
+    /// Runs `hook` at every [`Fault`] point.
+    #[doc(hidden)]
+    pub fn hook_faults(&self, hook: Option<FaultHook>) {
+        *self.fault.lock().unwrap() = hook;
+    }
+
+    /// Runs the hook a test set, which may stop the thread here as a kill would.
+    fn fault_point(&self, fault: Fault) {
+        let hook = self.fault.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(fault);
+        }
     }
 
     pub fn dir(&self) -> &Path {
@@ -340,6 +389,61 @@ mod tests {
             .unwrap();
         insert("selection", "(SELECT id FROM profile_versions)").unwrap();
         assert!(insert("selection", "(SELECT id FROM profile_versions)").is_err());
+    }
+
+    #[test]
+    fn the_builds_migration_rebuilds_jobs_keeping_their_references_and_gives_the_store_an_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_with(dir.path(), &migrations::MIGRATIONS[..3]).unwrap();
+        // A Selection Job and the Selection that refers back to it, as schema 3's code wrote them.
+        store
+            .write(|tx| {
+                tx.execute_batch(
+                    "INSERT INTO dats (provider, name) VALUES ('Test', 'Test');
+                     INSERT INTO dat_revisions (dat_id, sha256, version, file_name, imported_at)
+                         SELECT id, 'abc', '1', 'Test.dat', 'then' FROM dats;
+                     INSERT INTO source_sets (name, root, path, dat_id, added_at)
+                         SELECT 'Set', 'sets', 'Set', id, 'then' FROM dats;
+                     INSERT INTO profiles (name, created_at) VALUES ('Mine', 'then');
+                     INSERT INTO profile_versions (profile_id, version, json, sha256, saved_at, saved_by)
+                         SELECT id, 1, '{}', 'def', 'then', 'Operator' FROM profiles;
+                     INSERT INTO jobs (state, kind, profile_version_id, source_set_id, dat_revision_id, actor,
+                                       readers, hashers, created_at)
+                         SELECT 'succeeded', 'selection', v.id, s.id, r.id, 'Operator', 1, 1, 'then'
+                         FROM profile_versions v, source_sets s, dat_revisions r;
+                     INSERT INTO selections (source_set_id, dat_revision_id, profile_version_id, job_id, system,
+                                             system_settings, pins, summary, coverage_drift, stale_choices,
+                                             created_at)
+                         SELECT source_set_id, dat_revision_id, profile_version_id, id, 'Test', 0, '{}', '{}',
+                                '{}', '{}', 'then' FROM jobs;
+                     UPDATE jobs SET selection_id = (SELECT id FROM selections);",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(dir.path()).unwrap();
+
+        let jobs = store.jobs(10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind, title_select_api::JobKind::Selection);
+        assert_eq!(jobs[0].selection, Some(1));
+        assert_eq!((jobs[0].managed_folder, jobs[0].plan), (None, None));
+        let id = store.read(folders::store_id).unwrap();
+        assert_eq!(id.len(), 32);
+        let build_without_a_folder = store.write(|tx| {
+            tx.execute_batch(
+                "INSERT INTO jobs (state, kind, source_set_id, dat_revision_id, actor, readers, hashers,
+                                   created_at)
+                     SELECT 'queued', 'build', source_set_id, dat_revision_id, 'Operator', 1, 1, 'now'
+                     FROM jobs LIMIT 1;",
+            )?;
+            Ok(())
+        });
+        assert!(build_without_a_folder.is_err());
+        let foreign_keys = store.read(|c| Ok(pragma(c, "foreign_keys"))).unwrap();
+        assert_eq!(foreign_keys, "Integer(1)");
     }
 
     #[test]

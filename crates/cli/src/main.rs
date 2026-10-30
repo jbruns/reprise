@@ -22,7 +22,7 @@ struct Cli {
     /// The configuration file (`title-select.toml`) that declares your roots.
     #[arg(long, global = true, env = "TITLE_SELECT_CONFIG")]
     config: Option<PathBuf>,
-    /// The file holding your operator token: the Service accepts it, and `audit --server` sends it.
+    /// The file holding your operator token: the service accepts it, and `audit --server` sends it.
     #[arg(long, global = true, env = "TITLE_SELECT_OPERATOR_TOKEN_FILE")]
     token_file: Option<PathBuf>,
     #[command(subcommand)]
@@ -35,7 +35,7 @@ enum Command {
     /// Reads only; never changes the source set.
     ///
     /// With `--dat <file> <dir>` the audit is stateless. With `--set <name>` it audits a registered source set
-    /// and records the audit in the store. With `--server <url> --set <name>` the Service at `<url>` runs it as a
+    /// and records the audit in the store. With `--server <url> --set <name>` the service at `<url>` runs it as a
     /// job, which this follows to completion, showing progress and a summary on stderr.
     Audit {
         /// The Logiqx XML DAT file to audit against.
@@ -48,7 +48,7 @@ enum Command {
         /// audit's DAT revision, else the newest imported revision of the source set's DAT.
         #[arg(long, requires = "set")]
         revision: Option<String>,
-        /// The Service to run the audit, such as `http://127.0.0.1:8080`. Sends your operator token.
+        /// The service to run the audit, such as `http://127.0.0.1:8080`. Sends your operator token.
         #[arg(long, requires = "set")]
         server: Option<String>,
         /// Write the report to this file instead of stdout.
@@ -68,7 +68,7 @@ enum Command {
         #[command(subcommand)]
         command: SetCommand,
     },
-    /// Run the Service: the `/api/v1` JSON API and the audit and selection jobs. It holds the store until it stops.
+    /// Run the service: the `/api/v1` JSON API and the audit and selection jobs. It holds the store until it stops.
     Serve {
         /// The address to listen on.
         #[arg(long, env = "TITLE_SELECT_LISTEN", default_value = "127.0.0.1:8080")]
@@ -77,7 +77,7 @@ enum Command {
         #[arg(long, env = "TITLE_SELECT_UI")]
         ui: Option<PathBuf>,
         /// The selection engine install that `tools/retool/setup` builds, for selections and previews. Defaults
-        /// to `/opt/retool`. Without one the Service still runs audits.
+        /// to `/opt/retool`. Without one the service still runs audits.
         #[arg(long, env = title_select_selection::RETOOL_ENV)]
         retool: Option<PathBuf>,
     },
@@ -103,10 +103,10 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// Check that a Service is up, for a container healthcheck. Prints nothing on success; exits 1 with the
+    /// Check that the service is up, for a container healthcheck. Prints nothing on success; exits 1 with the
     /// reason on stderr otherwise.
     Health {
-        /// The Service's health endpoint.
+        /// The service's health endpoint.
         #[arg(long, default_value = "http://127.0.0.1:8080/api/v1/health")]
         url: String,
         /// Seconds to wait for the whole check, from 1 to 300.

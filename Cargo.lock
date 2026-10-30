@@ -802,6 +802,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
 dependencies = [
  "crc32fast",
+ "libz-sys",
  "miniz_oxide",
  "zlib-rs",
 ]
@@ -1591,6 +1592,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
+name = "libz-sys"
+version = "1.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
+dependencies = [
+ "cc",
+ "libc",
  "pkg-config",
  "vcpkg",
 ]
@@ -2667,7 +2680,9 @@ name = "title-select-engine"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "flate2",
  "jiff",
+ "libz-sys",
  "md-5",
  "quick-xml",
  "serde",
@@ -2729,6 +2744,7 @@ dependencies = [
  "jiff",
  "md-5",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha1",

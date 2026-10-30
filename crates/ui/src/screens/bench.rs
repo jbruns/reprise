@@ -139,7 +139,7 @@ pub fn Bench() -> impl IntoView {
         <h1>"Filtering benchmark"</h1>
         <p class="lede">
             {format!(
-                "{n} synthetic entries: {verified} verified, {needs_review} need review. Nothing here comes from the Service.",
+                "{n} synthetic entries: {verified} verified, {needs_review} need review. Nothing here comes from the service.",
             )}
         </p>
         <EntriesPanel entries />

@@ -12,6 +12,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_initial.sql"),
     include_str!("migrations/0002_jobs.sql"),
     include_str!("migrations/0003_selections.sql"),
+    include_str!("migrations/0004_builds.sql"),
 ];
 
 pub(super) fn migrate(conn: &mut Connection, dir: &Path, migrations: &[&str]) -> Result<()> {
@@ -24,6 +25,18 @@ pub(super) fn migrate(conn: &mut Connection, dir: &Path, migrations: &[&str]) ->
             migrations.len()
         )));
     }
+    if applied == migrations.len() {
+        return Ok(());
+    }
+    // A migration may rebuild a table others refer to, which SQLite allows only with foreign keys off; each checks
+    // them before it commits instead. The pragma is a no-op inside a transaction, so it is set around them.
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let migrated = apply(conn, dir, migrations, applied);
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    migrated
+}
+
+fn apply(conn: &mut Connection, dir: &Path, migrations: &[&str], applied: usize) -> Result<()> {
     for (version, sql) in migrations.iter().enumerate().skip(applied) {
         // A store opened with no schema has nothing to protect.
         if applied > 0 {
@@ -31,6 +44,17 @@ pub(super) fn migrate(conn: &mut Connection, dir: &Path, migrations: &[&str]) ->
         }
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
+        let violations: i64 =
+            tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })?;
+        if violations > 0 {
+            return Err(Error::Io(format!(
+                "{}: migration {} would leave {violations} broken references",
+                dir.display(),
+                version + 1
+            )));
+        }
         tx.pragma_update(None, "user_version", version as i64 + 1)?;
         tx.commit()?;
     }

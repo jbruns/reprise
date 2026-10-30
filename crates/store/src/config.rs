@@ -37,7 +37,8 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct Root {
     pub path: PathBuf,
-    /// Whether Title Select may write to this Root. Nothing writes yet, so every Root must be read-only.
+    /// Whether Title Select may write to this Root. Only Managed Folders may live in a writable Root; Source Sets
+    /// stay in read-only ones.
     #[serde(default)]
     pub writable: bool,
 }
@@ -263,14 +264,9 @@ impl Config {
         {
             return Err(Error("auth.dev_identity is empty".into()));
         }
-        for (name, root) in &config.roots {
+        for name in config.roots.keys() {
             if name.is_empty() {
                 return Err(Error("a root has an empty name".into()));
-            }
-            if root.writable {
-                return Err(Error(format!(
-                    "root {name} is writable; every root is read-only until change plans exist"
-                )));
             }
         }
         Ok(config)

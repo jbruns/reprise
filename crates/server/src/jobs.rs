@@ -95,7 +95,9 @@ pub async fn run(
             let ended = {
                 let (store, jobs) = (store.clone(), jobs.clone());
                 tokio::task::spawn_blocking(move || match kind {
-                    JobKind::Audit => run_one(&store, &config, &jobs, id, version),
+                    JobKind::Audit | JobKind::Build => {
+                        run_one(&store, &config, &jobs, kind, id, version)
+                    }
                     JobKind::Selection => run_selection(&store, &config, engine.as_deref(), id),
                 })
                 .await
@@ -121,8 +123,15 @@ pub async fn run(
     }
 }
 
-/// Runs one claimed Job's Audit, returning the Job as it ended.
-fn run_one(store: &Store, config: &Config, jobs: &Jobs, id: i64, version: u64) -> Option<Job> {
+/// Runs one claimed Audit or Build Job, publishing its progress, and returns the Job as it ended.
+fn run_one(
+    store: &Store,
+    config: &Config,
+    jobs: &Jobs,
+    kind: JobKind,
+    id: i64,
+    version: u64,
+) -> Option<Job> {
     let last = Mutex::new(None::<Instant>);
     let progress = |p: Progress| {
         let mut last = last.lock().unwrap();
@@ -137,7 +146,11 @@ fn run_one(store: &Store, config: &Config, jobs: &Jobs, id: i64, version: u64) -
             }));
         }
     };
-    match store.run_audit_job(config, id, Some(&progress)) {
+    let ran = match kind {
+        JobKind::Build => store.run_build_job(config, id, Some(&progress)),
+        _ => store.run_audit_job(config, id, Some(&progress)),
+    };
+    match ran {
         Ok(job) => Some(job),
         Err(err) => {
             eprintln!("title-select: job {id}: {err}");
