@@ -2711,6 +2711,7 @@ dependencies = [
  "thiserror 2.0.21",
  "title-select-api",
  "title-select-engine",
+ "title-select-selection",
  "title-select-store",
  "tokio",
  "tokio-stream",

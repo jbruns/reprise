@@ -136,6 +136,159 @@ pub struct AuditSummary {
     pub pruned: bool,
 }
 
+/// A named Selection Profile and its newest version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileRecord {
+    pub name: String,
+    pub created_at: String,
+    /// The newest version, or none before the first save.
+    pub latest: Option<ProfileVersion>,
+}
+
+/// One immutable version of a Selection Profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileVersion {
+    pub name: String,
+    pub version: u32,
+    /// SHA-256 of the canonical JSON.
+    pub sha256: String,
+    pub saved_at: String,
+    pub saved_by: String,
+    pub profile: selection::SelectionProfile,
+}
+
+/// The request to create a named Selection Profile with no versions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateProfile {
+    pub name: String,
+}
+
+/// The request to save a Selection Profile as its next version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveProfile {
+    pub profile: selection::SelectionProfile,
+    /// The version the edit started from; a save is refused if a newer version was saved since. None for the
+    /// first version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<u32>,
+    /// Source Sets to queue a Selection for with the saved version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue: Vec<StartSelectionFor>,
+}
+
+/// A Source Set to queue a Selection for, at a DAT Revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartSelectionFor {
+    pub source_set: String,
+    /// A prefix of the DAT Revision's SHA-256; defaults as for an Audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+
+/// The response to a save.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedProfile {
+    pub version: ProfileVersion,
+    /// False when nothing changed, so the newest version was returned and none was created.
+    pub created: bool,
+    /// The Selection Jobs queued.
+    pub jobs: Vec<Job>,
+}
+
+/// The names the Profile editor offers and `check` accepts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Vocabulary {
+    pub regions: Vec<String>,
+    pub languages: Vec<String>,
+    pub videos: Vec<String>,
+    pub categories: Vec<selection::Category>,
+}
+
+/// The result of checking a Selection Profile: empty when the engine can read it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileCheck {
+    pub problems: Vec<String>,
+}
+
+/// The request for a live preview: the Selection a Profile, saved or not, would make for a Source Set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewRequest {
+    pub source_set: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    pub profile: selection::SelectionProfile,
+}
+
+/// A live preview, with what changed from the latest saved Selection for the same Source Set and DAT Revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preview {
+    pub dat_revision: DatRevisionRecord,
+    pub selection: selection::Selection,
+    /// The Selection the diff is against.
+    pub against: Option<i64>,
+    pub diff: Vec<selection::ReleaseChange>,
+    pub elapsed_ms: u64,
+}
+
+/// The request to queue a Selection for a Source Set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartSelection {
+    pub source_set: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    pub profile: String,
+    /// Defaults to the newest version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+}
+
+/// A recorded Selection. A pruned Selection keeps only this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionRecord {
+    pub id: i64,
+    pub source_set: String,
+    pub dat_revision_sha256: String,
+    pub dat_revision_version: String,
+    pub profile: ProfileVersionRef,
+    /// The Profile's newest version, so that a client can offer it when it is newer.
+    pub latest_profile_version: u32,
+    pub job: Option<i64>,
+    pub system: String,
+    pub system_settings: bool,
+    pub pins: selection::SelectionPins,
+    pub summary: selection::SelectionSummary,
+    pub created_at: String,
+    pub pruned: bool,
+}
+
+/// A release of a Selection with its position, and the availability of the release in the Source Set's latest
+/// Audit against the same DAT Revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionReleaseRow {
+    pub seq: u64,
+    #[serde(flatten)]
+    pub release: selection::ReleaseRow,
+    /// None when there is no Audit against the Selection's DAT Revision.
+    pub availability: Option<GameStatus>,
+}
+
+/// The availability of a Selection's releases: the Game Statuses of the Source Set's latest Audit against the
+/// Selection's DAT Revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Availability {
+    /// None when the Source Set has no Audit against that DAT Revision.
+    pub audit: Option<i64>,
+    pub games: BTreeMap<String, GameStatus>,
+}
+
+/// Release by release, what changed between two Selections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionDiff {
+    pub from: i64,
+    pub to: i64,
+    pub changes: Vec<selection::ReleaseChange>,
+}
+
 /// The request to start an Audit of a registered Source Set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartAudit {
@@ -195,22 +348,61 @@ pub struct Workers {
     pub hashers: usize,
 }
 
-/// A durable unit of work: so far, always an Audit of a Source Set.
+/// What a Job does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    #[default]
+    Audit,
+    Selection,
+}
+
+impl JobKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobKind::Audit => "audit",
+            JobKind::Selection => "selection",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<JobKind> {
+        [JobKind::Audit, JobKind::Selection]
+            .into_iter()
+            .find(|k| k.as_str() == s)
+    }
+}
+
+/// A Selection Profile version, by Profile name and version number.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProfileVersionRef {
+    pub name: String,
+    pub version: u32,
+}
+
+/// A durable unit of work: an Audit of a Source Set, or a Selection made for one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     pub id: i64,
+    #[serde(default)]
+    pub kind: JobKind,
     pub state: JobState,
     pub source_set: String,
-    /// The DAT Revision the Audit is pinned to, by SHA-256.
+    /// The DAT Revision the Job is pinned to, by SHA-256.
     pub dat_revision: String,
+    /// The Selection Profile version a Selection Job runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ProfileVersionRef>,
     /// Who started it: the identity the trusted proxy handed over, or the Operator token's.
     pub actor: String,
     /// 1, or 2 for the Job queued again after a restart interrupted the first.
     pub attempt: u32,
     /// The interrupted Job this one was queued again for.
     pub requeued_from: Option<i64>,
-    /// The Audit a Succeeded Job recorded.
+    /// The Audit a Succeeded Audit Job recorded.
     pub audit: Option<i64>,
+    /// The Selection a Succeeded Selection Job recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<i64>,
     /// Why a Job Failed or was Interrupted.
     pub error: Option<String>,
     pub workers: Workers,

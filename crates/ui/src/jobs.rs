@@ -164,6 +164,7 @@ mod tests {
     fn job(id: i64, state: JobState, version: u64) -> Job {
         Job {
             id,
+            kind: Default::default(),
             state,
             source_set: "Atari 2600".into(),
             dat_revision: "ab".repeat(32),
@@ -171,6 +172,8 @@ mod tests {
             attempt: 1,
             requeued_from: None,
             audit: (state == JobState::Succeeded).then_some(7),
+            profile: None,
+            selection: None,
             error: None,
             workers: Workers {
                 readers: 1,

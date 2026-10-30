@@ -14,10 +14,14 @@ use axum::routing::{any, get, post};
 use axum::{Extension, Json, Router, middleware};
 use futures_util::StreamExt;
 use serde::Deserialize;
+use title_select_api::selection::{Role, SelectionProfile, diff_rows};
 use title_select_api::{
-    AddSourceSet, Dat, ErrorBody, Finding, GameStatus, Health, ImportedDatRevision, JobEvent,
-    JobSnapshot, Page, Root, SSE_KEEP_ALIVE, StartAudit,
+    AddSourceSet, Availability, CreateProfile, Dat, ErrorBody, Finding, GameStatus, Health,
+    ImportedDatRevision, JobEvent, JobSnapshot, Page, Preview, PreviewRequest, ProfileCheck,
+    ProfileRecord, ProfileVersion, Root, SSE_KEEP_ALIVE, SaveProfile, SavedProfile, SelectionDiff,
+    SelectionRecord, SelectionReleaseRow, StartAudit, StartSelection, Vocabulary,
 };
+use title_select_selection::Engine;
 use title_select_store::config::Config;
 use title_select_store::{Error, Store, Workers};
 use tokio::sync::{broadcast, mpsc};
@@ -27,6 +31,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::auth::{Actor, Auth, require_operator};
 use crate::jobs::Jobs;
+use crate::selections::{Previews, UNAVAILABLE};
 
 /// The largest DAT file an upload may carry.
 pub const UPLOAD_LIMIT: usize = 512 * 1024 * 1024;
@@ -41,6 +46,16 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub jobs: Arc<Jobs>,
     pub workers: Workers,
+    pub engine: Option<Arc<Engine>>,
+    pub previews: Arc<Previews>,
+}
+
+impl AppState {
+    fn engine(&self) -> ApiResult<Arc<Engine>> {
+        self.engine
+            .clone()
+            .ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE.into(), None))
+    }
 }
 
 pub fn router(state: AppState, auth: Arc<Auth>, ui: Option<&std::path::Path>) -> Router {
@@ -62,6 +77,22 @@ pub fn router(state: AppState, auth: Arc<Auth>, ui: Option<&std::path::Path>) ->
         .route("/audits/{id}/entries", get(entries))
         .route("/audits/{id}/entries.ndjson", get(entries_ndjson))
         .route("/audits/{id}/games", get(games))
+        .route("/vocabulary", get(vocabulary))
+        .route("/check", post(check_profile))
+        .route("/profiles", get(profiles).post(create_profile))
+        .route("/profiles/{name}", get(profile))
+        .route(
+            "/profiles/{name}/versions",
+            get(profile_versions).post(save_profile),
+        )
+        .route("/profiles/{name}/versions/{version}", get(profile_version))
+        .route("/preview", post(preview))
+        .route("/selections", get(selections).post(start_selection))
+        .route("/selections/{id}", get(selection_record))
+        .route("/selections/{id}/selection", get(selection))
+        .route("/selections/{id}/releases", get(selection_releases))
+        .route("/selections/{id}/availability", get(availability))
+        .route("/selections/{id}/diff", get(selection_diff))
         .route("/jobs", get(jobs))
         .route("/jobs/{id}", get(job))
         .route("/jobs/{id}/events", get(job_events))
@@ -140,6 +171,7 @@ impl From<Error> for ApiError {
         let status = match &err {
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Refused(_) => StatusCode::BAD_REQUEST,
+            Error::Conflict(_) => StatusCode::CONFLICT,
             Error::JobActive { job, .. } => {
                 return ApiError(StatusCode::CONFLICT, err.to_string(), Some(*job));
             }
@@ -147,6 +179,24 @@ impl From<Error> for ApiError {
             Error::Sqlite(_) | Error::Io(_) | Error::Audit(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError(status, err.to_string(), None)
+    }
+}
+
+impl From<title_select_selection::Error> for ApiError {
+    fn from(err: title_select_selection::Error) -> ApiError {
+        use title_select_selection::Error as E;
+        let status = match &err {
+            E::Profile(_) => StatusCode::BAD_REQUEST,
+            E::Cancelled => StatusCode::CONFLICT,
+            E::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            E::Install(_) => StatusCode::SERVICE_UNAVAILABLE,
+            E::Io { .. } | E::Retool { .. } | E::Trace(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let message = match &err {
+            E::Cancelled => "a newer preview replaced this one".to_owned(),
+            _ => err.to_string(),
+        };
+        ApiError(status, message, None)
     }
 }
 
@@ -455,6 +505,297 @@ async fn entries_ndjson(
         .into_response())
 }
 
+async fn vocabulary(State(state): State<AppState>) -> ApiResult<Json<Vocabulary>> {
+    let engine = state.engine()?;
+    let names = tokio::task::spawn_blocking(move || engine.names())
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), None))??;
+    Ok(Json(Vocabulary {
+        regions: names.regions,
+        languages: names.languages,
+        videos: names.videos,
+        categories: title_select_api::selection::Category::ALL.to_vec(),
+    }))
+}
+
+/// Checks that the engine can read a Selection Profile; the problems are empty when it can.
+async fn check_profile(
+    State(state): State<AppState>,
+    body: Result<Json<SelectionProfile>, JsonRejection>,
+) -> ApiResult<Json<ProfileCheck>> {
+    let Json(profile) = body?;
+    let engine = state.engine()?;
+    let checked = tokio::task::spawn_blocking(move || engine.check(&profile))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), None))?;
+    Ok(Json(ProfileCheck {
+        problems: match checked {
+            Ok(()) => Vec::new(),
+            Err(title_select_selection::Error::Profile(problem)) => vec![problem],
+            Err(err) => return Err(err.into()),
+        },
+    }))
+}
+
+async fn profiles(State(state): State<AppState>) -> ApiResult<Json<Vec<ProfileRecord>>> {
+    Ok(Json(blocking(&state, |store| store.profiles()).await?))
+}
+
+async fn create_profile(
+    State(state): State<AppState>,
+    body: Result<Json<CreateProfile>, JsonRejection>,
+) -> ApiResult<(StatusCode, Json<ProfileRecord>)> {
+    let Json(create) = body?;
+    let record = blocking(&state, move |store| store.create_profile(&create.name)).await?;
+    Ok((StatusCode::CREATED, Json(record)))
+}
+
+async fn profile(
+    State(state): State<AppState>,
+    name: Result<Path<String>, PathRejection>,
+) -> ApiResult<Json<ProfileRecord>> {
+    let Path(name) = name?;
+    Ok(Json(
+        blocking(&state, move |store| store.profile(&name)).await?,
+    ))
+}
+
+async fn profile_versions(
+    State(state): State<AppState>,
+    name: Result<Path<String>, PathRejection>,
+) -> ApiResult<Json<Vec<ProfileVersion>>> {
+    let Path(name) = name?;
+    Ok(Json(
+        blocking(&state, move |store| store.profile_versions(&name)).await?,
+    ))
+}
+
+async fn profile_version(
+    State(state): State<AppState>,
+    path: Result<Path<(String, u32)>, PathRejection>,
+) -> ApiResult<Json<ProfileVersion>> {
+    let Path((name, version)) = path?;
+    Ok(Json(
+        blocking(&state, move |store| {
+            store.profile_version(&name, Some(version))
+        })
+        .await?,
+    ))
+}
+
+/// Saves a Profile as its next version, creating the Profile on its first save, and queues the Selections asked
+/// for. A save with nothing changed creates no version.
+async fn save_profile(
+    State(state): State<AppState>,
+    Extension(Actor(actor)): Extension<Actor>,
+    name: Result<Path<String>, PathRejection>,
+    body: Result<Json<SaveProfile>, JsonRejection>,
+) -> ApiResult<(StatusCode, Json<SavedProfile>)> {
+    let (Path(name), Json(save)) = (name?, body?);
+    let engine = state.engine()?;
+    let profile = save.profile.clone();
+    tokio::task::spawn_blocking(move || engine.check(&profile))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), None))??;
+    let workers = state.workers;
+    let saved = blocking(&state, move |store| {
+        store.save_profile(
+            &name,
+            &save.profile,
+            save.base_version,
+            &actor,
+            &save.queue,
+            workers,
+        )
+    })
+    .await?;
+    for job in &saved.jobs {
+        state.jobs.changed(job.clone());
+    }
+    let status = if saved.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(saved)))
+}
+
+/// A live preview: the Selection a Profile, saved or not, would make for a Source Set now, outside the Job queue.
+/// A newer preview from the same actor, or the client going away, kills the engine run.
+async fn preview(
+    State(state): State<AppState>,
+    Extension(Actor(actor)): Extension<Actor>,
+    body: Result<Json<PreviewRequest>, JsonRejection>,
+) -> ApiResult<Json<Preview>> {
+    let Json(request) = body?;
+    let engine = state.engine()?;
+    let guard = state.previews.start(&actor);
+    let cancel = guard.flag();
+    let started = std::time::Instant::now();
+    let store = state.store.clone();
+    let made = tokio::task::spawn_blocking(move || -> ApiResult<Preview> {
+        let (revision, blob) =
+            store.selection_revision(&request.source_set, request.revision.as_deref())?;
+        let selection = crate::selections::select(
+            &store,
+            &engine,
+            &blob,
+            &revision.file,
+            &request.profile,
+            Some(cancel),
+        )?;
+        let against = store.latest_selection(&request.source_set, &revision.sha256)?;
+        let diff = match against {
+            Some(id) => diff_rows(&store.selection_rows(id)?, &selection.rows()),
+            None => Vec::new(),
+        };
+        Ok(Preview {
+            dat_revision: revision,
+            selection,
+            against,
+            diff,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), None))?;
+    drop(guard);
+    Ok(Json(made?))
+}
+
+/// Queues a Selection Job. It runs whether or not the client stays connected.
+async fn start_selection(
+    State(state): State<AppState>,
+    Extension(Actor(actor)): Extension<Actor>,
+    body: Result<Json<StartSelection>, JsonRejection>,
+) -> ApiResult<(StatusCode, Json<title_select_api::Job>)> {
+    let Json(start) = body?;
+    state.engine()?;
+    let workers = state.workers;
+    let job = blocking(&state, move |store| {
+        store.enqueue_selection(
+            &start.source_set,
+            start.revision.as_deref(),
+            &start.profile,
+            start.version,
+            &actor,
+            workers,
+        )
+    })
+    .await?;
+    state.jobs.changed(job.clone());
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+#[derive(Deserialize)]
+struct SelectionsQuery {
+    source_set: String,
+}
+
+async fn selections(
+    State(state): State<AppState>,
+    query: Result<Query<SelectionsQuery>, QueryRejection>,
+) -> ApiResult<Json<Vec<SelectionRecord>>> {
+    let Query(query) = query?;
+    Ok(Json(
+        blocking(&state, move |store| store.selections(&query.source_set)).await?,
+    ))
+}
+
+async fn selection_record(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Json<SelectionRecord>> {
+    let Path(id) = id?;
+    Ok(Json(
+        blocking(&state, move |store| store.selection_record(id)).await?,
+    ))
+}
+
+/// The whole explained Selection, group by group.
+async fn selection(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Json<title_select_api::selection::Selection>> {
+    let Path(id) = id?;
+    Ok(Json(
+        blocking(&state, move |store| store.selection(id)).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct ReleasesQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+    role: Option<Role>,
+    group: Option<String>,
+}
+
+async fn selection_releases(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    query: Result<Query<ReleasesQuery>, QueryRejection>,
+) -> ApiResult<Json<Page<SelectionReleaseRow>>> {
+    let (Path(id), Query(query)) = (id?, query?);
+    let (after, limit) = paging(query.cursor.as_deref(), query.limit)?;
+    let page = blocking(&state, move |store| {
+        store.selection_releases(id, after, limit, query.role, query.group.as_deref())
+    })
+    .await?;
+    Ok(to_page(page))
+}
+
+async fn availability(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Json<Availability>> {
+    let Path(id) = id?;
+    Ok(Json(
+        blocking(&state, move |store| store.selection_availability(id)).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct DiffQuery {
+    /// The Selection to compare against; by default the Source Set's Selection before this one.
+    against: Option<i64>,
+}
+
+/// Release by release, what changed from the `against` Selection to this one.
+async fn selection_diff(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    query: Result<Query<DiffQuery>, QueryRejection>,
+) -> ApiResult<Json<SelectionDiff>> {
+    let (Path(id), Query(query)) = (id?, query?);
+    Ok(Json(
+        blocking(&state, move |store| {
+            let against = match query.against {
+                Some(against) => against,
+                None => {
+                    let record = store.selection_record(id)?;
+                    store
+                        .selections(&record.source_set)?
+                        .into_iter()
+                        .find(|s| s.id < id && !s.pruned)
+                        .map(|s| s.id)
+                        .ok_or_else(|| {
+                            Error::NotFound(format!(
+                                "selection {id} has no earlier selection to compare with"
+                            ))
+                        })?
+                }
+            };
+            Ok(SelectionDiff {
+                from: against,
+                to: id,
+                changes: diff_rows(&store.selection_rows(against)?, &store.selection_rows(id)?),
+            })
+        })
+        .await?,
+    ))
+}
+
 async fn jobs(State(state): State<AppState>) -> ApiResult<Json<Vec<title_select_api::Job>>> {
     Ok(Json(blocking(&state, |store| store.jobs(100)).await?))
 }
@@ -626,6 +967,8 @@ mod tests {
                 readers: 1,
                 hashers: 1,
             },
+            engine: None,
+            previews: Arc::default(),
         }
     }
 

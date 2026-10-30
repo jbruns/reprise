@@ -68,7 +68,7 @@ enum Command {
         #[command(subcommand)]
         command: SetCommand,
     },
-    /// Run the Service: the `/api/v1` JSON API and the audit jobs. It holds the store until it stops.
+    /// Run the Service: the `/api/v1` JSON API and the audit and selection jobs. It holds the store until it stops.
     Serve {
         /// The address to listen on.
         #[arg(long, env = "TITLE_SELECT_LISTEN", default_value = "127.0.0.1:8080")]
@@ -76,6 +76,10 @@ enum Command {
         /// The workbench's built bundle (`target/site` after `cargo leptos build`), served at `/`.
         #[arg(long, env = "TITLE_SELECT_UI")]
         ui: Option<PathBuf>,
+        /// The selection engine install that `tools/retool/setup` builds, for selections and previews. Defaults
+        /// to `/opt/retool`. Without one the Service still runs audits.
+        #[arg(long, env = title_select_selection::RETOOL_ENV)]
+        retool: Option<PathBuf>,
     },
     /// Select from a DAT with a selection profile, running the pinned selection engine, and print the explained
     /// selection as JSON: every group's winner, alternatives and exclusions with the rule responsible for each.
@@ -239,7 +243,7 @@ fn run(cli: Cli) -> Result<(), String> {
             write_report(&audit.report, output)
         }
         Command::Audit { .. } => unreachable!("clap requires --dat with a directory, or --set"),
-        Command::Serve { listen, ui } => {
+        Command::Serve { listen, ui, retool } => {
             let store = store.ok_or("no store: pass --store <dir> or set TITLE_SELECT_STORE")?;
             title_select_server::run(Settings {
                 store: store.to_path_buf(),
@@ -247,6 +251,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 listen,
                 token_file: cli.token_file,
                 ui,
+                retool,
                 hold_jobs: false,
             })
             .map_err(|e| e.to_string())

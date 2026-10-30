@@ -1,10 +1,12 @@
-//! Title Select's Service: the `/api/v1` JSON API over the store, durable Audit Jobs and Operator auth (ADR 0003).
+//! Title Select's Service: the `/api/v1` JSON API over the store, durable Audit and Selection Jobs, live Selection
+//! previews and Operator auth (ADR 0003).
 //!
 //! The Service owns the store, and its lock, for as long as it runs.
 
 mod auth;
 mod jobs;
 mod routes;
+mod selections;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -30,6 +32,9 @@ pub struct Settings {
     pub token_file: Option<PathBuf>,
     /// The workbench's built bundle, served at `/` (ADR 0005).
     pub ui: Option<PathBuf>,
+    /// The selection engine install; by default `$TITLE_SELECT_RETOOL`, else `/opt/retool`. Without one the
+    /// Service still starts, and refuses Selections and previews.
+    pub retool: Option<PathBuf>,
     /// Leaves queued Jobs queued, so tests can observe them.
     #[doc(hidden)]
     pub hold_jobs: bool,
@@ -62,8 +67,16 @@ fn prepare(settings: Settings) -> Result<Prepared, StartError> {
         listen,
         token_file,
         ui,
+        retool,
         hold_jobs,
     } = settings;
+    let engine = match title_select_selection::Engine::locate(retool.as_deref()) {
+        Ok(engine) => Some(Arc::new(engine)),
+        Err(err) => {
+            eprintln!("title-select: selections are unavailable: {err}");
+            None
+        }
+    };
     let auth = auth::Auth::new(&config.auth, token_file.as_deref(), listen)?;
     let store = Store::open(&store)?;
     let workers: Workers = config.jobs.workers();
@@ -90,6 +103,8 @@ fn prepare(settings: Settings) -> Result<Prepared, StartError> {
         config: Arc::new(config),
         jobs: Arc::new(jobs::Jobs::new()),
         workers,
+        engine,
+        previews: Arc::default(),
     };
     let app = routes::router(state.clone(), Arc::new(auth), ui.as_deref());
     Ok(Prepared {
@@ -109,7 +124,12 @@ impl Prepared {
     async fn serve(self) -> std::io::Result<()> {
         let state = self.state;
         if !self.hold_jobs {
-            tokio::spawn(jobs::run(state.store, state.config, state.jobs));
+            tokio::spawn(jobs::run(
+                state.store,
+                state.config,
+                state.jobs,
+                state.engine,
+            ));
         }
         let listener = tokio::net::TcpListener::from_std(self.listener)?;
         axum::serve(
