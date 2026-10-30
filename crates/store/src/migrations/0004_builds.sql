@@ -59,8 +59,9 @@ CREATE TABLE builds (
     generation INTEGER NOT NULL,
     started_at TEXT NOT NULL,
     finished_at TEXT,
-    -- Set, and committed, before the marker is advanced to `generation`: the only evidence on which recovery puts
-    -- a marker one generation ahead of the store back.
+    -- Set in the transaction that advances the folder to `generation` and makes this its current Build, which
+    -- commits before the marker is advanced: the only evidence on which recovery moves a marker one generation
+    -- behind the store forward. A marker is never moved back.
     finalizing_at TEXT,
     -- When the folder was last left clean after the Build: no staging directory, no half-written marker, every
     -- publishing item settled. A Build that ended without it still needs recovery, and its folder is not planned.
@@ -80,10 +81,12 @@ CREATE TABLE build_items (
     kind TEXT NOT NULL CHECK (kind IN ('copy', 'repack')),
     state TEXT NOT NULL CHECK (state IN ('pending', 'publishing', 'applied', 'failed', 'uncertain')),
     error TEXT,
-    -- The staged file's SHA-256 and size, recorded with state 'publishing' before it is renamed into place, so that
-    -- recovery can tell the file it put there from any other.
+    -- The staged file's SHA-256, size, device and inode, recorded with state 'publishing' before it is renamed into
+    -- place, so that the Build and recovery can tell the file it put there from any other.
     sha256 TEXT,
     size INTEGER,
+    dev INTEGER,
+    ino INTEGER,
     PRIMARY KEY (build_id, seq)
 );
 
@@ -105,8 +108,20 @@ CREATE TABLE built_files (
     PRIMARY KEY (folder_id, target)
 );
 
--- Something that cites a Selection as provenance, such as a Managed Folder's current Build. A cited Selection is
--- never pruned.
+-- What a Build or recovery created in a Managed Folder for itself: the staging directory, each file in it (named
+-- '.title-select-staging/<file>') and a marker's temp file, by device and inode, committed before it is relied on.
+-- Only an entry found with a recorded identity is ever removed; anything else there is left and blocks the folder.
+CREATE TABLE folder_temps (
+    folder_id INTEGER NOT NULL REFERENCES managed_folders (id),
+    name TEXT NOT NULL,
+    dev INTEGER NOT NULL,
+    ino INTEGER NOT NULL,
+    PRIMARY KEY (folder_id, name)
+);
+
+-- Something that cites a Selection as provenance, such as a Managed Folder's current Build ('managed-folder:<id>'),
+-- or holds it for a Build Job from its approval until it ends ('build-job:<id>'); audit_citations does the same for
+-- Audits. A cited Selection is never pruned.
 CREATE TABLE selection_citations (
     selection_id INTEGER NOT NULL REFERENCES selections (id),
     cited_by TEXT NOT NULL,

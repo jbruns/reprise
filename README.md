@@ -390,12 +390,20 @@ build fails and the marker stays where it was. Renaming without replacing needs 
 yours does not, the build fails rather than risk overwriting a file. A ROM name with a path separator, a `..`
 part, a drive or a device name such as `CON` is a blocked item.
 
+The staging folder is private to the server's user. Each file is renamed into place only while the staged file is
+still the one verified, and recorded only if the file then in place is that one; otherwise it is left and the build
+fails. The store records the next generation before the marker follows it, and a marker is never moved back.
+While a build is queued or running, its selection and audit are kept from being pruned.
+
 A build cut off by a stop or a failure is not run again. When the server starts, it cleans up after such a build only
-if the folder's marker is still this store's and matches what the build recorded: it then removes the staging folder,
-records each file already put in place whose content it re-hashes and finds as planned, and marks any other file at
-that target uncertain, leaving it as it is. A marker the build advanced just before the stop is put back. Otherwise it
-changes nothing, and planning for that folder is blocked until you resolve it and restart the server. A staging folder
-or a marker temporary file that no build accounts for also blocks planning until you remove it.
+if the managed folder's root is still writable and the folder's marker is still this store's and matches what the
+store recorded. It removes only what the build recorded creating, by device and inode: the staging folder, the files
+in it, and a marker temporary file. It records each file already put in place whose content it re-hashes and finds
+as planned, and marks any other file at that target uncertain, leaving it as it is. A marker that did not follow the
+generation the store recorded is moved forward to it. Otherwise it changes nothing, and planning for that folder is
+blocked until you resolve it and restart the server; this includes a marker newer than the store, as after you
+restore the store from a backup. Anything else in the staging folder, or at the marker's temporary name, also blocks
+planning until you remove it.
 
 The current build of each managed folder keeps its selection and its audit from being pruned.
 

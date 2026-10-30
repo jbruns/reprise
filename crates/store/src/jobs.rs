@@ -116,6 +116,22 @@ pub(super) fn finish_running(
     if updated != 1 {
         return Err(Error::Io(format!("job {id} is no longer running")));
     }
+    release_holds(tx, id)
+}
+
+/// What holds a Build Job's Selection and Audit from pruning, from its approval until it ends.
+pub(super) fn build_hold(job: i64) -> String {
+    format!("build-job:{job}")
+}
+
+/// Releases the holds of Job `id`, which has ended. A Build that succeeded has made its folder cite its inputs.
+fn release_holds(tx: &Transaction, id: i64) -> Result<()> {
+    let hold = build_hold(id);
+    tx.execute(
+        "DELETE FROM selection_citations WHERE cited_by = ?1",
+        [&hold],
+    )?;
+    tx.execute("DELETE FROM audit_citations WHERE cited_by = ?1", [&hold])?;
     Ok(())
 }
 

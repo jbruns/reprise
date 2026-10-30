@@ -25,7 +25,7 @@ use super::folder_dir::{FolderDir, file_stat};
 use super::folders::{
     FolderRow, MARKER_NEW, MarkerState, folder_by_id, is_own, open_folder, read_marker, store_id,
 };
-use super::jobs::job_by_id;
+use super::jobs::{build_hold, job_by_id};
 use super::selections::{read_rows, read_selection, record_by_id};
 use super::sets::{resolve, set_by_id};
 use super::{Error, Result, Store, now};
@@ -983,7 +983,31 @@ impl Store {
                     id
                 ],
             )?;
-            job_by_id(tx, tx.last_insert_rowid())
+            let job = tx.last_insert_rowid();
+            // The Selection and Audit are held from pruning until the Job ends, in the transaction that queues it.
+            let pruned: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM selections WHERE id = ?1 AND pruned_at IS NOT NULL)
+                     OR EXISTS (SELECT 1 FROM audits WHERE id = ?2 AND pruned_at IS NOT NULL)",
+                params![content.selection, content.audit],
+                |r| r.get(0),
+            )?;
+            if pruned {
+                return Err(Error::Refused(format!(
+                    "plan {id}'s selection or audit was pruned; plan again"
+                )));
+            }
+            let hold = build_hold(job);
+            tx.execute(
+                "INSERT INTO selection_citations (selection_id, cited_by) VALUES (?1, ?2)",
+                params![content.selection, hold],
+            )?;
+            if let Some(audit) = content.audit {
+                tx.execute(
+                    "INSERT INTO audit_citations (audit_id, cited_by) VALUES (?1, ?2)",
+                    params![audit, hold],
+                )?;
+            }
+            job_by_id(tx, job)
         })
     }
 }

@@ -89,15 +89,23 @@ pub struct Store {
     readers: Mutex<Vec<Connection>>,
     /// Holds the exclusive lock on `lock` until the store is dropped.
     _lock: File,
-    fault: Mutex<Option<Fault>>,
+    fault: Mutex<Option<FaultHook>>,
 }
+
+/// What a test runs at each [`Fault`] point.
+#[doc(hidden)]
+pub type FaultHook = std::sync::Arc<dyn Fn(Fault) + Send + Sync>;
 
 /// A point at which a Build stops as if the service were killed there, for tests of its recovery.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
+    /// After the publish intent of the item with this sequence number is committed, before its file is renamed.
+    BeforePublish(i64),
     /// After the file of the item with this sequence number is renamed into place, before the store records it.
     AfterPublish(i64),
+    /// After the store commits the folder's next generation, before the marker advances to it.
+    AfterFinalize,
     /// After the marker advances, before the store records the Build finished.
     AfterMarker,
 }
@@ -165,13 +173,26 @@ impl Store {
 
     #[doc(hidden)]
     pub fn inject_fault(&self, fault: Option<Fault>) {
-        *self.fault.lock().unwrap() = fault;
+        self.hook_faults(fault.map(|fault| {
+            std::sync::Arc::new(move |at: Fault| {
+                if at == fault {
+                    panic!("injected fault: {fault:?}");
+                }
+            }) as FaultHook
+        }));
     }
 
-    /// Stops the thread, as a kill would, at `fault` if a test injected it.
+    /// Runs `hook` at every [`Fault`] point.
+    #[doc(hidden)]
+    pub fn hook_faults(&self, hook: Option<FaultHook>) {
+        *self.fault.lock().unwrap() = hook;
+    }
+
+    /// Runs the hook a test set, which may stop the thread here as a kill would.
     fn fault_point(&self, fault: Fault) {
-        if *self.fault.lock().unwrap() == Some(fault) {
-            panic!("injected fault: {fault:?}");
+        let hook = self.fault.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(fault);
         }
     }
 

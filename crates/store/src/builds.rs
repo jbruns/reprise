@@ -1,11 +1,14 @@
 //! Builds: carrying out an approved Change Plan in its Managed Folder. The folder is opened once without following a
-//! symlink, and every change is made through that handle (see [`FolderDir`]). Each file is written and verified in
-//! the folder's staging directory, its SHA-256 recorded as the item's publish intent, the marker checked again, and
-//! the file renamed into place without replacing anything; it is recorded applied in its own transaction. The
-//! Build's finalize intent is committed before the marker advances, and the marker advances before the transaction
-//! that finishes the Build. Recovery changes a folder only for a Build the store records as unfinished, and only once
-//! the folder's marker shows it is that folder.
+//! symlink, and every change is made through that handle (see [`FolderDir`]). The staging directory, each staged
+//! file and each marker temp file are recorded by device and inode before they are relied on, and only an entry with
+//! a recorded identity is ever removed. Each file is written and verified in the staging directory, its SHA-256 and
+//! identity recorded as the item's publish intent, the marker checked again, and the file renamed into place
+//! without replacing anything, only while the staged name is still the verified file; it is recorded applied only
+//! if the target is then that file. The store commits the folder's next generation before the marker advances, and
+//! recovery moves a marker that did not follow forward, never back. Recovery changes a folder only for a Build the
+//! store records as unfinished, only in a writable Root, and only once the folder's marker shows it is that folder.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -21,15 +24,16 @@ use title_select_api::{Job, JobKind, JobState};
 use title_select_engine::Progress;
 use title_select_engine::build::{Source, copy, repack, verify};
 
-use super::folder_dir::{FolderDir, file_stat};
+use super::folder_dir::{FolderDir, Identity, file_stat};
 use super::folders::{
-    MARKER_NEW, MarkerState, build_by_id, builds_where, check_marker, folder_by_id, open_folder,
-    read_marker, store_id, write_marker,
+    MARKER_NEW, MarkerState, build_by_id, builds_where, check_marker, folder_by_id,
+    open_writable_folder, read_marker, store_id, write_marker,
 };
 use super::jobs::finish_running;
-use super::plans::{digest, json, stat, to_json};
+use super::plans::{digest, json, to_json};
 use super::{Error, Fault, Result, Store, now};
 use crate::config::Config;
+use rustix::fs::Stat;
 
 /// What a Managed Folder's current Build cites, in `audit_citations` and `selection_citations`.
 fn cited_by(folder: i64) -> String {
@@ -76,11 +80,11 @@ fn sha256_of(mut file: &File) -> io::Result<(String, u64)> {
     Ok((hex(&hasher.finalize()), size))
 }
 
-/// Writes `item` to the new file `name` in `staging` and verifies it.
+/// Writes `item` to `file`, new in the staging directory at `staged`, and verifies it.
 fn stage(
     item: &PlanItem,
-    staging: &FolderDir,
-    name: &str,
+    file: &mut File,
+    staged: &Path,
     set_dir: &Path,
     set_root: &Path,
     built_at: SystemTime,
@@ -101,12 +105,9 @@ fn stage(
         })
         .collect::<std::result::Result<_, String>>()
         .map_err(Failure::Item)?;
-    let mut file = staging
-        .create_new(name)
-        .map_err(|e| Failure::Folder(e.to_string()))?;
     match item.kind {
         ItemKind::Copy => {
-            copy(&sources[0], &mut file)
+            copy(&sources[0], file)
                 .map_err(|e| Failure::Item(format!("{}: {e}", sources[0].display())))?;
         }
         ItemKind::Repack => {
@@ -128,61 +129,135 @@ fn stage(
                     )
                 })
                 .collect();
-            repack(&file, &pairs).map_err(Failure::Item)?;
+            repack(file, &pairs).map_err(Failure::Item)?;
         }
         _ => unreachable!("only copies and repacks are written"),
     }
-    verify(&file, &item.roms).map_err(Failure::Item)?;
-    let staged = staging.path().join(name);
+    verify(file, &item.roms).map_err(Failure::Item)?;
     file.set_modified(built_at)
         .and_then(|()| file.sync_all())
         .map_err(|e| Failure::Folder(format!("{}: {e}", staged.display())))?;
     let (sha256, size) =
-        sha256_of(&file).map_err(|e| Failure::Folder(format!("{}: {e}", staged.display())))?;
+        sha256_of(file).map_err(|e| Failure::Folder(format!("{}: {e}", staged.display())))?;
     Ok(Staged { sha256, size })
 }
 
-/// Removes what a Build put in the folder's staging directory, then the directory. Anything but regular files in it
-/// is left, and the error says so.
-fn clear_staging(dir: &FolderDir) -> std::result::Result<(), String> {
-    let Some(st) = dir.stat(STAGING).map_err(|e| e.to_string())? else {
-        return Ok(());
-    };
-    if FolderDir::kind(&st) != rustix::fs::FileType::Directory {
-        return Err(format!(
-            "{}/{STAGING} is not a directory; it was left as it is",
-            dir.path().display()
-        ));
+/// Whether `name` in `dir` is, without following a symlink, the regular file `id`.
+fn is_file(dir: &FolderDir, name: &str, id: Identity) -> std::result::Result<bool, String> {
+    Ok(dir
+        .stat(name)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|st| {
+            FolderDir::kind(&st) == rustix::fs::FileType::RegularFile && Identity::of(&st) == id
+        }))
+}
+
+/// Why an entry a Build did not create was left in the folder.
+fn not_ours(dir: &FolderDir, name: &str) -> String {
+    format!(
+        "{}/{name} is not something a build of this store created; it was left as it is. Remove it, then restart \
+         the service",
+        dir.path().display()
+    )
+}
+
+/// Removes the staged file `name` from `staging` if it is still the file `id`; anything else there is left.
+fn remove_staged(staging: &FolderDir, name: &str, id: Identity) -> std::result::Result<(), String> {
+    match staging.stat(name).map_err(|e| e.to_string())? {
+        None => Ok(()),
+        Some(_) if is_file(staging, name, id)? => staging.unlink(name).map_err(|e| e.to_string()),
+        Some(_) => Err(not_ours(staging, name)),
     }
-    let staging = dir.sub(STAGING).map_err(|e| e.to_string())?;
+}
+
+/// Removes the staging directory `staging`, opened from `dir` and created as `own`, once every entry in it is a file
+/// a Build created, by the identities in `known`. Anything else, or a staging directory that is no longer `own`,
+/// is left as it is, and the error says so.
+fn clear_staging(
+    dir: &FolderDir,
+    staging: &FolderDir,
+    own: Identity,
+    known: &HashMap<String, Identity>,
+) -> std::result::Result<(), String> {
+    if staging.identity().map_err(|e| e.to_string())? != own {
+        return Err(not_ours(dir, STAGING));
+    }
     for (name, _) in staging.entries().map_err(|e| e.to_string())? {
-        match staging.stat(&name).map_err(|e| e.to_string())? {
-            Some(st) if FolderDir::kind(&st) == rustix::fs::FileType::RegularFile => {
-                staging.unlink(&name).map_err(|e| e.to_string())?;
-            }
-            None => {}
-            Some(_) => {
-                return Err(format!(
-                    "{}/{name} is not a file a build wrote; the staging directory was left as it is",
-                    staging.path().display()
-                ));
-            }
+        match known.get(&name) {
+            Some(&id) => remove_staged(staging, &name, id)?,
+            None => return Err(not_ours(staging, &name)),
         }
+    }
+    match dir.stat(STAGING).map_err(|e| e.to_string())? {
+        Some(st)
+            if FolderDir::kind(&st) == rustix::fs::FileType::Directory
+                && Identity::of(&st) == own => {}
+        _ => return Err(not_ours(dir, STAGING)),
     }
     dir.rmdir(STAGING)
         .and_then(|()| dir.sync())
         .map_err(|e| e.to_string())
 }
 
-/// Records the item `seq` of Build `build` applied and its file built, with `file`'s stat.
+/// The name a staged file is recorded under in `folder_temps`.
+fn staged_temp(name: &str) -> String {
+    format!("{STAGING}/{name}")
+}
+
+/// The entries Builds and recovery created in Managed Folder `folder`, by name.
+fn temps(c: &Connection, folder: i64) -> Result<HashMap<String, Identity>> {
+    let mut stmt = c.prepare("SELECT name, dev, ino FROM folder_temps WHERE folder_id = ?1")?;
+    let rows = stmt.query_map([folder], |r| {
+        Ok((r.get(0)?, Identity::from_sql(r.get(1)?, r.get(2)?)))
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Records, and commits, that the entry `name` in Managed Folder `folder` was created as `id`.
+fn record_temp(store: &Store, folder: i64, name: &str, id: Identity) -> Result<()> {
+    let (dev, ino) = id.to_sql();
+    store.write(|tx| {
+        tx.execute(
+            "INSERT OR REPLACE INTO folder_temps (folder_id, name, dev, ino) VALUES (?1, ?2, ?3, ?4)",
+            params![folder, name, dev, ino],
+        )?;
+        Ok(())
+    })
+}
+
+/// Records the item `seq` of Build `build` applied and its file built, if `found`, the `lstat` or `fstat` of what is
+/// at its target, is the regular file its publish intent records. Otherwise it records the item uncertain, leaving
+/// the file, and returns false.
 fn record_applied(
     tx: &Transaction,
     build: i64,
     folder: i64,
     seq: i64,
     item: &PlanItem,
-    file: &FileStat,
-) -> Result<()> {
+    found: &Stat,
+) -> Result<bool> {
+    let (dev, ino): (Option<i64>, Option<i64>) = tx.query_row(
+        "SELECT dev, ino FROM build_items WHERE build_id = ?1 AND seq = ?2",
+        params![build, seq],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let recorded = dev.zip(ino).map(|(dev, ino)| Identity::from_sql(dev, ino));
+    if FolderDir::kind(found) != rustix::fs::FileType::RegularFile
+        || recorded != Some(Identity::of(found))
+    {
+        set_item(
+            tx,
+            build,
+            seq,
+            ItemState::Uncertain,
+            &format!(
+                "the file at {} is not the one the build put there; it was left as it is",
+                item.target
+            ),
+        )?;
+        return Ok(false);
+    }
+    let file = file_stat(found);
     tx.execute(
         "UPDATE build_items SET state = 'applied', error = NULL WHERE build_id = ?1 AND seq = ?2",
         params![build, seq],
@@ -209,7 +284,7 @@ fn record_applied(
             build
         ],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn set_item(tx: &Transaction, build: i64, seq: i64, state: ItemState, error: &str) -> Result<()> {
@@ -346,8 +421,8 @@ impl Store {
             .ok_or_else(|| Error::Io(format!("plan {plan_id} has no audit")))?;
         let (folder_row, store) =
             self.read(|c| Ok((folder_by_id(c, content.folder)?, store_id(c)?)))?;
-        let dir =
-            open_folder(config, &folder_row.root, &folder_row.path).map_err(Error::Refused)?;
+        let dir = open_writable_folder(config, &folder_row.root, &folder_row.path)
+            .map_err(Error::Refused)?;
         let expected = Marker {
             store,
             folder: content.folder,
@@ -412,8 +487,12 @@ impl Store {
         *build_id = Some(id);
 
         let folder_io = |e: io::Error| Error::Io(e.to_string());
-        dir.mkdir(STAGING).map_err(folder_io)?;
+        let folder = content.folder;
+        dir.mkdir_private(STAGING).map_err(folder_io)?;
         let staging = dir.sub(STAGING).map_err(folder_io)?;
+        let staging_id = staging.identity().map_err(folder_io)?;
+        record_temp(self, folder, STAGING, staging_id)?;
+        let mut staged_ids = HashMap::new();
         let built_at = SystemTime::now();
         let total = work.len();
         if let Some(progress) = progress {
@@ -425,52 +504,101 @@ impl Store {
         for (done, w) in work.iter().enumerate() {
             let name = format!("{}.zip", w.seq);
             let target = &w.item.target;
-            match stage(w.item, &staging, &name, &set_dir, &set_root, built_at) {
+            let fail = |state: ItemState, error: &str| {
+                self.write(|tx| set_item(tx, id, w.seq, state, error))
+            };
+            let created = staging.create_new(&name).and_then(|file| {
+                let id = Identity::of_fd(&file)?;
+                Ok((file, id))
+            });
+            let (mut file, file_id) = match created {
+                Ok(created) => created,
+                Err(e) => {
+                    fail(ItemState::Failed, &e.to_string())?;
+                    return Err(Error::Io(e.to_string()));
+                }
+            };
+            record_temp(self, folder, &staged_temp(&name), file_id)?;
+            staged_ids.insert(name.clone(), file_id);
+            let staged_path = staging.path().join(&name);
+            match stage(
+                w.item,
+                &mut file,
+                &staged_path,
+                &set_dir,
+                &set_root,
+                built_at,
+            ) {
                 Err(Failure::Item(error)) => {
-                    match staging.unlink(&name) {
-                        Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                            return Err(Error::Io(e.to_string()));
-                        }
-                        _ => {}
+                    drop(file);
+                    if let Err(e) = remove_staged(&staging, &name, file_id) {
+                        fail(ItemState::Failed, &error)?;
+                        return Err(Error::Refused(e));
                     }
-                    self.write(|tx| set_item(tx, id, w.seq, ItemState::Failed, &error))?;
+                    fail(ItemState::Failed, &error)?;
                 }
                 Err(Failure::Folder(error)) => {
-                    self.write(|tx| set_item(tx, id, w.seq, ItemState::Failed, &error))?;
+                    fail(ItemState::Failed, &error)?;
                     return Err(Error::Io(error));
                 }
                 Ok(staged) => {
+                    let (dev, ino) = file_id.to_sql();
                     self.write(|tx| {
                         tx.execute(
-                            "UPDATE build_items SET state = 'publishing', sha256 = ?3, size = ?4
+                            "UPDATE build_items SET state = 'publishing', sha256 = ?3, size = ?4, dev = ?5, ino = ?6
                              WHERE build_id = ?1 AND seq = ?2",
-                            params![id, w.seq, staged.sha256, staged.size as i64],
+                            params![id, w.seq, staged.sha256, staged.size as i64, dev, ino],
                         )?;
                         Ok(())
                     })?;
-                    let renamed = check_marker(&dir, &expected).and_then(|()| {
-                        staging
-                            .rename_new(&name, &dir, target)
-                            .map_err(|e| match e.kind() {
-                                io::ErrorKind::AlreadyExists => format!(
-                                    "{target} appeared in the folder during the build; it was left as it is"
-                                ),
-                                _ => e.to_string(),
-                            })
-                    });
+                    self.fault_point(Fault::BeforePublish(w.seq));
+                    // The file renamed is the one verified: the staged name must still be it, and the target must
+                    // be it once renamed. The verified file stays open until then.
+                    let renamed = check_marker(&dir, &expected)
+                        .and_then(|()| match is_file(&staging, &name, file_id)? {
+                            true => Ok(()),
+                            false => Err(format!(
+                                "{} was replaced after it was verified; it was left as it is",
+                                staged_path.display()
+                            )),
+                        })
+                        .and_then(|()| {
+                            staging
+                                .rename_new(&name, &dir, target)
+                                .map_err(|e| match e.kind() {
+                                    io::ErrorKind::AlreadyExists => format!(
+                                        "{target} appeared in the folder during the build; it was left as it is"
+                                    ),
+                                    _ => e.to_string(),
+                                })
+                        });
                     if let Err(error) = renamed {
-                        self.write(|tx| set_item(tx, id, w.seq, ItemState::Failed, &error))?;
+                        fail(ItemState::Failed, &error)?;
                         return Err(Error::Refused(error));
                     }
                     // From here until the item is recorded applied, recovery settles it from its publish intent.
                     dir.sync().map_err(folder_io)?;
                     self.fault_point(Fault::AfterPublish(w.seq));
-                    let st = dir.stat(target).map_err(folder_io)?.ok_or_else(|| {
-                        Error::Io(format!("{target} vanished once it was in place"))
-                    })?;
-                    self.write(|tx| {
-                        record_applied(tx, id, content.folder, w.seq, w.item, &file_stat(&st))
-                    })?;
+                    let found = dir.stat(target).map_err(folder_io)?;
+                    let applied = match &found {
+                        Some(st) => {
+                            self.write(|tx| record_applied(tx, id, folder, w.seq, w.item, st))?
+                        }
+                        None => {
+                            fail(
+                                ItemState::Uncertain,
+                                &format!("{target} vanished once it was put in place"),
+                            )?;
+                            false
+                        }
+                    };
+                    if !applied {
+                        return Err(Error::Refused(format!(
+                            "{}: {target} is not the file the build put there; it was left as it is",
+                            dir.path().display()
+                        )));
+                    }
+                    drop(file);
                 }
             }
             if let Some(progress) = progress {
@@ -480,33 +608,26 @@ impl Store {
                 });
             }
         }
+        clear_staging(&dir, &staging, staging_id, &staged_ids).map_err(Error::Refused)?;
         drop(staging);
-        clear_staging(&dir).map_err(Error::Io)?;
 
+        // The store decides the next generation first, and the marker follows it; recovery moves a marker that did
+        // not follow forward, and never back.
         check_marker(&dir, &expected).map_err(Error::Refused)?;
+        let key = cited_by(folder);
         self.write(|tx| {
+            let advanced = tx.execute(
+                "UPDATE managed_folders SET generation = ?2, current_build_id = ?3 WHERE id = ?1 AND generation = ?4",
+                params![folder, generation as i64, id, content.generation as i64],
+            )?;
+            if advanced != 1 {
+                return Err(Error::Io(format!(
+                    "managed folder {folder} is no longer at generation {}",
+                    content.generation
+                )));
+            }
             tx.execute(
                 "UPDATE builds SET finalizing_at = ?2 WHERE id = ?1",
-                params![id, now()],
-            )?;
-            Ok(())
-        })?;
-        write_marker(
-            &dir,
-            &Marker {
-                generation,
-                ..expected.clone()
-            },
-        )?;
-        self.fault_point(Fault::AfterMarker);
-        let key = cited_by(content.folder);
-        self.write(|tx| {
-            tx.execute(
-                "UPDATE managed_folders SET generation = ?2, current_build_id = ?3 WHERE id = ?1",
-                params![content.folder, generation as i64, id],
-            )?;
-            tx.execute(
-                "UPDATE builds SET state = 'succeeded', finished_at = ?2, cleaned_at = ?2 WHERE id = ?1",
                 params![id, now()],
             )?;
             tx.execute("DELETE FROM audit_citations WHERE cited_by = ?1", [&key])?;
@@ -522,6 +643,24 @@ impl Store {
                 "INSERT INTO selection_citations (selection_id, cited_by) VALUES (?1, ?2)",
                 params![content.selection, key],
             )?;
+            Ok(())
+        })?;
+        self.fault_point(Fault::AfterFinalize);
+        write_marker(
+            &dir,
+            &Marker {
+                generation,
+                ..expected.clone()
+            },
+            &mut |tmp| record_temp(self, folder, MARKER_NEW, tmp),
+        )?;
+        self.fault_point(Fault::AfterMarker);
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE builds SET state = 'succeeded', finished_at = ?2, cleaned_at = ?2 WHERE id = ?1",
+                params![id, now()],
+            )?;
+            tx.execute("DELETE FROM folder_temps WHERE folder_id = ?1", [folder])?;
             finish_running(tx, job, JobState::Succeeded, None)
         })
     }
@@ -570,6 +709,12 @@ impl Store {
                 "UPDATE builds SET cleaned_at = CASE WHEN ?2 IS NULL THEN ?3 END, recovery_error = ?2 WHERE id = ?1",
                 params![build, error, now()],
             )?;
+            if error.is_none() {
+                tx.execute(
+                    "DELETE FROM folder_temps WHERE folder_id = ?1",
+                    [folder.id],
+                )?;
+            }
             Ok(())
         })?;
         Ok(error)
@@ -583,27 +728,12 @@ impl Store {
         folder: &super::folders::FolderRow,
         store: String,
     ) -> Result<std::result::Result<(), String>> {
-        let dir = match open_folder(config, &folder.root, &folder.path) {
+        let dir = match open_writable_folder(config, &folder.root, &folder.path) {
             Ok(dir) => dir,
             Err(reason) => return Ok(Err(reason)),
         };
-        let rewind = match read_marker(&dir) {
-            MarkerState::Present(m) if m.store == store && m.folder == folder.id => {
-                if m.generation == folder.generation {
-                    false
-                } else if m.generation == folder.generation + 1
-                    && unfinished.generation == m.generation
-                    && unfinished.finalizing
-                {
-                    true
-                } else {
-                    return Ok(Err(format!(
-                        "its marker is at build generation {}, and the store is at {} with no record of build {build} \
-                         advancing it; the folder was left as it is",
-                        m.generation, folder.generation
-                    )));
-                }
-            }
+        let marker = match read_marker(&dir) {
+            MarkerState::Present(m) if m.store == store && m.folder == folder.id => m,
             MarkerState::Present(_) => {
                 return Ok(Err(
                     "its marker is for another folder or another store; the folder was left as it is".into(),
@@ -618,28 +748,39 @@ impl Store {
                 )));
             }
         };
-        let expected = Marker {
-            store,
-            folder: folder.id,
-            generation: if rewind {
-                folder.generation + 1
-            } else {
-                folder.generation
-            },
+        let forward = if marker.generation == folder.generation {
+            false
+        } else if marker.generation + 1 == folder.generation
+            && unfinished.finalizing
+            && unfinished.generation == folder.generation
+            && folder.current_build == Some(build)
+        {
+            true
+        } else if marker.generation > folder.generation {
+            return Ok(Err(format!(
+                "its marker is at build generation {}, ahead of the store's {}, as when the store is restored from a \
+                 backup taken before later builds; the folder was left as it is",
+                marker.generation, folder.generation
+            )));
+        } else {
+            return Ok(Err(format!(
+                "its marker is at build generation {}, behind the store's {} with no record of build {build} \
+                 advancing it; the folder was left as it is",
+                marker.generation, folder.generation
+            )));
         };
+        let temps = self.read(|c| temps(c, folder.id))?;
 
         match dir.stat(MARKER_NEW) {
             Ok(None) => {}
-            Ok(Some(st)) if FolderDir::kind(&st) == rustix::fs::FileType::RegularFile => {
-                if let Err(e) = dir.unlink(MARKER_NEW) {
-                    return Ok(Err(e.to_string()));
+            Ok(Some(_)) => match temps.get(MARKER_NEW) {
+                Some(&id) => {
+                    if let Err(reason) = remove_staged(&dir, MARKER_NEW, id) {
+                        return Ok(Err(reason));
+                    }
                 }
-            }
-            Ok(Some(_)) => {
-                return Ok(Err(format!(
-                    "{MARKER_NEW} is not a file a build wrote; the folder was left as it is"
-                )));
-            }
+                None => return Ok(Err(not_ours(&dir, MARKER_NEW))),
+            },
             Err(e) => return Ok(Err(e.to_string())),
         }
 
@@ -652,7 +793,7 @@ impl Store {
                     .ok_or_else(|| {
                         Error::Io(format!("build {build}: no plan item for {}", p.target))
                     })?;
-                if let Err(reason) = check_marker(&dir, &expected) {
+                if let Err(reason) = check_marker(&dir, &marker) {
                     return Ok(Err(reason));
                 }
                 let found = match dir.open_file(&p.target) {
@@ -660,7 +801,7 @@ impl Store {
                     Err(e) => Some(Err(e.to_string())),
                     Ok(file) => Some(
                         sha256_of(&file)
-                            .and_then(|hash| Ok((hash, stat(&file.metadata()?))))
+                            .and_then(|hash| Ok((hash, rustix::fs::fstat(&file)?)))
                             .map_err(|e| e.to_string()),
                     ),
                 };
@@ -672,10 +813,10 @@ impl Store {
                         ItemState::Failed,
                         "the build stopped before the file was put in place",
                     ),
-                    Some(Ok(((sha256, size), file)))
+                    Some(Ok(((sha256, size), st)))
                         if Some(&sha256) == p.sha256.as_ref() && Some(size as i64) == p.size =>
                     {
-                        record_applied(tx, build, folder.id, p.seq, item, &file)
+                        record_applied(tx, build, folder.id, p.seq, item, &st).map(|_| ())
                     }
                     Some(Ok(_)) => set_item(
                         tx,
@@ -703,19 +844,44 @@ impl Store {
             }
         }
 
-        if let Err(reason) = clear_staging(&dir) {
-            return Ok(Err(reason));
+        match dir.stat(STAGING) {
+            Ok(None) => {}
+            Ok(Some(st)) => {
+                let Some(&own) = temps.get(STAGING) else {
+                    return Ok(Err(not_ours(&dir, STAGING)));
+                };
+                if FolderDir::kind(&st) != rustix::fs::FileType::Directory
+                    || Identity::of(&st) != own
+                {
+                    return Ok(Err(not_ours(&dir, STAGING)));
+                }
+                let staging = match dir.sub(STAGING) {
+                    Ok(staging) => staging,
+                    Err(e) => return Ok(Err(e.to_string())),
+                };
+                let prefix = format!("{STAGING}/");
+                let known: HashMap<String, Identity> = temps
+                    .iter()
+                    .filter_map(|(name, &id)| Some((name.strip_prefix(&prefix)?.to_owned(), id)))
+                    .collect();
+                if let Err(reason) = clear_staging(&dir, &staging, own, &known) {
+                    return Ok(Err(reason));
+                }
+            }
+            Err(e) => return Ok(Err(e.to_string())),
         }
-        if rewind {
-            if let Err(reason) = check_marker(&dir, &expected) {
+
+        if forward {
+            if let Err(reason) = check_marker(&dir, &marker) {
                 return Ok(Err(reason));
             }
             write_marker(
                 &dir,
                 &Marker {
                     generation: folder.generation,
-                    ..expected
+                    ..marker
                 },
+                &mut |tmp| record_temp(self, folder.id, MARKER_NEW, tmp),
             )?;
         }
         Ok(Ok(()))

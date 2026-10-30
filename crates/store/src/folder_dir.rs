@@ -45,6 +45,41 @@ fn component(name: &str) -> io::Result<&str> {
     Ok(name)
 }
 
+/// What a file or directory is, as opposed to the name it is found at: its device and inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Identity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl Identity {
+    // The field types differ by platform.
+    #[allow(clippy::unnecessary_cast)]
+    pub fn of(st: &Stat) -> Identity {
+        Identity {
+            dev: st.st_dev as u64,
+            ino: st.st_ino as u64,
+        }
+    }
+
+    /// The identity of the open `fd`, from `fstat`.
+    pub fn of_fd(fd: impl AsFd) -> io::Result<Identity> {
+        Ok(Identity::of(&rustix::fs::fstat(fd)?))
+    }
+
+    /// As stored in SQLite, which has signed integers only.
+    pub fn to_sql(self) -> (i64, i64) {
+        (self.dev as i64, self.ino as i64)
+    }
+
+    pub fn from_sql(dev: i64, ino: i64) -> Identity {
+        Identity {
+            dev: dev as u64,
+            ino: ino as u64,
+        }
+    }
+}
+
 /// A file's size and modification time, from `lstat`.
 pub(super) fn file_stat(st: &Stat) -> FileStat {
     FileStat {
@@ -98,6 +133,17 @@ impl FolderDir {
     pub fn mkdir(&self, name: &str) -> io::Result<()> {
         let name = component(name)?;
         rustix::fs::mkdirat(&self.fd, name, dir_mode()).map_err(|e| self.error(name, e))
+    }
+
+    /// Creates the directory `name` for this service's user only, failing if anything is there.
+    pub fn mkdir_private(&self, name: &str) -> io::Result<()> {
+        let name = component(name)?;
+        rustix::fs::mkdirat(&self.fd, name, Mode::RWXU).map_err(|e| self.error(name, e))
+    }
+
+    /// The identity of this directory as it was opened.
+    pub fn identity(&self) -> io::Result<Identity> {
+        Identity::of_fd(&self.fd).map_err(|e| with_path(&self.path, e))
     }
 
     /// Creates the new file `name` for reading and writing, failing if anything, a symlink included, is there.

@@ -12,11 +12,12 @@ use title_select_api::build::{
 use title_select_api::paths::{PathTemplate, TokenValues, relative_path};
 
 use super::dats::split_dat;
-use super::folder_dir::FolderDir;
+use super::folder_dir::{FolderDir, Identity};
 use super::profiles::profile_id;
 use super::sets::{resolve, set_by_id, set_by_name};
 use super::{Error, Result, Store, io_error, now};
 use crate::config::Config;
+use rustix::fs::FileType;
 
 /// A Managed Folder's row and what its bindings name.
 #[derive(Debug, Clone)]
@@ -189,6 +190,22 @@ pub(super) fn open_folder(
     })
 }
 
+/// Opens the Managed Folder `rel` in the Root `root` as [`open_folder`] does, for a change: refused unless the
+/// Root is configured `writable = true` now.
+pub(super) fn open_writable_folder(
+    config: &Config,
+    root: &str,
+    rel: &str,
+) -> std::result::Result<FolderDir, String> {
+    if !config.root(root).is_some_and(|r| r.writable) {
+        return Err(format!(
+            "root {root} is not writable now; declare it with writable = true, then restart the service. Nothing \
+             in the folder was changed"
+        ));
+    }
+    open_folder(config, root, rel)
+}
+
 /// The temp file a marker is written to before it is renamed over the marker.
 pub(super) const MARKER_NEW: &str = ".title-select.new";
 
@@ -201,21 +218,43 @@ pub(super) fn is_own(name: &str) -> bool {
 }
 
 /// Replaces the folder's marker atomically and durably. The new marker is written to a file created exclusively and
-/// without following a symlink, so anything already at [`MARKER_NEW`] makes it fail.
-pub(super) fn write_marker(dir: &FolderDir, marker: &Marker) -> Result<()> {
+/// without following a symlink, so anything already at [`MARKER_NEW`] makes it fail. `record` is given the temp
+/// file's identity as soon as it exists, before anything relies on it; the temp file is renamed over the marker
+/// only while it is still that file, and the marker must then be that file.
+pub(super) fn write_marker(
+    dir: &FolderDir,
+    marker: &Marker,
+    record: &mut dyn FnMut(Identity) -> Result<()>,
+) -> Result<()> {
     let mut json = serde_json::to_vec_pretty(marker).expect("a marker always serializes");
     json.push(b'\n');
     let tmp = dir.path().join(MARKER_NEW);
     let mut file = dir
         .create_new(MARKER_NEW)
         .map_err(|e| Error::Io(e.to_string()))?;
+    let id = Identity::of_fd(&file).map_err(|e| io_error(&tmp, e))?;
+    record(id)?;
     file.write_all(&json)
         .and_then(|()| file.sync_all())
         .map_err(|e| io_error(&tmp, e))?;
-    drop(file);
+    let is_ours = |name: &str| -> Result<()> {
+        match dir.stat(name).map_err(|e| Error::Io(e.to_string()))? {
+            Some(st)
+                if FolderDir::kind(&st) == FileType::RegularFile && Identity::of(&st) == id =>
+            {
+                Ok(())
+            }
+            _ => Err(Error::Refused(format!(
+                "{}: {name} was replaced while the marker was written; the folder was left as it is",
+                dir.path().display()
+            ))),
+        }
+    };
+    is_ours(MARKER_NEW)?;
     dir.replace(MARKER_NEW, MARKER)
         .and_then(|()| dir.sync())
-        .map_err(|e| Error::Io(e.to_string()))
+        .map_err(|e| Error::Io(e.to_string()))?;
+    is_ours(MARKER)
 }
 
 /// What a Managed Folder's marker says.
@@ -425,6 +464,8 @@ impl Store {
                     folder: id,
                     generation: 0,
                 },
+                // A folder whose registration stopped is not registered, so nothing is ever removed from it.
+                &mut |_| Ok(()),
             )?;
             record(tx, config, folder_by_id(tx, id)?)
         })
