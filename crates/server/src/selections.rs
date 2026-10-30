@@ -95,3 +95,32 @@ impl Drop for PreviewGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_newer_preview_cancels_the_older_one_of_the_same_actor_only() {
+        let previews = Arc::new(Previews::default());
+        let older = previews.start("someone");
+        let other = previews.start("someone else");
+        let newer = previews.start("someone");
+
+        assert!(older.flag().load(Ordering::Relaxed));
+        assert!(!newer.flag().load(Ordering::Relaxed));
+        assert!(!other.flag().load(Ordering::Relaxed));
+        drop(older);
+        assert!(
+            previews.0.lock().unwrap().contains_key("someone"),
+            "the older guard leaves the newer preview registered"
+        );
+        let flag = newer.flag();
+        drop(newer);
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "a dropped request kills its run"
+        );
+        assert!(!previews.0.lock().unwrap().contains_key("someone"));
+    }
+}

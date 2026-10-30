@@ -565,3 +565,60 @@ pub struct Rule {
     pub reference: Option<String>,
     pub message: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(titles: &[&str]) -> BTreeSet<String> {
+        titles.iter().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn a_choice_is_stored_only_where_it_differs_from_the_picks_or_confirms_an_unresolved_group() {
+        let mut profile = SelectionProfile::default();
+        let picks = set(&["Pong (USA)"]);
+
+        profile.set_choice("Atari", "pong", picks.clone(), &picks, false);
+        assert!(profile.choices.is_empty());
+        profile.set_choice("Atari", "pong", set(&["Pong (Europe)"]), &picks, false);
+        profile.set_choice("Atari", "combat", set(&[]), &set(&["Combat (USA)"]), false);
+        profile.set_choice(
+            "Atari",
+            "maze",
+            set(&["Maze (USA)"]),
+            &set(&["Maze (USA)"]),
+            true,
+        );
+        assert_eq!(profile.choices["Atari"].len(), 3);
+
+        profile.set_choice("Atari", "pong", picks.clone(), &picks, false);
+        assert!(
+            !profile.choices["Atari"].contains_key("pong"),
+            "back to the picks"
+        );
+    }
+
+    #[test]
+    fn choices_reset_per_group_per_system_and_for_the_whole_profile() {
+        let mut profile = SelectionProfile::default();
+        let none = BTreeSet::new();
+        for (system, group) in [("Atari", "pong"), ("Atari", "combat"), ("Coleco", "zaxxon")] {
+            profile.set_choice(system, group, set(&["x"]), &none, false);
+        }
+
+        profile.reset_choices("Atari", Some("pong"));
+        assert_eq!(
+            profile.choices["Atari"].keys().collect::<Vec<_>>(),
+            ["combat"]
+        );
+        profile.reset_choices("Atari", None);
+        assert!(!profile.choices.contains_key("Atari"));
+        profile.reset_all_choices();
+        assert!(profile.choices.is_empty());
+        assert_eq!(
+            profile.canonical_json(),
+            SelectionProfile::default().canonical_json()
+        );
+    }
+}
