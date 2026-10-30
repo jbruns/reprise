@@ -249,9 +249,14 @@ fn Versions(name: String) -> impl IntoView {
     }
 }
 
-/// Runs `f` once edits have paused for [`DEBOUNCE`].
+/// Runs `f` once edits have paused for [`DEBOUNCE`], unless the editor is gone by then.
 fn debouncer(f: impl Fn() + Clone + 'static) -> impl Fn() + Clone + 'static {
     let pending = StoredValue::new(None::<TimeoutHandle>);
+    on_cleanup(move || {
+        if let Some(Some(handle)) = pending.try_get_value() {
+            handle.clear();
+        }
+    });
     move || {
         if let Some(handle) = pending.get_value() {
             handle.clear();
@@ -330,7 +335,8 @@ fn Editor(name: Option<String>, initial: Option<ProfileVersion>) -> impl IntoVie
         running.set(true);
         leptos::task::spawn_local(async move {
             let result = api::post::<_, Preview>("/preview", &request).await;
-            if sequence.get_value() != n {
+            // A newer preview superseded this one, or the editor is gone.
+            if sequence.try_get_value() != Some(n) {
                 return;
             }
             running.set(false);

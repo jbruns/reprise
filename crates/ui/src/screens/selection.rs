@@ -890,7 +890,7 @@ fn GroupPanel(
                         let excluded = role == Role::Exclusion;
                         view! {
                             <li class="release">
-                                <label>
+                                <label class="inline">
                                     <input
                                         type="checkbox"
                                         disabled=excluded

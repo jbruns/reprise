@@ -83,8 +83,7 @@ impl Grid for JobItem {
     fn class(col: JobCol) -> &'static str {
         match col {
             JobCol::Id => "c-id data",
-            JobCol::Kind => "c-state",
-            JobCol::Result => "c-actor",
+            JobCol::Kind | JobCol::Result => "c-kind",
             JobCol::State => "c-state",
             JobCol::SourceSet | JobCol::Progress => "c-wide",
             JobCol::DatRevision => "c-hash data",
