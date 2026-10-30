@@ -179,28 +179,28 @@ pub fn DatRevisions() -> impl IntoView {
     };
 
     view! {
-        <h1>"DAT Revisions"</h1>
+        <h1>"DAT revisions"</h1>
         <p class="lede">
-            "Each import of a DAT file is a DAT Revision, named by its SHA-256. Newest import first within each DAT."
+            "Each import of a DAT file is a DAT revision, named by its SHA-256. Newest import first within each DAT."
         </p>
         {move || match items.get() {
-            None => view! { <Loading what="the DAT Revisions" /> }.into_any(),
+            None => view! { <Loading what="the DAT revisions" /> }.into_any(),
             Some(Err(message)) => view! { <Problem message /> }.into_any(),
             Some(Ok(_)) => ().into_any(),
         }}
         <DataTable
             id="dat-revisions"
-            label="DAT Revisions".to_string()
+            label="DAT revisions".to_string()
             rows
             sorting
             selected
             on_open=Callback::new(|_| focus("revision-detail"))
-            empty="No DAT Revisions yet. Upload a DAT below.".to_string()
+            empty="No DAT revisions yet. Upload a DAT below.".to_string()
         />
-        <section class="detail" id="revision-detail" tabindex="-1" aria-label="Selected DAT Revision">
+        <section class="detail" id="revision-detail" tabindex="-1" aria-label="Selected DAT revision">
             {move || match detail() {
                 Some(view) => view,
-                None => view! { <p class="note">"Select a DAT Revision to see its provenance."</p> }.into_any(),
+                None => view! { <p class="note">"Select a DAT revision to see its provenance."</p> }.into_any(),
             }}
         </section>
         <Upload on_done=Callback::new(move |_| uploaded.update(|n| *n += 1)) />
@@ -236,13 +236,13 @@ fn revision_detail(item: RevisionItem) -> AnyView {
                 {if r.blob_present {
                     "Kept in the store"
                 } else {
-                    "Deleted from the store; the DAT Revision is still recorded, and uploading the same file again restores it"
+                    "Deleted from the store; the DAT revision is still recorded, and uploading the same file again restores it"
                 }}
             </dd>
             <dt>"Audits"</dt>
             <dd>
                 {if item.used_by.is_empty() {
-                    view! { "No Audit refers to it" }.into_any()
+                    view! { "No audit refers to it" }.into_any()
                 } else {
                     view! {
                         <ul>
@@ -323,9 +323,9 @@ fn Upload(on_done: Callback<()>) -> impl IntoView {
                         Ok(imported) => {
                             let r = imported.dat_revision;
                             let what = match imported.outcome {
-                                ImportOutcome::Added => "Added DAT Revision",
-                                ImportOutcome::AlreadyImported => "Already imported: DAT Revision",
-                                ImportOutcome::Restored => "Restored the kept file of DAT Revision",
+                                ImportOutcome::Added => "Added DAT revision",
+                                ImportOutcome::AlreadyImported => "Already imported: DAT revision",
+                                ImportOutcome::Restored => "Restored the kept file of DAT revision",
                             };
                             view! {
                                 <p class="done" role="status">

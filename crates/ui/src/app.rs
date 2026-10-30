@@ -25,8 +25,8 @@ pub fn App() -> impl IntoView {
                     "Title Select"
                 </a>
                 <nav aria-label="Workbench">
-                    <A href="/source-sets">"Source Sets"</A>
-                    <A href="/dat-revisions">"DAT Revisions"</A>
+                    <A href="/source-sets">"Source sets"</A>
+                    <A href="/dat-revisions">"DAT revisions"</A>
                     <A href="/jobs">"Jobs"</A>
                 </nav>
                 <StreamStatus />
@@ -54,7 +54,7 @@ fn StreamStatus() -> impl IntoView {
         <p class="stream" aria-live="polite">
             <span class=move || format!("dot {}", live.stream.get().label().to_lowercase())></span>
             {move || match live.stream.get() {
-                Stream::Live => format!("Live · {} Jobs active", active()),
+                Stream::Live => format!("Live · {} jobs active", active()),
                 other => other.label().to_string(),
             }}
         </p>

@@ -43,7 +43,7 @@ impl Derived {
     pub fn label(self) -> &'static str {
         match self {
             Derived::Verified => "Verified",
-            Derived::NeedsReview => "Needs Review",
+            Derived::NeedsReview => "Needs review",
         }
     }
 }

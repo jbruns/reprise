@@ -67,8 +67,8 @@ impl Grid for JobItem {
         match col {
             JobCol::Id => "Job",
             JobCol::State => "State",
-            JobCol::SourceSet => "Source Set",
-            JobCol::DatRevision => "DAT Revision",
+            JobCol::SourceSet => "Source set",
+            JobCol::DatRevision => "DAT revision",
             JobCol::Progress => "Progress",
             JobCol::Actor => "Started by",
             JobCol::Created => "Queued",
@@ -172,7 +172,7 @@ pub fn Jobs() -> impl IntoView {
             }}
         </p>
         {move || match history.get() {
-            None => view! { <Loading what="the Jobs" /> }.into_any(),
+            None => view! { <Loading what="the jobs" /> }.into_any(),
             Some(Err(message)) => view! { <Problem message /> }.into_any(),
             Some(Ok(_)) => ().into_any(),
         }}
@@ -183,12 +183,12 @@ pub fn Jobs() -> impl IntoView {
             sorting
             selected
             on_open=Callback::new(|_| crate::screens::audit::focus("job-detail"))
-            empty="No Jobs yet. Start an Audit from a Source Set.".to_string()
+            empty="No jobs yet. Start an audit from a source set.".to_string()
         />
-        <section class="detail" id="job-detail" tabindex="-1" aria-label="Selected Job">
+        <section class="detail" id="job-detail" tabindex="-1" aria-label="Selected job">
             {move || match detail() {
                 Some(view) => view,
-                None => view! { <p class="note">"Select a Job to see its details."</p> }.into_any(),
+                None => view! { <p class="note">"Select a job to see its details."</p> }.into_any(),
             }}
         </section>
     }
@@ -202,11 +202,11 @@ fn job_detail(live: &LiveJob) -> AnyView {
         <dl class="facts">
             <dt>"State"</dt>
             <dd>{state_view(job.state)} " " {progress_view(live)}</dd>
-            <dt>"Source Set"</dt>
+            <dt>"Source set"</dt>
             <dd>
                 <A href=set_href>{job.source_set.clone()}</A>
             </dd>
-            <dt>"DAT Revision"</dt>
+            <dt>"DAT revision"</dt>
             <dd>
                 <code class="hash">{job.dat_revision.clone()}</code>
             </dd>
@@ -215,7 +215,7 @@ fn job_detail(live: &LiveJob) -> AnyView {
             <dt>"Attempt"</dt>
             <dd>
                 {job.attempt}
-                {job.requeued_from.map(|from| format!(", queued again for interrupted Job #{from}"))}
+                {job.requeued_from.map(|from| format!(", queued again for interrupted job #{from}"))}
             </dd>
             <dt>"Workers"</dt>
             <dd>{format!("{} payload readers, {} hash workers", job.workers.readers, job.workers.hashers)}</dd>
