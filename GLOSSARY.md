@@ -116,3 +116,14 @@ Play Library. Approval to repair a Source Set is separate from approval to build
 **Build**:
 Applying an approved Change Plan that creates or updates a Play Library from a Selection's files in a Source Set.
 _Avoid_: Publish, export
+
+**Managed Folder**:
+A Play Library folder that the Operator registers for Title Select to build into, identified by its Root and a path
+relative to it, and bound to one system, one Source Set and one Selection Profile. Title Select writes only to
+Managed Folders; every other Play Library file is unmanaged and never touched. A system may have several.
+_Avoid_: Output folder, target
+
+**Path Template**:
+A pattern of tokens, such as `{provider}/{dat}` or `{platform}`, that proposes the path of a Source Set or Managed
+Folder at registration. It only proposes: a registered path never moves when a template changes.
+_Avoid_: Naming scheme
