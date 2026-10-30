@@ -6,9 +6,68 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
 use title_select_api::{
-    ErrorBody, Finding, GameStatus, Job, JobEvent, JobProgress, JobState, PREFIX, Report,
+    ErrorBody, Finding, GameStatus, Health, Job, JobEvent, JobProgress, JobState, PREFIX, Report,
     SSE_KEEP_ALIVE, StartAudit,
 };
+
+/// Succeeds only when `url` answers 200 with `{"status": "ok"}` within `timeout`. The reason for a failure is one
+/// line, whatever the URL or the answer holds.
+pub fn health(url: &str, timeout: Duration) -> Result<(), String> {
+    check_health(url, timeout).map_err(|e| {
+        let mut line = String::new();
+        for c in e.chars() {
+            if c.is_control() {
+                line.extend(c.escape_default());
+            } else {
+                line.push(c);
+            }
+        }
+        line
+    })
+}
+
+fn check_health(url: &str, timeout: Duration) -> Result<(), String> {
+    const SHOWN: usize = 200;
+    // A container-local check: never follow a redirect elsewhere or go through the environment's proxy.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None)
+        .timeout_global(Some(timeout))
+        .build()
+        .into();
+    let mut response = agent.get(url).call().map_err(|e| match e {
+        ureq::Error::Timeout(_) => format!(
+            "the Service at {url} did not answer within {} s",
+            timeout.as_secs()
+        ),
+        e => format!("cannot reach the Service at {url}: {e}"),
+    })?;
+    let status = response.status();
+    if status != ureq::http::StatusCode::OK {
+        return Err(format!("the Service at {url} answered {status}"));
+    }
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(64 * 1024)
+        .read_to_string()
+        .map_err(|e| format!("cannot read the Service's answer at {url}: {e}"))?;
+    match serde_json::from_str::<Health>(&body) {
+        Ok(health) if health.status == "ok" => Ok(()),
+        _ => {
+            let shown: String = body.trim().chars().take(SHOWN).collect();
+            let more = if body.trim().chars().count() > SHOWN {
+                "…"
+            } else {
+                ""
+            };
+            Err(format!(
+                "the Service at {url} is not healthy: {shown:?}{more}"
+            ))
+        }
+    }
+}
 
 pub struct Request<'a> {
     pub server: &'a str,

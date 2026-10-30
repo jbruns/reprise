@@ -133,3 +133,109 @@ fn the_headless_client_fails_on_a_wrong_token_an_unreachable_server_or_a_failed_
     assert!(stderr(&failed).contains("failed"), "{}", stderr(&failed));
     assert!(failed.stdout.is_empty());
 }
+
+fn health(url: &str) -> Output {
+    health_with(url, &[])
+}
+
+fn health_with(url: &str, env: &[(&str, &str)]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_title-select"))
+        .args(["health", "--timeout", "1", "--url", url])
+        .envs(env.iter().copied())
+        .output()
+        .unwrap()
+}
+
+/// A server that answers its first request with `response`, then closes.
+fn answering(response: String) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/api/v1/health", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = stream.read(&mut [0; 4096]);
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    url
+}
+
+fn ok_with_body(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn closed_port() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{addr}")
+}
+
+#[test]
+fn health_exits_0_quietly_against_a_running_service_ignoring_proxy_settings() {
+    let env = Env::new();
+    let url = format!("{}/api/v1/health", env.service.url());
+    let proxy = closed_port();
+
+    for out in [
+        health(&url),
+        health_with(
+            &url,
+            &[
+                ("HTTP_PROXY", &proxy),
+                ("http_proxy", &proxy),
+                ("ALL_PROXY", &proxy),
+                ("all_proxy", &proxy),
+            ],
+        ),
+    ] {
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(out.stdout.is_empty());
+        assert!(out.stderr.is_empty());
+    }
+}
+
+#[test]
+fn health_exits_1_with_a_one_line_reason_when_the_service_is_not_healthy() {
+    let closed_url = format!("{}/api/v1/health", closed_port());
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let silent_url = format!("http://{}/api/v1/health", silent.local_addr().unwrap());
+    let not_found = answering("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".into());
+    let healthy = answering(ok_with_body(r#"{"status": "ok"}"#));
+    let redirect = answering(format!(
+        "HTTP/1.1 302 Found\r\nLocation: {healthy}\r\nContent-Length: 0\r\n\r\n"
+    ));
+    let wrong_body = answering(ok_with_body(r#"{"status": "failed"}"#));
+    let long_body = answering(ok_with_body(&format!("failed\n{}", "x".repeat(10_000))));
+    let newline_url = format!("{closed_url}\nsecond line");
+
+    for (url, reason) in [
+        (&closed_url, "cannot reach"),
+        (&silent_url, "did not answer"),
+        (&not_found, "404"),
+        (&redirect, "302"),
+        (&wrong_body, "failed"),
+        (&long_body, "failed"),
+        (&newline_url, "second line"),
+    ] {
+        let out = health(url);
+        assert_eq!(out.status.code(), Some(1), "{url}: {}", stderr(&out));
+        assert!(out.stdout.is_empty());
+        let err = stderr(&out);
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(err.len() < 500, "{err}");
+        assert!(err.contains(reason), "{url}: {err}");
+    }
+}
+
+#[test]
+fn health_refuses_a_timeout_out_of_range() {
+    let out = Command::new(env!("CARGO_BIN_EXE_title-select"))
+        .args(["health", "--timeout", "18446744073709551615"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}

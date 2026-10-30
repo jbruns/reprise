@@ -76,6 +76,16 @@ enum Command {
         #[arg(long, env = "TITLE_SELECT_UI")]
         ui: Option<PathBuf>,
     },
+    /// Check that a Service is up, for a container healthcheck. Prints nothing on success; exits 1 with the
+    /// reason on stderr otherwise.
+    Health {
+        /// The Service's health endpoint.
+        #[arg(long, default_value = "http://127.0.0.1:8080/api/v1/health")]
+        url: String,
+        /// Seconds to wait for the whole check, from 1 to 300.
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=300))]
+        timeout: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -198,6 +208,9 @@ fn run(cli: Cli) -> Result<(), String> {
                 hold_jobs: false,
             })
             .map_err(|e| e.to_string())
+        }
+        Command::Health { url, timeout } => {
+            client::health(&url, std::time::Duration::from_secs(timeout))
         }
         Command::Dat {
             command:
