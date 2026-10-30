@@ -17,9 +17,10 @@ use serde::Deserialize;
 use title_select_api::selection::{Role, SelectionProfile, diff_rows};
 use title_select_api::{
     AddSourceSet, Availability, CreateProfile, Dat, ErrorBody, Finding, GameStatus, Health,
-    ImportedDatRevision, JobEvent, JobSnapshot, Page, Preview, PreviewRequest, ProfileCheck,
-    ProfileRecord, ProfileVersion, Root, SSE_KEEP_ALIVE, SaveProfile, SavedProfile, SelectionDiff,
-    SelectionRecord, SelectionReleaseRow, StartAudit, StartSelection, Vocabulary,
+    ImportedDatRevision, JobEvent, JobSnapshot, Page, PathTemplateDefaults, Preview,
+    PreviewRequest, ProfileCheck, ProfileRecord, ProfileVersion, Root, SSE_KEEP_ALIVE, SaveProfile,
+    SavedProfile, SelectionDiff, SelectionRecord, SelectionReleaseRow, StartAudit, StartSelection,
+    Vocabulary,
 };
 use title_select_selection::Engine;
 use title_select_store::config::Config;
@@ -68,6 +69,7 @@ pub fn router(state: AppState, auth: Arc<Auth>, ui: Option<&std::path::Path>) ->
                 .post(upload_dat)
                 .layer(DefaultBodyLimit::max(UPLOAD_LIMIT)),
         )
+        .route("/path-templates", get(path_templates))
         .route("/source-sets", get(source_sets).post(add_source_set))
         .route("/source-sets/{name}", get(source_set))
         .route("/source-sets/{name}/history", get(history))
@@ -324,6 +326,14 @@ async fn upload_dat(
     ))
 }
 
+async fn path_templates(State(state): State<AppState>) -> Json<PathTemplateDefaults> {
+    let templates = &state.config.path_templates;
+    Json(PathTemplateDefaults {
+        source_set: templates.source_set.to_string(),
+        managed_folder: templates.managed_folder.to_string(),
+    })
+}
+
 async fn source_sets(
     State(state): State<AppState>,
 ) -> ApiResult<Json<Vec<title_select_api::SourceSetRecord>>> {
@@ -337,7 +347,16 @@ async fn add_source_set(
     let Json(add) = body?;
     let config = state.config.clone();
     let record = blocking(&state, move |store| {
-        store.add_source_set(&config, &add.root, &add.path, &add.dat)
+        let path = match (add.path, add.template) {
+            (Some(_), Some(_)) => {
+                return Err(Error::Refused("give a path or a template, not both".into()));
+            }
+            (Some(path), None) => path,
+            (None, template) => {
+                store.propose_source_set_path(&config, &add.dat, template.as_deref())?
+            }
+        };
+        store.add_source_set(&config, &add.root, &path, &add.dat)
     })
     .await?;
     Ok((StatusCode::CREATED, Json(record)))

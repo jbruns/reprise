@@ -7,8 +7,9 @@ use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 use leptos_struct_table::ColumnSort;
 use title_select_api::{
-    AddSourceSet, AuditSummary, Dat, DatRevisionRecord, Finding, GameStatus, Job, ProfileRecord,
-    Root, SelectionRecord, SourceSetRecord, StartAudit, StartSelection,
+    AddSourceSet, AuditSummary, Dat, DatRevisionRecord, Finding, GameStatus, Job,
+    PathTemplateDefaults, ProfileRecord, Root, SelectionRecord, SourceSetRecord, StartAudit,
+    StartSelection,
 };
 
 use crate::api;
@@ -17,6 +18,7 @@ use crate::events::use_live;
 use crate::model::{
     audit_choices, finding_label, game_status_label, needs_review_from_counts, short_sha, when,
 };
+use crate::registration;
 use crate::screens::audit::{ReAudit, queued};
 use crate::screens::selection::SelectionQueued;
 use crate::table::{DataTable, Grid, Rows, rows_of, sort_of};
@@ -172,17 +174,58 @@ pub fn SourceSets() -> impl IntoView {
 fn Register(on_added: Callback<String>) -> impl IntoView {
     let roots = LocalResource::new(|| api::get::<Vec<Root>>("/roots"));
     let dats = LocalResource::new(|| api::get::<Vec<Dat>>("/dats"));
+    let defaults = LocalResource::new(|| api::get::<PathTemplateDefaults>("/path-templates"));
     let root = RwSignal::new(String::new());
-    let path = RwSignal::new(String::new());
     let dat = RwSignal::new(String::new());
+    let template = RwSignal::new(None::<String>);
+    // The path you typed over the proposal; `None` follows the template.
+    let typed = RwSignal::new(None::<String>);
     let problem = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
 
+    let proposal = Memo::new(move |_| {
+        let Some(template) = template.get() else {
+            return Err("Loading the path template…".to_string());
+        };
+        let dat = dat.get();
+        let dats = dats.get().and_then(Result::ok).unwrap_or_default();
+        match dats.iter().find(|d| d.dat == dat) {
+            Some(d) => registration::propose(&template, d),
+            None => Err("Choose a DAT to propose a path.".to_string()),
+        }
+    });
+    let path = Memo::new(move |_| {
+        registration::chosen_path(typed.get().as_deref(), &proposal.get()).unwrap_or_default()
+    });
+    let preview = move || {
+        let root_path = roots
+            .get()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|r| r.name == root.get())
+            .map(|r| r.path)
+            .unwrap_or_default();
+        let proposal = proposal.get();
+        match (typed.get(), &proposal) {
+            (None, Err(reason)) => Err(reason.clone()),
+            _ => registration::preview(&root_path, &path.get()),
+        }
+    };
+
     let submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
+        let chosen = path.get_untracked();
+        if chosen.trim().is_empty() {
+            problem.set(Some(
+                "Type a path, or change the template so it proposes one.".into(),
+            ));
+            return;
+        }
         let request = AddSourceSet {
             root: root.get_untracked(),
-            path: path.get_untracked().trim().to_string(),
+            path: Some(chosen),
+            template: None,
             dat: dat.get_untracked(),
         };
         busy.set(true);
@@ -212,6 +255,13 @@ fn Register(on_added: Callback<String>) -> impl IntoView {
             dat.set(first.dat.clone());
         }
     });
+    Effect::new(move || {
+        if let Some(Ok(defaults)) = defaults.get()
+            && template.get_untracked().is_none()
+        {
+            template.set(Some(defaults.source_set));
+        }
+    });
 
     view! {
         <section aria-labelledby="register-title">
@@ -235,16 +285,6 @@ fn Register(on_added: Callback<String>) -> impl IntoView {
                     </select>
                 </label>
                 <label>
-                    "Path in the root"
-                    <input
-                        type="text"
-                        required
-                        placeholder="Atari - 2600"
-                        prop:value=path
-                        on:input=move |ev| path.set(event_target_value(&ev))
-                    />
-                </label>
-                <label>
                     "DAT"
                     <select required prop:value=dat on:change=move |ev| dat.set(event_target_value(&ev))>
                         {move || {
@@ -257,10 +297,51 @@ fn Register(on_added: Callback<String>) -> impl IntoView {
                         }}
                     </select>
                 </label>
+                <label>
+                    "Path template"
+                    <input
+                        type="text"
+                        class="data"
+                        title="Tokens: {provider}, {dat} and {platform}"
+                        prop:value=move || template.get().unwrap_or_default()
+                        on:input=move |ev| template.set(Some(event_target_value(&ev)))
+                    />
+                </label>
+                <label>
+                    "Path in the root"
+                    <input
+                        type="text"
+                        class="data"
+                        placeholder="Type a path"
+                        prop:value=path
+                        on:input=move |ev| typed.set(Some(event_target_value(&ev)))
+                    />
+                </label>
+                {move || {
+                    (typed.get().is_some() && proposal.get().is_ok())
+                        .then(|| {
+                            view! {
+                                <button type="button" on:click=move |_| typed.set(None)>
+                                    "Use the proposed path"
+                                </button>
+                            }
+                        })
+                }}
                 <button type="submit" class="primary" disabled=busy>
                     "Register"
                 </button>
             </form>
+            <p class="note" aria-live="polite">
+                {move || match preview() {
+                    Ok(folder) => view! { "Registers " <code>{folder}</code> }.into_any(),
+                    Err(reason) => reason.into_any(),
+                }}
+            </p>
+            <p class="note small">
+                "The path template proposes a path from the DAT: {provider} is its provider, {dat} its name and \
+                {platform} its front-end folder name. Change the template or type over the path. A registered \
+                source set keeps its path when the template changes."
+            </p>
             {move || problem.get().map(|message| view! { <Problem message /> })}
         </section>
     }

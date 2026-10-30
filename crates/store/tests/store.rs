@@ -231,6 +231,77 @@ fn a_source_set_is_named_by_its_folder_and_bound_to_its_dat() {
 }
 
 #[test]
+fn the_source_set_template_proposes_a_path_that_registration_checks() {
+    let env = Env::new(20);
+    env.import(1);
+
+    let proposed = env
+        .store
+        .propose_source_set_path(&env.config, "No-Intro/Test - System", None)
+        .unwrap();
+    assert_eq!(proposed, SET, "the default is {{provider}}/{{dat}}");
+    let set = env
+        .store
+        .add_source_set(&env.config, "sets", &proposed, "No-Intro/Test - System")
+        .unwrap();
+    assert_eq!(
+        (set.name.as_str(), set.path.as_str()),
+        ("Test - System", SET)
+    );
+
+    let overridden = env
+        .store
+        .propose_source_set_path(&env.config, "No-Intro/Test - System", Some("Mine/{dat}"))
+        .unwrap();
+    assert_eq!(overridden, "Mine/Test - System");
+    for (dat, template) in [
+        ("No-Intro/Test - System", Some("{platform}")),
+        ("No-Intro/Test - System", Some("../{dat}")),
+        ("No-Intro/Test - System", Some("{system}")),
+        ("No-Intro/Other", None),
+    ] {
+        let refused = env
+            .store
+            .propose_source_set_path(&env.config, dat, template);
+        assert!(
+            matches!(refused, Err(Error::Refused(_))),
+            "{template:?}: {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn a_changed_template_leaves_existing_source_sets_where_they_are() {
+    let env = Env::new(20);
+    env.import(1);
+    std::fs::create_dir_all(env.root().join("Atari - 2600")).unwrap();
+    env.store
+        .add_source_set(
+            &env.config,
+            "sets",
+            "Atari - 2600",
+            "No-Intro/Test - System",
+        )
+        .unwrap();
+    let before = env.store.source_sets().unwrap();
+    let changed = Config::parse(&format!(
+        "[roots.sets]\npath = {:?}\n\n[path_templates]\nsource_set = \"Elsewhere/{{dat}}\"\n",
+        env.root().display().to_string()
+    ))
+    .unwrap();
+
+    let proposed = env
+        .store
+        .propose_source_set_path(&changed, "No-Intro/Test - System", None)
+        .unwrap();
+    let (_tmp, store) = env.reopen();
+
+    assert_eq!(proposed, "Elsewhere/Test - System");
+    assert_eq!(store.source_sets().unwrap(), before);
+    assert_eq!(before[0].path, "Atari - 2600");
+}
+
+#[test]
 fn the_default_revision_is_the_latest_audits_else_the_newest_imported() {
     let env = Env::new(20);
     let (first, _) = env.import(1);

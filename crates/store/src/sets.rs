@@ -1,12 +1,13 @@
 //! The Source Set registry: each Source Set is a Root plus a relative path, bound to a DAT.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::dats::split_dat;
 use super::{Error, Result, Store, now};
 use crate::config::Config;
+use title_select_api::paths::{PathTemplate, TokenValues, relative_path};
 
 pub use title_select_api::{LastVerified, SourceSetRecord};
 
@@ -83,39 +84,13 @@ pub(super) fn resolve(config: &Config, root: &str, rel: &str) -> Result<Resolved
     let root_config = config
         .root(root)
         .ok_or_else(|| Error::Refused(format!("no root named {root} is configured")))?;
-    let rel_path = Path::new(rel);
-    if rel_path.has_root() || rel_path.is_absolute() {
-        return Err(Error::Refused(format!(
-            "{rel}: a source set's path must be relative to its root"
-        )));
-    }
-    let mut parts = Vec::new();
-    for component in rel_path.components() {
-        match component {
-            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                return Err(Error::Refused(format!(
-                    "{rel}: a source set's path must not contain `..`"
-                )));
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(Error::Refused(format!(
-                    "{rel}: a source set's path must be relative to its root"
-                )));
-            }
-        }
-    }
-    if parts.is_empty() {
-        return Err(Error::Refused(
-            "a source set's path must name a folder inside its root".into(),
-        ));
-    }
+    let rel = relative_path(rel)
+        .map_err(|e| Error::Refused(format!("{rel}: a source set's path {e}")))?;
     let canonical_root = root_config.path.canonicalize().map_err(|e| {
         Error::Refused(format!("root {root} ({}): {e}", root_config.path.display()))
     })?;
-    let configured = parts
-        .iter()
+    let configured = rel
+        .split('/')
         .fold(root_config.path.clone(), |p, part| p.join(part));
     let canonical = configured
         .canonicalize()
@@ -132,13 +107,40 @@ pub(super) fn resolve(config: &Config, root: &str, rel: &str) -> Result<Resolved
         )));
     }
     Ok(Resolved {
-        rel: parts.join("/"),
+        rel,
         path: configured,
         canonical_root,
     })
 }
 
 impl Store {
+    /// The path a Path Template proposes for a Source Set bound to `dat` (`<provider>/<name>`): `template` if given,
+    /// else the configured default. The path is not checked against any Root: registering it does that.
+    pub fn propose_source_set_path(
+        &self,
+        config: &Config,
+        dat: &str,
+        template: Option<&str>,
+    ) -> Result<String> {
+        let template = match template {
+            Some(text) => PathTemplate::parse(text).map_err(|e| Error::Refused(e.to_string()))?,
+            None => config.path_templates.source_set.clone(),
+        };
+        let (provider, dat_name) = split_dat(dat)?;
+        self.read(|c| {
+            c.query_row(
+                "SELECT 1 FROM dats WHERE provider = ?1 AND name = ?2",
+                params![provider, dat_name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .ok_or_else(|| Error::Refused(format!("no DAT {dat} has been imported")))
+        })?;
+        template
+            .render(&TokenValues::for_dat(provider, dat_name))
+            .map_err(|e| Error::Refused(e.to_string()))
+    }
+
     /// Registers the folder `rel` in the Root `root` as a Source Set bound to `dat` (`<provider>/<name>`).
     pub fn add_source_set(
         &self,
