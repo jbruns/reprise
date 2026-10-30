@@ -10,10 +10,13 @@ use title_select_api::{Job, JobKind, JobState, ProfileVersionRef, Workers};
 use title_select_engine::Progress;
 
 /// Why a restart Interrupted a Job.
-const INTERRUPTED: &str = "the Service stopped while the job was running";
+const INTERRUPTED: &str = "the service stopped while the job was running";
+/// Why a restart Interrupted a Build Job, which is never queued again: its plan may no longer hold.
+const BUILD_INTERRUPTED: &str = "the service stopped while the build was running; the files it applied stay, \
+     and a new plan builds the rest";
 /// Why a restart Failed a Job that was already queued again once.
 const INTERRUPTED_AGAIN: &str =
-    "the Service stopped while the job was running, after it had already been queued again once";
+    "the service stopped while the job was running, after it had already been queued again once";
 
 /// What starting the Service did to a Job it found Running.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +38,7 @@ pub(super) struct JobRow {
 pub(super) const JOB_QUERY: &str =
     "SELECT j.id, j.state, s.name, r.sha256, j.actor, j.attempt, j.requeued_from, j.audit_id,
             j.error, j.readers, j.hashers, j.created_at, j.started_at, j.finished_at, j.version,
-            j.kind, p.name, v.version, j.selection_id
+            j.kind, p.name, v.version, j.selection_id, j.managed_folder_id, j.plan_id
      FROM jobs j
      JOIN source_sets s ON s.id = j.source_set_id
      JOIN dat_revisions r ON r.id = j.dat_revision_id
@@ -71,6 +74,8 @@ pub(super) fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
         kind,
         profile,
         selection: row.get(18)?,
+        managed_folder: row.get(19)?,
+        plan: row.get(20)?,
         state,
         source_set: row.get(2)?,
         dat_revision: row.get(3)?,
@@ -282,18 +287,33 @@ impl Store {
 
     /// Run when the Service starts: every Job still Running was cut off by a stop. Its Audit was already discarded
     /// when the store opened. A first attempt becomes Interrupted and a fresh Job is queued for it with `workers`; a
-    /// Job that was itself queued again becomes Failed. Each Job's change is one transaction.
+    /// Job that was itself queued again becomes Failed. A Build Job becomes Interrupted and is not queued again, since
+    /// its plan may no longer hold; [`Store::recover_builds`] then cleans up its folder. Each Job's change is one
+    /// transaction.
     pub fn recover_jobs(&self, workers: Workers) -> Result<Vec<Interruption>> {
-        let running: Vec<(i64, u32)> = self.read(|c| {
-            let mut stmt =
-                c.prepare("SELECT id, attempt FROM jobs WHERE state = 'running' ORDER BY id")?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let running: Vec<(i64, u32, String)> = self.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, attempt, kind FROM jobs WHERE state = 'running' ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })?;
         running
             .into_iter()
-            .map(|(id, attempt)| {
+            .map(|(id, attempt, kind)| {
                 self.write(|tx| {
+                    if kind == JobKind::Build.as_str() {
+                        finish_running(tx, id, JobState::Interrupted, Some(BUILD_INTERRUPTED))?;
+                        tx.execute(
+                            "UPDATE builds SET state = 'interrupted', finished_at = ?2
+                             WHERE job_id = ?1 AND state = 'running'",
+                            params![id, now()],
+                        )?;
+                        return Ok(Interruption {
+                            job: job_by_id(tx, id)?,
+                            requeued: None,
+                        });
+                    }
                     if attempt > 1 {
                         finish_running(tx, id, JobState::Failed, Some(INTERRUPTED_AGAIN))?;
                         return Ok(Interruption {

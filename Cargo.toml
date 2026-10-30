@@ -17,6 +17,10 @@ title-select-server = { path = "crates/server" }
 title-select-selection = { path = "crates/selection" }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 crc32fast = "1.5.3"
+# TorrentZip output (ADR 0007): deflate through zlib, built from the pinned libz-sys source and linked statically.
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib"] }
+libz-sys = { version = "=1.1.31", default-features = false, features = ["libc", "static"] }
+libc = "0.2.191"
 jiff = { version = "0.2.38", features = ["serde"] }
 md-5 = "0.11.0"
 quick-xml = "0.42.0"

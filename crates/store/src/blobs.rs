@@ -21,14 +21,14 @@ pub(super) fn write_blob(dats: &Path, sha256: &str, bytes: &[u8]) -> Result<()> 
 }
 
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> Result<()> {
+pub(super) fn sync_dir(dir: &Path) -> Result<()> {
     File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| io_error(dir, e))
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> Result<()> {
+pub(super) fn sync_dir(_dir: &Path) -> Result<()> {
     Ok(())
 }
 

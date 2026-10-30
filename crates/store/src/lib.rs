@@ -2,10 +2,13 @@
 
 mod audits;
 mod blobs;
+mod builds;
 pub mod config;
 mod dats;
+mod folders;
 mod jobs;
 mod migrations;
+mod plans;
 mod profiles;
 mod selections;
 mod sets;
@@ -340,6 +343,61 @@ mod tests {
             .unwrap();
         insert("selection", "(SELECT id FROM profile_versions)").unwrap();
         assert!(insert("selection", "(SELECT id FROM profile_versions)").is_err());
+    }
+
+    #[test]
+    fn the_builds_migration_rebuilds_jobs_keeping_their_references_and_gives_the_store_an_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_with(dir.path(), &migrations::MIGRATIONS[..3]).unwrap();
+        // A Selection Job and the Selection that refers back to it, as schema 3's code wrote them.
+        store
+            .write(|tx| {
+                tx.execute_batch(
+                    "INSERT INTO dats (provider, name) VALUES ('Test', 'Test');
+                     INSERT INTO dat_revisions (dat_id, sha256, version, file_name, imported_at)
+                         SELECT id, 'abc', '1', 'Test.dat', 'then' FROM dats;
+                     INSERT INTO source_sets (name, root, path, dat_id, added_at)
+                         SELECT 'Set', 'sets', 'Set', id, 'then' FROM dats;
+                     INSERT INTO profiles (name, created_at) VALUES ('Mine', 'then');
+                     INSERT INTO profile_versions (profile_id, version, json, sha256, saved_at, saved_by)
+                         SELECT id, 1, '{}', 'def', 'then', 'Operator' FROM profiles;
+                     INSERT INTO jobs (state, kind, profile_version_id, source_set_id, dat_revision_id, actor,
+                                       readers, hashers, created_at)
+                         SELECT 'succeeded', 'selection', v.id, s.id, r.id, 'Operator', 1, 1, 'then'
+                         FROM profile_versions v, source_sets s, dat_revisions r;
+                     INSERT INTO selections (source_set_id, dat_revision_id, profile_version_id, job_id, system,
+                                             system_settings, pins, summary, coverage_drift, stale_choices,
+                                             created_at)
+                         SELECT source_set_id, dat_revision_id, profile_version_id, id, 'Test', 0, '{}', '{}',
+                                '{}', '{}', 'then' FROM jobs;
+                     UPDATE jobs SET selection_id = (SELECT id FROM selections);",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(dir.path()).unwrap();
+
+        let jobs = store.jobs(10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind, title_select_api::JobKind::Selection);
+        assert_eq!(jobs[0].selection, Some(1));
+        assert_eq!((jobs[0].managed_folder, jobs[0].plan), (None, None));
+        let id = store.read(folders::store_id).unwrap();
+        assert_eq!(id.len(), 32);
+        let build_without_a_folder = store.write(|tx| {
+            tx.execute_batch(
+                "INSERT INTO jobs (state, kind, source_set_id, dat_revision_id, actor, readers, hashers,
+                                   created_at)
+                     SELECT 'queued', 'build', source_set_id, dat_revision_id, 'Operator', 1, 1, 'now'
+                     FROM jobs LIMIT 1;",
+            )?;
+            Ok(())
+        });
+        assert!(build_without_a_folder.is_err());
+        let foreign_keys = store.read(|c| Ok(pragma(c, "foreign_keys"))).unwrap();
+        assert_eq!(foreign_keys, "Integer(1)");
     }
 
     #[test]

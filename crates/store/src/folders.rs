@@ -1,0 +1,499 @@
+//! Managed Folders: folders in writable Roots that Builds write a Source Set's Selections into, each holding one
+//! marker that ties it to this store.
+
+use std::fs::File;
+use std::io::{ErrorKind, Write};
+use std::path::{Component, Path, PathBuf};
+
+use rusqlite::{Connection, OptionalExtension, Row, params};
+use title_select_api::build::{
+    AddManagedFolder, BuildState, BuildSummary, ChangeManagedFolder, MARKER, ManagedFolder, Marker,
+    PlanContent, STAGING,
+};
+use title_select_api::paths::{PathTemplate, TokenValues, relative_path};
+
+use super::blobs::sync_dir;
+use super::dats::split_dat;
+use super::profiles::profile_id;
+use super::sets::{resolve, set_by_id, set_by_name};
+use super::{Error, Result, Store, io_error, now};
+use crate::config::Config;
+
+/// A Managed Folder's row and what its bindings name.
+#[derive(Debug, Clone)]
+pub(super) struct FolderRow {
+    pub id: i64,
+    pub root: String,
+    pub path: String,
+    pub source_set_id: i64,
+    pub source_set: String,
+    pub dat_id: i64,
+    pub system: String,
+    pub profile_id: i64,
+    pub profile: String,
+    pub generation: u64,
+    pub current_build: Option<i64>,
+    pub created_at: String,
+    pub files: u64,
+    pub active_job: Option<i64>,
+    pub latest_plan: Option<i64>,
+}
+
+const FOLDER_QUERY: &str = "SELECT f.id, f.root, f.path, s.id, s.name, d.id, d.provider || '/' || d.name, p.id,
+            p.name, f.generation, f.current_build_id, f.created_at,
+            (SELECT count(*) FROM built_files b WHERE b.folder_id = f.id),
+            (SELECT max(j.id) FROM jobs j
+             WHERE j.managed_folder_id = f.id AND j.kind = 'build' AND j.state IN ('queued', 'running')),
+            (SELECT max(pl.id) FROM plans pl WHERE pl.folder_id = f.id)
+     FROM managed_folders f
+     JOIN source_sets s ON s.id = f.source_set_id
+     JOIN dats d ON d.id = s.dat_id
+     JOIN profiles p ON p.id = f.profile_id";
+
+fn folder_from_row(r: &Row) -> rusqlite::Result<FolderRow> {
+    Ok(FolderRow {
+        id: r.get(0)?,
+        root: r.get(1)?,
+        path: r.get(2)?,
+        source_set_id: r.get(3)?,
+        source_set: r.get(4)?,
+        dat_id: r.get(5)?,
+        system: r.get(6)?,
+        profile_id: r.get(7)?,
+        profile: r.get(8)?,
+        generation: r.get::<_, i64>(9)? as u64,
+        current_build: r.get(10)?,
+        created_at: r.get(11)?,
+        files: r.get::<_, i64>(12)? as u64,
+        active_job: r.get(13)?,
+        latest_plan: r.get(14)?,
+    })
+}
+
+pub(super) fn folder_by_id(c: &Connection, id: i64) -> Result<FolderRow> {
+    c.query_row(
+        &format!("{FOLDER_QUERY} WHERE f.id = ?1"),
+        [id],
+        folder_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| Error::NotFound(format!("no managed folder {id}")))
+}
+
+/// This store's id, which every marker it writes records.
+pub(super) fn store_id(c: &Connection) -> Result<String> {
+    Ok(
+        c.query_row("SELECT value FROM meta WHERE key = 'store_id'", [], |r| {
+            r.get(0)
+        })?,
+    )
+}
+
+const BUILD_QUERY: &str =
+    "SELECT b.id, b.folder_id, b.plan_id, b.job_id, b.state, b.generation, b.selection_id,
+            b.audit_id, r.sha256, b.started_at, b.finished_at,
+            (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'applied'),
+            (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'failed'),
+            (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'pending'),
+            p.content
+     FROM builds b
+     JOIN dat_revisions r ON r.id = b.dat_revision_id
+     JOIN plans p ON p.id = b.plan_id";
+
+fn build_from_row(r: &Row) -> rusqlite::Result<BuildSummary> {
+    let state: String = r.get(4)?;
+    let content: String = r.get(14)?;
+    let content: PlanContent = serde_json::from_str(&content).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(14, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(BuildSummary {
+        id: r.get(0)?,
+        folder: r.get(1)?,
+        plan: r.get(2)?,
+        job: r.get(3)?,
+        state: BuildState::parse(&state).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                format!("unknown build state {state}").into(),
+            )
+        })?,
+        generation: r.get::<_, i64>(5)? as u64,
+        selection: r.get(6)?,
+        audit: r.get(7)?,
+        dat_revision: r.get(8)?,
+        started_at: r.get(9)?,
+        finished_at: r.get(10)?,
+        applied: r.get::<_, i64>(11)? as u64,
+        failed: r.get::<_, i64>(12)? as u64,
+        pending: r.get::<_, i64>(13)? as u64,
+        planned: content.summary(),
+    })
+}
+
+pub(super) fn build_by_id(c: &Connection, id: i64) -> Result<BuildSummary> {
+    c.query_row(
+        &format!("{BUILD_QUERY} WHERE b.id = ?1"),
+        [id],
+        build_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| Error::NotFound(format!("no build {id}")))
+}
+
+pub(super) fn builds_where(
+    c: &Connection,
+    condition: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<BuildSummary>> {
+    let mut stmt = c.prepare(&format!(
+        "{BUILD_QUERY} WHERE {condition} ORDER BY b.id DESC"
+    ))?;
+    let rows = stmt.query_map(params, build_from_row)?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+fn record(c: &Connection, config: &Config, row: FolderRow) -> Result<ManagedFolder> {
+    let build = match row.current_build {
+        Some(id) => Some(build_by_id(c, id)?),
+        None => None,
+    };
+    Ok(ManagedFolder {
+        id: row.id,
+        writable: config.root(&row.root).is_some_and(|r| r.writable),
+        root: row.root,
+        path: row.path,
+        system: row.system,
+        source_set: row.source_set,
+        profile: row.profile,
+        generation: row.generation,
+        created_at: row.created_at,
+        build,
+        files: row.files,
+        active_job: row.active_job,
+        latest_plan: row.latest_plan,
+    })
+}
+
+/// A Managed Folder's directory.
+pub(super) struct FolderPath {
+    /// The Root's path, as configured, joined with the folder's path.
+    pub path: PathBuf,
+    /// The folder's canonical path.
+    pub canonical: PathBuf,
+}
+
+/// Where the Managed Folder `rel` in the Root `root` is, checked to be a directory inside the Root after following
+/// symlinks. The error is a sentence for a plan's blocker.
+pub(super) fn locate(
+    config: &Config,
+    root: &str,
+    rel: &str,
+) -> std::result::Result<FolderPath, String> {
+    let root_config = config
+        .root(root)
+        .ok_or_else(|| format!("no root named {root} is configured any more"))?;
+    let canonical_root = root_config
+        .path
+        .canonicalize()
+        .map_err(|e| format!("root {root} ({}): {e}", root_config.path.display()))?;
+    let path = rel
+        .split('/')
+        .fold(root_config.path.clone(), |p, part| p.join(part));
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(format!("{rel}: resolves outside root {root}"));
+    }
+    if !canonical.is_dir() {
+        return Err(format!("{}: not a directory", path.display()));
+    }
+    Ok(FolderPath { path, canonical })
+}
+
+/// The temp file a marker is written to before it is renamed over the marker.
+pub(super) const MARKER_NEW: &str = ".title-select.new";
+
+/// Whether `name` is one of the files Title Select keeps in a Managed Folder for itself.
+pub(super) fn is_own(name: &str) -> bool {
+    name == MARKER || name == STAGING || name == MARKER_NEW
+}
+
+/// Replaces the folder's marker atomically and durably.
+pub(super) fn write_marker(dir: &Path, marker: &Marker) -> Result<()> {
+    let tmp = dir.join(MARKER_NEW);
+    let mut json = serde_json::to_vec_pretty(marker).expect("a marker always serializes");
+    json.push(b'\n');
+    let mut file = File::create(&tmp).map_err(|e| io_error(&tmp, e))?;
+    file.write_all(&json).map_err(|e| io_error(&tmp, e))?;
+    file.sync_all().map_err(|e| io_error(&tmp, e))?;
+    drop(file);
+    let path = dir.join(MARKER);
+    std::fs::rename(&tmp, &path).map_err(|e| io_error(&path, e))?;
+    sync_dir(dir)
+}
+
+/// What a Managed Folder's marker says.
+pub(super) enum MarkerState {
+    Absent,
+    Unreadable(String),
+    Present(Marker),
+}
+
+pub(super) fn read_marker(dir: &Path) -> MarkerState {
+    let path = dir.join(MARKER);
+    match std::fs::read(&path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => MarkerState::Absent,
+        Err(e) => MarkerState::Unreadable(e.to_string()),
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(marker) => MarkerState::Present(marker),
+            Err(e) => MarkerState::Unreadable(e.to_string()),
+        },
+    }
+}
+
+/// Creates the folder `rel` in the Root at `root_path` (canonically `canonical_root`), creating each missing
+/// component, or checks that it is empty. Each existing component must resolve inside the Root.
+fn create_or_check_empty(root_path: &Path, canonical_root: &Path, rel: &str) -> Result<FolderPath> {
+    let mut path = root_path.to_path_buf();
+    for part in rel.split('/') {
+        path.push(part);
+        match path.canonicalize() {
+            Ok(canonical) => {
+                if !canonical.starts_with(canonical_root) {
+                    return Err(Error::Refused(format!("{rel}: resolves outside its root")));
+                }
+                if !canonical.is_dir() {
+                    return Err(Error::Refused(format!(
+                        "{}: not a directory",
+                        path.display()
+                    )));
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                std::fs::create_dir(&path).map_err(|e| io_error(&path, e))?;
+            }
+            Err(e) => return Err(io_error(&path, e)),
+        }
+    }
+    let mut entries = std::fs::read_dir(&path).map_err(|e| io_error(&path, e))?;
+    if let Some(entry) = entries.next() {
+        let name = entry.map_err(|e| io_error(&path, e))?.file_name();
+        return Err(Error::Refused(format!(
+            "{} is not empty (it holds {}); a managed folder starts empty, and adopting a folder's files comes later",
+            path.display(),
+            name.to_string_lossy()
+        )));
+    }
+    let canonical = path.canonicalize().map_err(|e| io_error(&path, e))?;
+    Ok(FolderPath { path, canonical })
+}
+
+/// Whether one of two canonical folders lies inside the other.
+fn overlaps(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+impl Store {
+    /// The path a Path Template proposes for a Managed Folder of the Source Set `source_set`'s system: `template` if
+    /// given, else the configured default.
+    pub fn propose_managed_folder_path(
+        &self,
+        config: &Config,
+        source_set: &str,
+        template: Option<&str>,
+    ) -> Result<String> {
+        let template = match template {
+            Some(text) => PathTemplate::parse(text).map_err(|e| Error::Refused(e.to_string()))?,
+            None => config.path_templates.managed_folder.clone(),
+        };
+        let set = self.read(|c| set_by_name(c, source_set))?;
+        let (provider, dat_name) = split_dat(&set.record.dat)?;
+        template
+            .render(&TokenValues::for_dat(provider, dat_name))
+            .map_err(|e| Error::Refused(e.to_string()))
+    }
+
+    /// Registers a Managed Folder: `add.path` (or the path its template proposes) in the writable Root `add.root`,
+    /// bound to a Source Set and a Selection Profile. The folder is created if absent and must be empty if present;
+    /// its marker is written before the registration commits.
+    pub fn add_managed_folder(
+        &self,
+        config: &Config,
+        add: &AddManagedFolder,
+    ) -> Result<ManagedFolder> {
+        let rel = match (&add.path, &add.template) {
+            (Some(_), Some(_)) => {
+                return Err(Error::Refused("give a path or a template, not both".into()));
+            }
+            (Some(path), None) => path.clone(),
+            (None, template) => {
+                self.propose_managed_folder_path(config, &add.source_set, template.as_deref())?
+            }
+        };
+        let root = config
+            .root(&add.root)
+            .ok_or_else(|| Error::Refused(format!("no root named {} is configured", add.root)))?;
+        if !root.writable {
+            return Err(Error::Refused(format!(
+                "root {} is read-only; a managed folder needs a root with writable = true",
+                add.root
+            )));
+        }
+        let rel = relative_path(&rel)
+            .map_err(|e| Error::Refused(format!("{rel}: a managed folder's path {e}")))?;
+        if !Path::new(&rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+        {
+            return Err(Error::Refused(format!(
+                "{rel}: a managed folder's path must be relative to its root"
+            )));
+        }
+        let canonical_root = root.path.canonicalize().map_err(|e| {
+            Error::Refused(format!("root {} ({}): {e}", add.root, root.path.display()))
+        })?;
+        let (set, profile, others) = self.read(|c| {
+            let set = set_by_name(c, &add.source_set)?;
+            let profile = profile_id(c, &add.profile)?;
+            let clash: Option<i64> = c
+                .query_row(
+                    "SELECT id FROM managed_folders WHERE root = ?1 AND path = ?2",
+                    params![add.root, rel],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(clash) = clash {
+                return Err(Error::Refused(format!(
+                    "managed folder {clash} already uses {rel} in root {}",
+                    add.root
+                )));
+            }
+            let mut stmt = c.prepare(
+                "SELECT root, path, 'a source set' FROM source_sets
+                 UNION ALL SELECT root, path, 'another managed folder' FROM managed_folders",
+            )?;
+            let others = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((set, profile, others))
+        })?;
+        // The folder's own path need not exist yet; the folder it would be is checked against every folder Title
+        // Select reads or writes.
+        let would_be = rel
+            .split('/')
+            .fold(canonical_root.clone(), |p, part| p.join(part));
+        for (root, path, what) in others {
+            let Some(other) = config.root(&root).and_then(|r| {
+                path.split('/')
+                    .fold(r.path.clone(), |p, part| p.join(part))
+                    .canonicalize()
+                    .ok()
+            }) else {
+                continue;
+            };
+            if overlaps(&would_be, &other) {
+                return Err(Error::Refused(format!(
+                    "{rel} in root {} would overlap {what} at {}",
+                    add.root,
+                    other.display()
+                )));
+            }
+        }
+        let folder = create_or_check_empty(&root.path, &canonical_root, &rel)?;
+        self.write(|tx| {
+            let store = store_id(tx)?;
+            tx.execute(
+                "INSERT INTO managed_folders (root, path, source_set_id, profile_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![add.root, rel, set.id, profile, now()],
+            )?;
+            let id = tx.last_insert_rowid();
+            write_marker(
+                &folder.path,
+                &Marker {
+                    store,
+                    folder: id,
+                    generation: 0,
+                },
+            )?;
+            record(tx, config, folder_by_id(tx, id)?)
+        })
+    }
+
+    /// Rebinds a Managed Folder to another Source Set of the same system, or to another Profile. Refused while a
+    /// Build Job is Queued or Running for it.
+    pub fn change_managed_folder(
+        &self,
+        config: &Config,
+        id: i64,
+        change: &ChangeManagedFolder,
+    ) -> Result<ManagedFolder> {
+        self.write(|tx| {
+            let folder = folder_by_id(tx, id)?;
+            if let Some(job) = folder.active_job {
+                return Err(Error::Conflict(format!(
+                    "managed folder {id} has a build queued or running: job {job}"
+                )));
+            }
+            if let Some(name) = &change.source_set {
+                let set = set_by_name(tx, name)?;
+                if set.dat_id != folder.dat_id {
+                    return Err(Error::Refused(format!(
+                        "source set {name} is for {}, but managed folder {id} is for {}",
+                        set.record.dat, folder.system
+                    )));
+                }
+                tx.execute(
+                    "UPDATE managed_folders SET source_set_id = ?2 WHERE id = ?1",
+                    params![id, set.id],
+                )?;
+            }
+            if let Some(name) = &change.profile {
+                let profile = profile_id(tx, name)?;
+                tx.execute(
+                    "UPDATE managed_folders SET profile_id = ?2 WHERE id = ?1",
+                    params![id, profile],
+                )?;
+            }
+            record(tx, config, folder_by_id(tx, id)?)
+        })
+    }
+
+    /// Every Managed Folder, by root and path.
+    pub fn managed_folders(&self, config: &Config) -> Result<Vec<ManagedFolder>> {
+        self.read(|c| {
+            let mut stmt = c.prepare(&format!("{FOLDER_QUERY} ORDER BY f.root, f.path"))?;
+            let rows = stmt
+                .query_map([], folder_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().map(|row| record(c, config, row)).collect()
+        })
+    }
+
+    pub fn managed_folder(&self, config: &Config, id: i64) -> Result<ManagedFolder> {
+        self.read(|c| record(c, config, folder_by_id(c, id)?))
+    }
+
+    /// Every Build of the Managed Folder, newest first.
+    pub fn builds(&self, folder: i64) -> Result<Vec<BuildSummary>> {
+        self.read(|c| {
+            folder_by_id(c, folder)?;
+            builds_where(c, "b.folder_id = ?1", [folder])
+        })
+    }
+
+    /// The configured path of a Source Set's folder.
+    pub(super) fn set_folder(&self, config: &Config, set_id: i64) -> Result<(PathBuf, PathBuf)> {
+        let set = self.read(|c| set_by_id(c, set_id))?;
+        let resolved = resolve(config, &set.record.root, &set.record.path)?;
+        Ok((resolved.path, resolved.canonical_root))
+    }
+}

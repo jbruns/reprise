@@ -1,8 +1,10 @@
 //! Audits a Source Set against a DAT Revision (see GLOSSARY.md and ADR 0002).
 
+pub mod build;
 pub mod dat;
-mod payload;
+pub mod payload;
 mod read;
+pub mod torrentzip;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

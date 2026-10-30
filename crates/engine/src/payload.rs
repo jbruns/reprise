@@ -14,6 +14,7 @@ pub struct Checksums {
 }
 
 /// Computes every checksum in one pass over a payload, fed in chunks.
+#[derive(Default)]
 pub struct Hasher {
     crc: crc32fast::Hasher,
     md5: md5::Md5,
@@ -24,13 +25,7 @@ pub struct Hasher {
 
 impl Hasher {
     pub fn new() -> Hasher {
-        Hasher {
-            crc: crc32fast::Hasher::new(),
-            md5: md5::Md5::new(),
-            sha1: sha1::Sha1::new(),
-            sha256: sha2::Sha256::new(),
-            size: 0,
-        }
+        Hasher::default()
     }
 
     pub fn update(&mut self, chunk: &[u8]) {

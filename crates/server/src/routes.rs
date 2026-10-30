@@ -14,6 +14,10 @@ use axum::routing::{any, get, post};
 use axum::{Extension, Json, Router, middleware};
 use futures_util::StreamExt;
 use serde::Deserialize;
+use title_select_api::build::{
+    AddManagedFolder, ApprovePlan, BuildDetail, BuildSummary, BuiltFile, ChangeManagedFolder,
+    ManagedFolder, Plan, PlanBuild,
+};
 use title_select_api::selection::{Role, SelectionProfile, diff_rows};
 use title_select_api::{
     AddSourceSet, Availability, CreateProfile, Dat, ErrorBody, Finding, GameStatus, Health,
@@ -95,6 +99,20 @@ pub fn router(state: AppState, auth: Arc<Auth>, ui: Option<&std::path::Path>) ->
         .route("/selections/{id}/releases", get(selection_releases))
         .route("/selections/{id}/availability", get(availability))
         .route("/selections/{id}/diff", get(selection_diff))
+        .route(
+            "/managed-folders",
+            get(managed_folders).post(add_managed_folder),
+        )
+        .route(
+            "/managed-folders/{id}",
+            get(managed_folder).patch(change_managed_folder),
+        )
+        .route("/managed-folders/{id}/builds", get(folder_builds))
+        .route("/managed-folders/{id}/files", get(built_files))
+        .route("/managed-folders/{id}/plans", post(plan_build))
+        .route("/plans/{id}", get(plan))
+        .route("/plans/{id}/approval", post(approve_plan))
+        .route("/builds/{id}", get(build))
         .route("/jobs", get(jobs))
         .route("/jobs/{id}", get(job))
         .route("/jobs/{id}/events", get(job_events))
@@ -360,6 +378,119 @@ async fn add_source_set(
     })
     .await?;
     Ok((StatusCode::CREATED, Json(record)))
+}
+
+async fn managed_folders(State(state): State<AppState>) -> ApiResult<Json<Vec<ManagedFolder>>> {
+    let config = state.config.clone();
+    Ok(Json(
+        blocking(&state, move |store| store.managed_folders(&config)).await?,
+    ))
+}
+
+async fn add_managed_folder(
+    State(state): State<AppState>,
+    body: Result<Json<AddManagedFolder>, JsonRejection>,
+) -> ApiResult<(StatusCode, Json<ManagedFolder>)> {
+    let Json(add) = body?;
+    let config = state.config.clone();
+    let folder = blocking(&state, move |store| store.add_managed_folder(&config, &add)).await?;
+    Ok((StatusCode::CREATED, Json(folder)))
+}
+
+async fn managed_folder(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Json<ManagedFolder>> {
+    let Path(id) = id?;
+    let config = state.config.clone();
+    Ok(Json(
+        blocking(&state, move |store| store.managed_folder(&config, id)).await?,
+    ))
+}
+
+async fn change_managed_folder(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<ChangeManagedFolder>, JsonRejection>,
+) -> ApiResult<Json<ManagedFolder>> {
+    let Path(id) = id?;
+    let Json(change) = body?;
+    let config = state.config.clone();
+    Ok(Json(
+        blocking(&state, move |store| {
+            store.change_managed_folder(&config, id, &change)
+        })
+        .await?,
+    ))
+}
+
+async fn folder_builds(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Json<Vec<BuildSummary>>> {
+    let Path(id) = id?;
+    Ok(Json(blocking(&state, move |store| store.builds(id)).await?))
+}
+
+async fn built_files(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Json<Vec<BuiltFile>>> {
+    let Path(id) = id?;
+    Ok(Json(
+        blocking(&state, move |store| store.built_files(id)).await?,
+    ))
+}
+
+/// Computes and stores a Change Plan for review. Planning reads the store and stats the folder, so it is quick
+/// enough to answer at once.
+async fn plan_build(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<PlanBuild>, JsonRejection>,
+) -> ApiResult<(StatusCode, Json<Plan>)> {
+    let Path(id) = id?;
+    let Json(request) = body?;
+    let config = state.config.clone();
+    let plan = blocking(&state, move |store| {
+        store.plan_build(&config, id, request.selection)
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(plan)))
+}
+
+async fn plan(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Json<Plan>> {
+    let Path(id) = id?;
+    Ok(Json(blocking(&state, move |store| store.plan(id)).await?))
+}
+
+/// Approves a plan by the digest you reviewed and queues its Build Job.
+async fn approve_plan(
+    State(state): State<AppState>,
+    Extension(Actor(actor)): Extension<Actor>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<ApprovePlan>, JsonRejection>,
+) -> ApiResult<(StatusCode, Json<title_select_api::Job>)> {
+    let Path(id) = id?;
+    let Json(approve) = body?;
+    let (config, workers) = (state.config.clone(), state.workers);
+    let job = blocking(&state, move |store| {
+        store.approve_plan(&config, id, &approve.digest, &actor, workers)
+    })
+    .await?;
+    state.jobs.changed(job.clone());
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+async fn build(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Json<BuildDetail>> {
+    let Path(id) = id?;
+    Ok(Json(blocking(&state, move |store| store.build(id)).await?))
 }
 
 async fn source_set(

@@ -6,7 +6,7 @@ use leptos::html::Div;
 use leptos::prelude::*;
 use leptos::tachys::view::any_view::AnyView;
 use leptos_router::components::A;
-use leptos_router::hooks::use_params_map;
+use leptos_router::hooks::{use_params_map, use_query_map};
 use leptos_struct_table::ColumnSort;
 use title_select_api::selection::{
     ChoiceStatus, ReleaseChange, Role, Rule, SelectionGroup, SelectionProfile,
@@ -20,6 +20,7 @@ use crate::api;
 use crate::app::{Loading, Problem};
 use crate::events::use_live;
 use crate::model::{Sort, game_status_label, when};
+use crate::screens::PlanABuild;
 use crate::screens::audit::{ReAudit, focus};
 use crate::selection_model::{
     AvailabilityFilter, FlagFilter, ReleaseColumn, ReleaseFilter, SelectionIndex, checked,
@@ -495,7 +496,8 @@ fn SelectionView(record: SelectionRecord) -> impl IntoView {
             staged.set(Some(version.profile));
         }
     });
-    let group = RwSignal::new(None::<String>);
+    // A link to an unresolved group, such as a plan's, opens the selection at it.
+    let group = RwSignal::new(use_query_map().read_untracked().get("group"));
     let audit_outcome = RwSignal::new(None::<Result<Job, String>>);
     let reaudit = ReAudit::new(
         r.source_set.clone(),
@@ -565,6 +567,7 @@ fn SelectionView(record: SelectionRecord) -> impl IntoView {
                     </div>
                 }
             })}
+        {(!pruned).then(|| view! { <PlanABuild selection=record.get_value() /> })}
         {move || {
             newer
                 .get()

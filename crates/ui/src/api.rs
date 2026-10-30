@@ -22,12 +22,12 @@ async fn checked(response: Response) -> Result<Response, String> {
     let status = response.status();
     match response.json::<ErrorBody>().await {
         Ok(body) => Err(body.error),
-        Err(_) => Err(format!("The Service answered {status}.")),
+        Err(_) => Err(format!("The service answered {status}.")),
     }
 }
 
 fn failed(err: gloo_net::Error) -> String {
-    format!("The Service could not be reached: {err}")
+    format!("The service could not be reached: {err}")
 }
 
 pub async fn get<T: DeserializeOwned>(path: &str) -> Result<T, String> {
@@ -60,6 +60,18 @@ pub async fn post_until<B: Serialize, T: DeserializeOwned>(
 ) -> Result<T, String> {
     let request = Request::post(&url(path))
         .abort_signal(signal)
+        .json(body)
+        .map_err(|e| e.to_string())?;
+    let response = request.send().await.map_err(failed)?;
+    checked(response)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn patch<B: Serialize, T: DeserializeOwned>(path: &str, body: &B) -> Result<T, String> {
+    let request = Request::patch(&url(path))
         .json(body)
         .map_err(|e| e.to_string())?;
     let response = request.send().await.map_err(failed)?;

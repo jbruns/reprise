@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 title-select-api.workspace = true
 crc32fast.workspace = true
+flate2.workspace = true
+libz-sys.workspace = true
 jiff.workspace = true
 md-5.workspace = true
 quick-xml.workspace = true

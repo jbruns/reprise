@@ -1164,4 +1164,92 @@ mod selections {
         assert_eq!(status, 503, "{body}");
         assert_eq!(client.start_audit().status(), 202);
     }
+
+    /// A managed folder in a writable root: a plan of the selection, an approval bound to its digest, and the build
+    /// job that writes TorrentZips under the DAT's names.
+    #[test]
+    fn a_selection_is_planned_approved_by_digest_and_built_into_a_managed_folder() {
+        use title_select_api::JobKind;
+        use title_select_api::build::{ItemKind, ManagedFolder, Plan};
+        let env = Env::new();
+        let play = env.tmp.path().join("roots/play");
+        std::fs::create_dir_all(&play).unwrap();
+        let service = title_select_server::spawn(env.settings(&format!(
+            "\n[roots.play]\npath = {:?}\nwritable = true\n",
+            play.display().to_string()
+        )))
+        .unwrap();
+        let client = Client::new(&service);
+        client.upload("Test - System (20260101).dat", &dat(&env, "20260101", true));
+        client.add_set();
+        let job: Job = client.start_audit().body_mut().read_json().unwrap();
+        assert_eq!(client.follow(job.id).1.state, JobState::Succeeded);
+        let (_, selection) = save(&client, json!({"region_order": ["USA", "Europe"]}));
+        let (status, body) = send(
+            client.post("/managed-folders"),
+            json!({"root": "sets", "path": "Play", "source_set": SET, "profile": "Everyday"}),
+        );
+        assert_eq!(status, 400, "a read-only root is refused: {body}");
+
+        let (status, folder) = send(
+            client.post("/managed-folders"),
+            json!({"root": "play", "path": "test", "source_set": SET, "profile": "Everyday"}),
+        );
+        assert_eq!(status, 201, "{folder}");
+        let folder: ManagedFolder = serde_json::from_value(folder).unwrap();
+        assert!(play.join("test/.title-select").is_file());
+        let (status, plan) = send(
+            client.post(&format!("/managed-folders/{}/plans", folder.id)),
+            json!({"selection": selection.id}),
+        );
+        assert_eq!(status, 201, "{plan}");
+        let plan: Plan = serde_json::from_value(plan).unwrap();
+        assert!(plan.approvable(), "{:?}", plan.content.blockers);
+        let kind = |game: &str| {
+            plan.content
+                .items
+                .iter()
+                .find(|i| i.game == game)
+                .map(|i| i.kind)
+        };
+        assert_eq!(kind("Pong (USA)"), Some(ItemKind::Repack));
+        assert_eq!(kind("Combat (USA)"), Some(ItemKind::Repack));
+        assert_eq!(kind("Pong (Europe)"), None, "an alternative is not built");
+        let (status, _) = send(
+            client.post(&format!("/plans/{}/approval", plan.id)),
+            json!({"digest": "0".repeat(64)}),
+        );
+        assert_eq!(status, 409, "an approval of another digest");
+        assert!(!play.join("test/Pong (USA).zip").exists());
+
+        let (status, job) = send(
+            client.post(&format!("/plans/{}/approval", plan.id)),
+            json!({"digest": plan.digest}),
+        );
+        assert_eq!(status, 202, "{job}");
+        let job: Job = serde_json::from_value(job).unwrap();
+        assert_eq!(
+            (job.kind, job.managed_folder, job.plan),
+            (JobKind::Build, Some(folder.id), Some(plan.id))
+        );
+        let (_, job) = client.follow(job.id);
+        assert_eq!(job.state, JobState::Succeeded, "{job:?}");
+
+        for name in ["Pong (USA).zip", "Combat (USA).zip"] {
+            let mut file = std::fs::File::open(play.join("test").join(name)).unwrap();
+            title_select_engine::torrentzip::validate(&mut file).unwrap();
+        }
+        assert!(!play.join("test/.title-select-staging").exists());
+        let folder: ManagedFolder = client.json(&format!("/managed-folders/{}", folder.id));
+        let build = folder.build.unwrap();
+        assert_eq!((folder.generation, build.applied, build.failed), (1, 2, 0));
+        let files: Vec<title_select_api::build::BuiltFile> =
+            client.json(&format!("/managed-folders/{}/files", folder.id));
+        assert_eq!(files.len(), 2);
+        let (status, _) = send(
+            client.post(&format!("/plans/{}/approval", plan.id)),
+            json!({"digest": plan.digest}),
+        );
+        assert_ne!(status, 202, "a plan is approved once");
+    }
 }

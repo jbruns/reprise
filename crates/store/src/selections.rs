@@ -112,7 +112,7 @@ fn record_from_row(row: &Row) -> rusqlite::Result<SelectionRecord> {
     })
 }
 
-fn record_by_id(c: &Connection, id: i64) -> Result<SelectionRecord> {
+pub(super) fn record_by_id(c: &Connection, id: i64) -> Result<SelectionRecord> {
     c.query_row(
         &format!("{SELECTION_QUERY} WHERE sel.id = ?1"),
         [id],
@@ -243,7 +243,7 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).expect("store values always serialize")
 }
 
-fn read_rows(c: &Connection, id: i64) -> Result<Vec<ReleaseRow>> {
+pub(super) fn read_rows(c: &Connection, id: i64) -> Result<Vec<ReleaseRow>> {
     let mut stmt = c.prepare(&format!(
         "SELECT {RELEASE_COLUMNS} FROM selection_releases rel WHERE rel.selection_id = ?1 ORDER BY rel.seq"
     ))?;
@@ -251,7 +251,7 @@ fn read_rows(c: &Connection, id: i64) -> Result<Vec<ReleaseRow>> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-fn read_selection(c: &Connection, id: i64) -> Result<Selection> {
+pub(super) fn read_selection(c: &Connection, id: i64) -> Result<Selection> {
     check_full(c, id)?;
     let (dat_sha256, system, system_settings, pins, summary, coverage_drift, stale_choices) = c
         .query_row(
@@ -548,16 +548,23 @@ impl Store {
         })
     }
 
-    /// Prunes the Source Set's Selections beyond the latest `keep` to their records. The latest is always kept.
+    /// Prunes the Source Set's Selections beyond the latest `keep` to their records, except any cited as
+    /// provenance, such as by a Managed Folder's current Build. The latest is always kept.
     fn prune_selections(&self, set_id: i64, keep: usize) -> Result<Vec<i64>> {
         self.write(|tx| {
             let mut stmt = tx.prepare(
-                "SELECT id FROM selections WHERE source_set_id = ?1 AND pruned_at IS NULL ORDER BY id DESC",
+                "SELECT id, EXISTS (SELECT 1 FROM selection_citations c WHERE c.selection_id = sel.id)
+                 FROM selections sel WHERE source_set_id = ?1 AND pruned_at IS NULL ORDER BY id DESC",
             )?;
             let full = stmt
-                .query_map([set_id], |r| r.get::<_, i64>(0))?
+                .query_map([set_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, bool>(1)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
-            let pruned: Vec<i64> = full.into_iter().skip(keep.max(1)).collect();
+            let pruned: Vec<i64> = full
+                .into_iter()
+                .skip(keep.max(1))
+                .filter(|(_, cited)| !cited)
+                .map(|(id, _)| id)
+                .collect();
             let at = now();
             for id in &pruned {
                 tx.execute(

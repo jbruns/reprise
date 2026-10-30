@@ -57,7 +57,7 @@ fn summary_from_row(r: &Row) -> rusqlite::Result<AuditSummary> {
     })
 }
 
-const ENTRY_COLUMNS: &str =
+pub(super) const ENTRY_COLUMNS: &str =
     "path, member, finding, roms, named_game, named_rom, evidence_level, algorithms, reason";
 
 /// The count columns of `audits`, Findings then Game Statuses, named as the report names them.
@@ -240,7 +240,7 @@ pub(super) fn delete_audits(
     Ok(tx.execute(&format!("DELETE FROM audits WHERE {condition}"), params)?)
 }
 
-fn entry_from_row(row: &Row) -> Result<Entry> {
+pub(super) fn entry_from_row(row: &Row) -> Result<Entry> {
     let finding: String = row.get(2)?;
     let roms: String = row.get(3)?;
     let named_game: Option<String> = row.get(4)?;

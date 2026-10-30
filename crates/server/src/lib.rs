@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use title_select_api::JobKind;
 use title_select_store::config::Config;
 use title_select_store::{Store, Workers};
 
@@ -87,12 +88,17 @@ fn prepare(settings: Settings) -> Result<Prepared, StartError> {
                 "title-select: job {} was interrupted by a stop; queued again as job {}",
                 job.id, again.id
             ),
+            None if job.kind == JobKind::Build => eprintln!(
+                "title-select: build job {} was interrupted by a stop; plan again to build the rest",
+                job.id
+            ),
             None => eprintln!(
                 "title-select: job {} was interrupted by a stop again; it failed",
                 job.id
             ),
         }
     }
+    store.recover_builds(&config)?;
     let listener =
         std::net::TcpListener::bind(listen).map_err(|e| StartError::Listen(listen, e))?;
     listener

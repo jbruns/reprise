@@ -38,21 +38,21 @@ fn check_health(url: &str, timeout: Duration) -> Result<(), String> {
         .into();
     let mut response = agent.get(url).call().map_err(|e| match e {
         ureq::Error::Timeout(_) => format!(
-            "the Service at {url} did not answer within {} s",
+            "the service at {url} did not answer within {} s",
             timeout.as_secs()
         ),
-        e => format!("cannot reach the Service at {url}: {e}"),
+        e => format!("cannot reach the service at {url}: {e}"),
     })?;
     let status = response.status();
     if status != ureq::http::StatusCode::OK {
-        return Err(format!("the Service at {url} answered {status}"));
+        return Err(format!("the service at {url} answered {status}"));
     }
     let body = response
         .body_mut()
         .with_config()
         .limit(64 * 1024)
         .read_to_string()
-        .map_err(|e| format!("cannot read the Service's answer at {url}: {e}"))?;
+        .map_err(|e| format!("cannot read the service's answer at {url}: {e}"))?;
     match serde_json::from_str::<Health>(&body) {
         Ok(health) if health.status == "ok" => Ok(()),
         _ => {
@@ -63,7 +63,7 @@ fn check_health(url: &str, timeout: Duration) -> Result<(), String> {
                 ""
             };
             Err(format!(
-                "the Service at {url} is not healthy: {shown:?}{more}"
+                "the service at {url} is not healthy: {shown:?}{more}"
             ))
         }
     }
@@ -103,7 +103,7 @@ impl Client {
     }
 
     fn unreachable(&self, err: ureq::Error) -> String {
-        format!("cannot reach the Service at {}: {err}", self.base)
+        format!("cannot reach the service at {}: {err}", self.base)
     }
 
     /// The body of a successful response, else the error the Service gave.
@@ -121,7 +121,7 @@ impl Client {
             .map(|b| b.error)
             .unwrap_or_else(|_| status.to_string());
         if status == ureq::http::StatusCode::UNAUTHORIZED {
-            return Err(format!("the Service refused the operator token: {message}"));
+            return Err(format!("the service refused the operator token: {message}"));
         }
         Err(message)
     }
@@ -151,7 +151,7 @@ impl Client {
                 std::thread::sleep(self.timing.poll);
             } else if self.stream(&mut job, &mut shown)? == Stream::Stalled {
                 eprintln!(
-                    "job {}: no events from the Service for {}s; polling its state instead",
+                    "job {}: no events from the service for {}s; polling its state instead",
                     job.id,
                     self.timing.stall.as_secs()
                 );
@@ -204,7 +204,7 @@ impl Client {
                 }
                 Ok(JobEvent::Progress(progress)) => show_progress(progress, shown),
                 Ok(JobEvent::Resync(_)) => {}
-                Err(err) => return Err(format!("unexpected event from the Service: {err}")),
+                Err(err) => return Err(format!("unexpected event from the service: {err}")),
             }
         }
     }
@@ -358,6 +358,8 @@ mod tests {
             audit: None,
             profile: None,
             selection: None,
+            managed_folder: None,
+            plan: None,
             error: None,
             workers: Workers {
                 readers: 1,

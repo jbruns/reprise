@@ -64,7 +64,7 @@ fn newest(c: &Connection, profile_id: i64) -> Result<Option<(i64, ProfileVersion
     .optional()?)
 }
 
-fn profile_id(c: &Connection, name: &str) -> Result<i64> {
+pub(super) fn profile_id(c: &Connection, name: &str) -> Result<i64> {
     c.query_row("SELECT id FROM profiles WHERE name = ?1", [name], |r| {
         r.get(0)
     })

@@ -1,10 +1,12 @@
-//! Title Select's workbench: DAT Revisions, Source Sets, Audits, Selection Profiles, Selections and Jobs over the
-//! `/api/v1` JSON API (ADR 0005).
+//! Title Select's workbench: DAT Revisions, Source Sets, Audits, Selection Profiles, Selections, Managed Folders,
+//! Change Plans, Builds and Jobs over the `/api/v1` JSON API (ADR 0005).
 //!
-//! `model`, `selection_model`, `registration` and `jobs` are pure and tested on the host; the rest renders in the browser.
+//! `model`, `selection_model`, `build_model`, `registration` and `jobs` are pure and tested on the host; the rest
+//! renders in the browser.
 
 pub mod api;
 pub mod app;
+pub mod build_model;
 pub mod events;
 pub mod jobs;
 pub mod model;
