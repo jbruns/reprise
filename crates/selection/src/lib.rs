@@ -95,6 +95,8 @@ impl Engine {
 
     /// The install at `root`, if it was built from the pins this binary was built with.
     pub fn open(root: &Path) -> Result<Self, Error> {
+        // Retool runs in its own folder, so every path it is given must be absolute.
+        let root = &std::path::absolute(root).map_err(io(root.display().to_string()))?;
         let expected = expected_pins()?;
         let path = root.join("pins.json");
         let bytes =
@@ -140,7 +142,7 @@ impl Engine {
     /// Reads clone lists, metadata, MIAs and RetroAchievements from `dir` instead of the pinned ones. Tests use
     /// it to run Retool's own fixtures.
     pub fn with_data_dir(mut self, dir: &Path) -> Self {
-        self.data = dir.to_path_buf();
+        self.data = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
         self
     }
 
@@ -186,12 +188,13 @@ impl Engine {
         let dat = std::path::absolute(dat).map_err(io(dat.display().to_string()))?;
         let dat_sha256 = sha256_file(&dat)?;
 
-        std::fs::create_dir_all(&options.work_dir)
+        let work_dir = std::path::absolute(&options.work_dir)
             .map_err(io(options.work_dir.display().to_string()))?;
+        std::fs::create_dir_all(&work_dir).map_err(io(work_dir.display().to_string()))?;
         let run = tempfile::Builder::new()
             .prefix("selection-")
-            .tempdir_in(&options.work_dir)
-            .map_err(io(options.work_dir.display().to_string()))?;
+            .tempdir_in(&work_dir)
+            .map_err(io(work_dir.display().to_string()))?;
         let run_dir = run.path();
         let write = |path: PathBuf, contents: String| {
             std::fs::write(&path, contents).map_err(io(path.display().to_string()))

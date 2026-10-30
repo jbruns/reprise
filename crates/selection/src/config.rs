@@ -19,21 +19,45 @@ pub(crate) struct Vocabulary {
     pub videos: Vec<String>,
 }
 
+/// A JSON object's keys in document order. Retool's default region order is the key order of an object, which
+/// `serde_json::Map` would sort.
+struct Keys(Vec<String>);
+
+impl<'de> serde::Deserialize<'de> for Keys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Keys;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Keys, A::Error> {
+                let mut keys = Vec::new();
+                while let Some((key, serde::de::IgnoredAny)) = map.next_entry::<String, _>()? {
+                    keys.push(key);
+                }
+                Ok(Keys(keys))
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
 impl Vocabulary {
     pub fn parse(internal_config: &[u8]) -> Result<Self, Error> {
         #[derive(serde::Deserialize)]
         struct Internal {
             #[serde(rename = "defaultRegionOrder")]
-            regions: serde_json::Map<String, serde_json::Value>,
-            languages: serde_json::Map<String, serde_json::Value>,
+            regions: Keys,
+            languages: Keys,
             #[serde(rename = "defaultVideoOrder")]
             videos: Vec<String>,
         }
         let internal: Internal = serde_json::from_slice(internal_config)
             .map_err(|e| Error::Install(format!("internal-config.json: {e}")))?;
         Ok(Vocabulary {
-            regions: internal.regions.keys().cloned().collect(),
-            languages: internal.languages.keys().cloned().collect(),
+            regions: internal.regions.0,
+            languages: internal.languages.0.into_iter().collect(),
             videos: internal.videos,
         })
     }
@@ -277,6 +301,15 @@ mod tests {
             languages: ["English".into(), "Japanese".into()].into(),
             videos: vec!["NTSC".into(), "PAL".into()],
         }
+    }
+
+    #[test]
+    fn the_default_region_order_keeps_retools_order() {
+        let parsed = Vocabulary::parse(
+            br#"{"defaultRegionOrder": {"USA": {}, "Europe": {}, "Asia": {}}, "languages": {"Zulu": "zu", "Afrikaans": "af"}, "defaultVideoOrder": ["PAL"]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.regions, ["USA", "Europe", "Asia"]);
     }
 
     #[test]

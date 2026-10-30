@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
-use title_select_api::selection::SelectionProfile;
+use title_select_api::selection::{
+    Category, Selection, SelectionOptions, SelectionProfile, SystemSettings,
+};
 use title_select_selection::{Engine, Error};
 
 /// Retool's synthetic DATs and settings, as Retool's own tests run them; `@name` is `tests/configs/user-config-name.yaml`. Retool writes the same output DATs
@@ -287,6 +289,190 @@ fn an_install_built_from_other_pins_is_refused() {
         Err(Error::Install(message)) => assert!(message.contains("pins.toml"), "{message}"),
         other => panic!("expected the install to be refused, got {other:?}"),
     }
+}
+
+fn feature(dat: &str) -> PathBuf {
+    support::upstream()
+        .join("tests/source/features")
+        .join(format!("{dat}.dat"))
+}
+
+fn fixture_select(dat: &str, profile: &SelectionProfile) -> Selection {
+    let work = tempfile::tempdir().unwrap();
+    support::fixture_engine()
+        .select(&feature(dat), profile, &support::options(work.path()))
+        .unwrap_or_else(|e| panic!("{dat}: {e}"))
+}
+
+fn excluded(selection: &Selection) -> Vec<&str> {
+    selection
+        .groups
+        .iter()
+        .flat_map(|g| &g.exclusions)
+        .map(|e| e.title.as_str())
+        .collect()
+}
+
+#[test]
+fn an_empty_region_order_is_retools_default_order() {
+    let engine = support::engine();
+    let internal = engine
+        .python()
+        .parent()
+        .unwrap()
+        .join("../../retool/config/internal-config.json");
+    // Python's json keeps the object's key order, which is Retool's default region order.
+    let output = Command::new(engine.python())
+        .args([
+            "-c",
+            "import json, sys; print(json.dumps(list(json.load(open(sys.argv[1]))['defaultRegionOrder'])))",
+        ])
+        .arg(&internal)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let defaults: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(defaults[0], "USA");
+
+    for dat in ["Retool - Languages", "Retool - World is USA-Europe-Japan"] {
+        let explicit = SelectionProfile {
+            region_order: defaults.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fixture_select(dat, &SelectionProfile::default()).groups,
+            fixture_select(dat, &explicit).groups,
+            "{dat}"
+        );
+    }
+}
+
+#[test]
+fn a_systems_options_filter_languages_on_and_off() {
+    let dat = "Retool - Languages";
+    let english = || SelectionProfile {
+        language_order: vec!["English".into()],
+        ..Default::default()
+    };
+    let filtering = SelectionOptions {
+        filter_languages: true,
+        ..Default::default()
+    };
+    let system = |options: SelectionOptions| {
+        [(
+            dat.to_owned(),
+            SystemSettings {
+                options: Some(options),
+                ..Default::default()
+            },
+        )]
+        .into()
+    };
+
+    let global = fixture_select(
+        dat,
+        &SelectionProfile {
+            options: filtering.clone(),
+            ..english()
+        },
+    );
+    assert!(!excluded(&global).is_empty(), "{global:#?}");
+
+    let per_system = fixture_select(
+        dat,
+        &SelectionProfile {
+            systems: system(filtering),
+            ..english()
+        },
+    );
+    assert_eq!(excluded(&per_system), excluded(&global));
+
+    let switched_off = fixture_select(
+        dat,
+        &SelectionProfile {
+            options: SelectionOptions {
+                filter_languages: true,
+                ..Default::default()
+            },
+            systems: system(SelectionOptions::default()),
+            ..english()
+        },
+    );
+    assert_eq!(excluded(&switched_off), Vec::<&str>::new());
+}
+
+#[test]
+fn a_systems_empty_exclusions_restore_every_globally_excluded_category() {
+    let dat = "Retool - Exclusions";
+    let aftermarket = "Test Title 49 (USA) (Aftermarket)";
+    let everything = SelectionProfile {
+        exclude: Category::ALL
+            .into_iter()
+            .filter(|c| *c != Category::Games)
+            .collect(),
+        ..Default::default()
+    };
+    assert!(excluded(&fixture_select(dat, &everything)).contains(&aftermarket));
+
+    let restored = fixture_select(
+        dat,
+        &SelectionProfile {
+            systems: [(
+                dat.to_owned(),
+                SystemSettings {
+                    exclude: Some(Default::default()),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..everything
+        },
+    );
+    assert_eq!(excluded(&restored), Vec::<&str>::new());
+    assert_eq!(
+        excluded(&fixture_select(dat, &SelectionProfile::default())),
+        Vec::<&str>::new()
+    );
+}
+
+#[test]
+fn relative_install_data_work_and_dat_paths_work() {
+    // Cargo runs tests in the crate's folder; every path below is relative to it.
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .unwrap();
+    let workspace = crate_dir.join("../..").canonicalize().unwrap();
+    let relative = |path: &Path| {
+        Path::new("../..").join(
+            path.canonicalize()
+                .unwrap()
+                .strip_prefix(&workspace)
+                .unwrap(),
+        )
+    };
+    let install = PathBuf::from(std::env::var_os("TITLE_SELECT_RETOOL").unwrap());
+    let target = workspace.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let work = tempfile::tempdir_in(&target).unwrap();
+    let path = work.path().join("solo.dat");
+    dat(&path, "Title Select - Relative", &["Solo (Europe)"]);
+    let data = data_dir(work.path());
+    std::fs::write(
+        data.join("clonelists/Title Select - Relative.json"),
+        r#"{"description": {"name": "Title Select - Relative", "lastUpdated": "2024-01-01 00:00:00", "minimumVersion": "2.4.8"}, "variants": []}"#,
+    )
+    .unwrap();
+
+    let selection = Engine::open(&relative(&install))
+        .unwrap()
+        .with_data_dir(&relative(&data))
+        .select(
+            &relative(&path),
+            &SelectionProfile::default(),
+            &support::options(&relative(work.path())),
+        )
+        .unwrap();
+    assert_eq!(selection.summary.winners, 1);
 }
 
 /// The acceptance run on a real DAT, which can't be committed:

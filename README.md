@@ -432,8 +432,10 @@ it as the browser runs it. `crates/selection` runs Retool and derives the Select
 - `upstream/`: the pristine Retool tree at a pinned commit, without its GUI, never edited in place. Its `tests/`
   fixtures seed the conformance tests.
 - `patches/`: applied in order at build time. `0001-no-network` turns every download into an error, so a missing
-  clone-list or metadata folder or config file fails instead of being fetched; `0002-run-paths` adds `--clonelist-dir`,
-  `--metadata-dir`, `--mia-dir`, `--ra-dir` and `--system-config-dir`; `0003-trace-json` adds `--trace-json <path>`.
+  clone-list or metadata folder or config file fails instead of being fetched; `0002-run-paths` adds
+  `--clonelist-dir`, `--metadata-dir`, `--mia-dir`, `--ra-dir` and `--system-config-dir`; `0003-trace-json` adds
+  `--trace-json <path>`; `0004-system-settings` makes a system's `override exclusions` clear the aftermarket exclusion
+  and its `override options` clear and accept `l` and `n`, which the parser missed.
 - `pins.toml`: the Retool commit and the sha256 of its tree, each patch's sha256, and the clone-list and metadata
   commit with the sha256 of its archive. `tools/retool/build.py` checks every one before it builds.
 - `requirements.in` and the hash-locked `requirements.txt`: Retool's runtime dependencies, without its GUI's.
@@ -444,7 +446,8 @@ patch-neutrality test, and a Python 3.11 venv made with [uv](https://docs.astral
 or a patch; the tests fail, rather than skip, without it.
 
 - **Clone-list pin:** Renovate proposes upstream's newest `main` commit in `pins.toml`, and the `clone-list pin`
-  workflow writes the new archive's sha256 on its branch and runs CI. By hand: change `commit`, run
+  workflow writes the new archive's sha256 on its branch and runs CI. It runs the default branch's `build.py`, never
+  the branch's code, because it holds a write token. By hand: change `commit`, run
   `python3 tools/retool/build.py pin-clone-lists`, then `tools/retool/setup` and the tests.
 - **Retool pin:** frozen; it changes only by hand. Vendor the new tree into `upstream/`, rework the patches, and copy
   the hashes `python3 tools/retool/build.py hash-tree` prints into `pins.toml`.
