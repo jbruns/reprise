@@ -7,6 +7,7 @@
 
 pub mod choices;
 mod config;
+mod patterns;
 mod trace;
 
 use std::fs::File;
@@ -42,6 +43,9 @@ pub enum Error {
     Install(String),
     #[error("selection profile: {0}")]
     Profile(String),
+    /// Regular expressions in the Profile that the engine cannot compile, one message each.
+    #[error("{}", .0.join("\n"))]
+    Patterns(Vec<String>),
     #[error("{context}: {source}")]
     Io {
         context: String,
@@ -88,6 +92,8 @@ pub struct Outcome {
     pub selection: Selection,
     /// Retool's trace, as JSON Lines.
     pub trace: String,
+    /// What Retool warned about on a run that succeeded, one line each.
+    pub warnings: Vec<String>,
 }
 
 /// A verified Retool install.
@@ -213,7 +219,8 @@ impl Engine {
     /// Checks that the engine can read `profile`: every name is known and every override and post filter is
     /// well formed.
     pub fn check(&self, profile: &SelectionProfile) -> Result<(), Error> {
-        self.vocabulary()?.check(profile)
+        self.vocabulary()?.check(profile)?;
+        patterns::check(&self.python(), profile)
     }
 
     /// Selects from `dat` with `profile`, applies the Profile's choices for the DAT's system, and keeps the trace.
@@ -226,6 +233,7 @@ impl Engine {
         let retool = self.root.join("retool");
         let vocabulary = self.vocabulary()?;
         vocabulary.check(profile)?;
+        patterns::check(&self.python(), profile)?;
         let dat = std::path::absolute(dat).map_err(io(dat.display().to_string()))?;
         let dat_sha256 = sha256_file(&dat)?;
 
@@ -339,6 +347,7 @@ impl Engine {
         let trace =
             std::fs::read_to_string(&trace_path).map_err(io(trace_path.display().to_string()))?;
         let derived = trace::derive(&trace)?;
+        let warnings = warnings(&std::fs::read_to_string(&stderr_path).unwrap_or_default());
         run.close().map_err(io("removing the run folder"))?;
         let mut selection = Selection {
             pins: self.pins.clone(),
@@ -352,8 +361,51 @@ impl Engine {
         };
         let choices = profile.choices.get(&selection.system);
         choices::apply(&mut selection, choices);
-        Ok(Outcome { selection, trace })
+        Ok(Outcome {
+            selection,
+            trace,
+            warnings,
+        })
     }
+}
+
+/// The warnings and errors in Retool's console output, a line each and without their colours. Retool colours
+/// them yellow (`ESC[93m`) and red (`ESC[91m`) until `ESC[0m`; its banner and progress notes are uncoloured.
+fn warnings(stderr: &str) -> Vec<String> {
+    let mut flagged = String::new();
+    let mut on = false;
+    let mut chars = stderr.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            if on || c == '\n' {
+                flagged.push(c);
+            }
+            continue;
+        }
+        let mut sequence = String::new();
+        for c in chars.by_ref() {
+            if c.is_ascii_alphabetic() {
+                sequence.push(c);
+                break;
+            }
+            sequence.push(c);
+        }
+        if let Some(params) = sequence.strip_prefix('[').and_then(|s| s.strip_suffix('m')) {
+            for param in params.split(';') {
+                match param {
+                    "93" | "91" => on = true,
+                    "" | "0" | "35" | "36" | "90" | "92" => on = false,
+                    _ => {}
+                }
+            }
+        }
+    }
+    flagged
+        .lines()
+        .map(|l| l.trim().trim_start_matches('•').trim())
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The names a Profile may use, from the engine's internal configuration.
@@ -431,4 +483,23 @@ fn sha256_file(path: &Path) -> Result<String, Error> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn warnings_are_retools_console_lines_without_colours() {
+        let stderr = "\u{1b}[0m\n\n\u{1b}[1mRetool 2.4.9\u{1b}[22m\u{1b}[0m\n\u{1b}[0m• Creating folder\n  \"\u{1b}[1m/out\
+                      \u{1b}[22m\"\u{1b}[0m\n\u{1b}[0m\u{1b}[93m• The following global post filter regexes are invalid \
+                      and will be\nskipped:\n\u{1b}[0m\n\u{1b}[0m\u{1b}[93m  • \u{1b}[1m/[\u{1b}[22m\u{1b}[0m\n";
+
+        assert_eq!(
+            super::warnings(stderr),
+            [
+                "The following global post filter regexes are invalid and will be",
+                "skipped:",
+                "/["
+            ]
+        );
+    }
 }

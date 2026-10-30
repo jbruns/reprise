@@ -119,6 +119,11 @@ refused:
 A per-system order, `exclude` or `options` replaces the global one; its overrides are added to the global ones, and
 its post filters too unless `replace_post_filters` is set.
 
+In overrides and post filters, plain text matches part of a release's name, `|` the full name and `/` a regular
+expression (Python syntax, ignoring case). A profile with a regular expression that doesn't compile is refused, so it
+can't silently match nothing. Anything else the engine warns about on a run that succeeds goes to the server's log, or
+to standard error for `title-select select`.
+
 A choice replaces the selection's winners in one group with the releases you checked, zero or more, after the engine
 has run. It is kept only where it differs from what the engine picks, or where you confirmed an unresolved group's
 pick. A choice is not applied, and is flagged, when a checked release is now excluded by your settings (conflicting)

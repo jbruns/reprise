@@ -40,9 +40,12 @@ pub fn select(
     }
     let mut options = RunOptions::new(&work);
     options.cancel = cancel;
-    let selection = engine.run(&dat, profile, &options)?.selection;
+    let outcome = engine.run(&dat, profile, &options)?;
+    for warning in &outcome.warnings {
+        eprintln!("title-select: selection engine warning for {file}: {warning}");
+    }
     drop(staged);
-    Ok(selection)
+    Ok(outcome.selection)
 }
 
 /// The preview each actor has in flight. A newer preview from the same actor cancels the older one.

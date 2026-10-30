@@ -278,6 +278,57 @@ fn a_profile_with_names_retool_does_not_know_is_refused() {
 }
 
 #[test]
+fn a_regular_expression_the_engine_cannot_compile_is_refused_rather_than_skipped() {
+    let work = tempfile::tempdir().unwrap();
+    let path = work.path().join("pair.dat");
+    dat(
+        &path,
+        "Title Select - Patterns",
+        &["Solo (Europe)", "Duo (Europe)"],
+    );
+    let engine = support::engine();
+    let mut profile = SelectionProfile {
+        post_filters: vec!["/[".into()],
+        ..Default::default()
+    };
+    profile.systems.insert(
+        "Title Select - Patterns".into(),
+        title_select_api::selection::SystemSettings {
+            overrides: title_select_api::selection::Overrides {
+                exclude: vec!["</(>".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    let checked = engine.check(&profile);
+    let selected = engine.select(&path, &profile, &support::options(work.path()));
+
+    for refused in [checked.map(|_| ()), selected.map(|_| ())] {
+        match refused {
+            Err(Error::Patterns(problems)) => {
+                assert_eq!(problems.len(), 2, "{problems:?}");
+                assert!(problems[0].contains("\"/[\" in your global post filters"));
+                assert!(problems[1].contains("\"</(>\" in your Title Select - Patterns exclude"));
+            }
+            other => panic!("expected the patterns to be refused, got {other:?}"),
+        }
+    }
+
+    // Python's `re`, as Retool uses, has lookarounds.
+    let profile = SelectionProfile {
+        post_filters: vec!["/^(?!Duo)".into()],
+        ..Default::default()
+    };
+    engine.check(&profile).unwrap();
+    let outcome = engine
+        .run(&path, &profile, &support::options(work.path()))
+        .unwrap();
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+}
+
+#[test]
 fn an_install_built_from_other_pins_is_refused() {
     let work = tempfile::tempdir().unwrap();
     std::fs::write(

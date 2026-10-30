@@ -271,9 +271,9 @@ fn run(cli: Cli) -> Result<(), String> {
                 Some(store) => store.join(title_select_store::TMP),
                 None => std::env::temp_dir(),
             };
-            let selection = title_select_selection::Engine::locate(retool.as_deref())
+            let outcome = title_select_selection::Engine::locate(retool.as_deref())
                 .and_then(|engine| {
-                    engine.select(
+                    engine.run(
                         &dat,
                         &profile,
                         &title_select_selection::RunOptions {
@@ -284,7 +284,10 @@ fn run(cli: Cli) -> Result<(), String> {
                     )
                 })
                 .map_err(|e| e.to_string())?;
-            write_report(&selection, output)
+            for warning in &outcome.warnings {
+                eprintln!("title-select: selection engine warning: {warning}");
+            }
+            write_report(&outcome.selection, output)
         }
         Command::Health { url, timeout } => {
             client::health(&url, std::time::Duration::from_secs(timeout))
