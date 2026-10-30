@@ -213,7 +213,34 @@ concurrent = 1              # jobs run at once (the default)
 pace = "default"            # gentle | default | unthrottled
 # readers = 2               # overrides the pace's payload readers
 # hashers = 2               # overrides the pace's hash workers
+
+[path_templates]            # the paths registration proposes; see "Path templates"
+source_set = "{provider}/{dat}"     # the default
+managed_folder = "{platform}"       # the default
 ```
+
+### Path templates
+
+When you register a folder, a path template proposes its path in the root from the DAT, so you don't type it in full.
+Its tokens are:
+
+- `{provider}`: the DAT's provider, such as `No-Intro` or `Redump`;
+- `{dat}`: the DAT's header name, such as `Atari - Atari 2600`;
+- `{platform}`: the front end's folder name for the system, such as `atari2600`.
+
+A source set's path is proposed from `path_templates.source_set`, by default `{provider}/{dat}`: the Atari 2600 DAT
+gives `No-Intro/Atari - Atari 2600`. `path_templates.managed_folder`, by default `{platform}`, will propose the folder
+a play library build writes to, in a root pointing at the front end's `roms/` folder: `atari2600`. You can change
+either default here, use another template when you register, or type the path yourself.
+
+The proposed path keeps every character of the provider and DAT name as it is. It must be relative to the root, not
+empty and without `..`, and registration refuses a path that resolves outside the root. A template only proposes:
+when you change it, source sets you already registered keep their paths.
+
+`{platform}` comes from a table in this repository, `crates/api/data/platforms.tsv`, of No-Intro and Redump DATs and
+the system folder names ES-DE uses, which RomM also recognises. A dump-format qualifier at the end of a DAT's name,
+such as `(Headered)` or `(Decrypted)`, doesn't change its system. A DAT the table doesn't list has no `{platform}`:
+the workbench says so, and you type the path.
 
 ## Commands
 
@@ -227,14 +254,15 @@ filename, import time, provider and source URL. A DAT is identified by its provi
 nothing and prints the existing DAT revision, restoring its file if the store had dropped it.
 
 ```sh
-title-select set add <root> <relative path> --dat <provider>/<name>
+title-select set add <root> [<relative path>] --dat <provider>/<name> [--template <path template>]
 title-select set list
 title-select set history <source set>
 ```
 
 `set add` registers a folder in a root, such as `sets "No-Intro/Atari - 2600"`, as a source set bound to an imported
-DAT. The source set is named by its folder (`Atari - 2600`). An absolute path, `..`, or a symlink that resolves
-outside the root is refused. `set list` prints each source set with the DAT revision it was last verified against:
+DAT. The source set is named by its folder (`Atari - 2600`). Without a path, it registers the path the path template
+proposes for the DAT: `--template`, else `path_templates.source_set`, by default `{provider}/{dat}` (see "Path
+templates"). An absolute path, `..`, or a symlink that resolves outside the root is refused. `set list` prints each source set with the DAT revision it was last verified against:
 its latest audit's, the latest being the last to finish. `set history` lists a source set's audits, latest first, with
 the time, DAT revision, counts, and whether the full audit is kept or only its summary.
 
@@ -324,7 +352,8 @@ Every body is JSON, and every error is `{"error": "...", "job": <id, when one is
 | `GET /api/v1/dat-revisions`                        | every DAT revision                                           |
 | `POST /api/v1/dat-revisions`                       | import a DAT: multipart `provider`, `source_url`?, `file`    |
 | `GET /api/v1/source-sets`                          | the source sets, with the DAT revision last verified against |
-| `POST /api/v1/source-sets`                         | register one: `{"root", "path", "dat"}`                      |
+| `GET /api/v1/path-templates`                       | the default path templates: `{"source_set", "managed_folder"}` |
+| `POST /api/v1/source-sets`                         | register one: `{"root", "path"?, "template"?, "dat"}`; with no `path`, the path `template`, else the default, proposes |
 | `GET /api/v1/source-sets/{name}`                   | one source set                                               |
 | `GET /api/v1/source-sets/{name}/history`           | its audits, latest first                                     |
 | `POST /api/v1/audits`                              | queue an audit job: `{"source_set", "revision"?}`; `202`     |
@@ -427,7 +456,9 @@ The workbench is your browser interface to the Service: a Leptos app compiled to
 `/api/v1` JSON API, from the same origin. Its screens:
 
 - **Source sets** lists each source set with its latest audit and the DAT revision it was last verified against, and
-  registers another from a root, a path in it and a DAT. Opening a source set shows its facts, starts an audit against
+  registers another from a root, a DAT and a path in the root. The path template proposes the path from the DAT, with a
+  live preview of the folder it names; change the template, or type over the path and use "Use the proposed path" to
+  go back. When the DAT has no `{platform}`, the preview says so and you type the path. Opening a source set shows its facts, starts an audit against
   the default DAT revision or a newer one, makes a selection with a selection profile, lists its selections, and
   lists its audit history, latest first, with a Re-audit for each row.
 - **DAT revisions** lists every DAT revision, newest import first within each DAT, with its provenance (provider,
