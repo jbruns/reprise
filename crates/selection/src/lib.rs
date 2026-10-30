@@ -305,17 +305,30 @@ impl Engine {
     }
 }
 
-/// The pins this binary was built with: those in `third_party/retool/pins.toml`.
-fn expected_pins() -> Result<SelectionPins, Error> {
+/// The upstream projects this binary's Selection is pinned to, from `third_party/retool/pins.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstream {
+    /// Retool's repository and the commit vendored in `third_party/retool/upstream`.
+    pub retool: Pinned,
+    /// The sha256 of the patches applied to it, as every Selection reports it.
+    pub patch_set_sha256: String,
+    /// The clone lists and metadata repository and the commit whose archive is fetched.
+    pub clone_lists: Pinned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct Pinned {
+    pub repository: String,
+    pub commit: String,
+}
+
+/// The upstream commits this binary was built with.
+pub fn upstream() -> Result<Upstream, Error> {
     #[derive(serde::Deserialize)]
     struct Pins {
-        retool: Commit,
+        retool: Pinned,
         patches: Vec<Patch>,
-        clone_lists: Commit,
-    }
-    #[derive(serde::Deserialize)]
-    struct Commit {
-        commit: String,
+        clone_lists: Pinned,
     }
     #[derive(serde::Deserialize)]
     struct Patch {
@@ -323,10 +336,20 @@ fn expected_pins() -> Result<SelectionPins, Error> {
     }
     let pins: Pins = toml::from_str(PINS).map_err(|e| Error::Install(format!("pins.toml: {e}")))?;
     let concatenated: String = pins.patches.iter().map(|p| p.sha256.as_str()).collect();
-    Ok(SelectionPins {
-        retool_commit: pins.retool.commit,
+    Ok(Upstream {
+        retool: pins.retool,
         patch_set_sha256: hex(&Sha256::digest(concatenated.as_bytes())),
-        clone_list_commit: pins.clone_lists.commit,
+        clone_lists: pins.clone_lists,
+    })
+}
+
+/// The pins this binary was built with: those in `third_party/retool/pins.toml`.
+fn expected_pins() -> Result<SelectionPins, Error> {
+    let upstream = upstream()?;
+    Ok(SelectionPins {
+        retool_commit: upstream.retool.commit,
+        patch_set_sha256: upstream.patch_set_sha256,
+        clone_list_commit: upstream.clone_lists.commit,
         trace_schema: SELECTION_TRACE_SCHEMA,
     })
 }

@@ -6,7 +6,7 @@ use leptos_router::path;
 use crate::events::{Stream, provide_live, use_live};
 #[cfg(feature = "bench")]
 use crate::screens::Bench;
-use crate::screens::{AuditScreen, DatRevisions, Jobs, SourceSet, SourceSets};
+use crate::screens::{About, AuditScreen, DatRevisions, Jobs, SourceSet, SourceSets};
 
 /// Without the `bench` feature, `/bench` is not a screen.
 #[cfg(not(feature = "bench"))]
@@ -39,9 +39,13 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/dat-revisions") view=DatRevisions />
                     <Route path=path!("/audits/:id") view=AuditScreen />
                     <Route path=path!("/jobs") view=Jobs />
+                    <Route path=path!("/about") view=About />
                     <Route path=path!("/bench") view=Bench />
                 </Routes>
             </main>
+            <footer class="footer">
+                <A href="/about">"About Title Select and its licences"</A>
+            </footer>
         </Router>
     }
 }

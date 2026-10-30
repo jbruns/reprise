@@ -14,7 +14,7 @@ use title_select_store::{ImportOutcome, Store};
 
 /// Audits your source sets against DAT revisions.
 #[derive(Parser)]
-#[command(version)]
+#[command(version = version())]
 struct Cli {
     /// The store directory: the database and the DAT blobs.
     #[arg(long, global = true, env = "TITLE_SELECT_STORE")]
@@ -142,6 +142,25 @@ enum SetCommand {
     List,
     /// List a source set's audits, newest first, with time, DAT revision and counts.
     History { name: String },
+}
+
+/// The package version, then the upstream commits selection is pinned to.
+fn version() -> &'static str {
+    static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let package = env!("CARGO_PKG_VERSION");
+        match title_select_selection::upstream() {
+            Ok(up) => format!(
+                "{package}\nselection engine: {} at {}, patch set {}\nclone lists and metadata: {} at {}",
+                up.retool.repository,
+                up.retool.commit,
+                up.patch_set_sha256,
+                up.clone_lists.repository,
+                up.clone_lists.commit,
+            ),
+            Err(err) => format!("{package}\n{err}"),
+        }
+    });
+    &VERSION
 }
 
 fn main() -> ExitCode {
