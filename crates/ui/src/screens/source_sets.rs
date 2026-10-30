@@ -621,7 +621,7 @@ fn Selections(
                     view! {
                         <p class="note">
                             "To make a selection, first "
-                            <A href="/profiles/new">"create a selection profile"</A>
+                            <A href="/new-profile">"create a selection profile"</A>
                             "."
                         </p>
                     }

@@ -43,7 +43,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/dat-revisions") view=DatRevisions />
                     <Route path=path!("/audits/:id") view=AuditScreen />
                     <Route path=path!("/profiles") view=Profiles />
-                    <Route path=path!("/profiles/new") view=NewProfile />
+                    <Route path=path!("/new-profile") view=NewProfile />
                     <Route path=path!("/profiles/:name") view=ProfileScreen />
                     <Route path=path!("/selections/:id") view=SelectionScreen />
                     <Route path=path!("/jobs") view=Jobs />

@@ -132,7 +132,7 @@ pub fn Profiles() -> impl IntoView {
             "A selection profile holds your settings for choosing one release per game, and your choices where you want something else. Every save is kept as a new version."
         </p>
         <div class="actions">
-            <A href="/profiles/new" attr:class="button">
+            <A href="/new-profile" attr:class="button">
                 "New selection profile"
             </A>
         </div>
