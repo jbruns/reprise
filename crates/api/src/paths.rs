@@ -72,6 +72,8 @@ pub enum PathError {
     Empty,
     Absolute,
     ParentDir,
+    /// A `\`, which Windows reads as a separator: refused everywhere, so a path means the same on every Host.
+    Backslash,
 }
 
 impl fmt::Display for PathError {
@@ -80,6 +82,7 @@ impl fmt::Display for PathError {
             PathError::Empty => "must name a folder inside its root",
             PathError::Absolute => "must be relative to its root",
             PathError::ParentDir => "must not contain `..`",
+            PathError::Backslash => "must separate folders with /, not \\",
         })
     }
 }
@@ -94,6 +97,8 @@ pub enum TemplateError {
     NoPlatform { provider: String, dat: String },
     /// The rendered path is not a valid relative path.
     Path { path: String, error: PathError },
+    /// The template's literal text makes every path it could render invalid, whatever the DAT.
+    Unusable(PathError),
 }
 
 impl fmt::Display for TemplateError {
@@ -111,6 +116,7 @@ impl fmt::Display for TemplateError {
                 "no platform folder name is known for {provider}/{dat}, so {{platform}} has no value; type the path"
             ),
             TemplateError::Path { path, error } => write!(f, "{path:?}: the path {error}"),
+            TemplateError::Unusable(error) => write!(f, "the template {error}"),
         }
     }
 }
@@ -148,10 +154,27 @@ impl PathTemplate {
         if !literal.is_empty() {
             parts.push(Part::Literal(literal));
         }
-        Ok(PathTemplate {
+        let template = PathTemplate {
             text: text.to_owned(),
             parts,
-        })
+        };
+        template.check_literals()?;
+        Ok(template)
+    }
+
+    /// Refuses a template whose literal text alone makes every rendered path invalid: empty, absolute, a `..`
+    /// segment, a backslash or a drive prefix. Each token is stood in for by a plain folder name, so only the
+    /// literal text can fail; token values are checked when the template renders.
+    fn check_literals(&self) -> Result<(), TemplateError> {
+        let stand_in = TokenValues {
+            provider: "provider".into(),
+            dat: "dat".into(),
+            platform: Some("platform".into()),
+        };
+        match self.render(&stand_in) {
+            Err(TemplateError::Path { error, .. }) => Err(TemplateError::Unusable(error)),
+            _ => Ok(()),
+        }
     }
 
     pub fn as_str(&self) -> &str {
@@ -285,9 +308,15 @@ pub fn platform(provider: &str, dat: &str) -> Option<&'static str> {
 
 /// Checks that `path` is relative, not empty and free of `..`, and returns it with `/` separators, without empty
 /// or `.` components. Every other character is kept verbatim.
+///
+/// The check is the same on every Host: a backslash is refused, and so is a Windows drive prefix such as `C:`,
+/// so neither `C:\root`, `\\server\share` nor `a\..\b` can pass where Windows would read them as a path.
 pub fn relative_path(path: &str) -> Result<String, PathError> {
-    if path.starts_with('/') {
+    if path.starts_with('/') || has_drive_prefix(path) {
         return Err(PathError::Absolute);
+    }
+    if path.contains('\\') {
+        return Err(PathError::Backslash);
     }
     let mut parts = Vec::new();
     for part in path.split('/') {
@@ -301,6 +330,12 @@ pub fn relative_path(path: &str) -> Result<String, PathError> {
         return Err(PathError::Empty);
     }
     Ok(parts.join("/"))
+}
+
+/// Whether `path` starts with a Windows drive prefix: a letter and a colon, such as `C:` or `c:folder`.
+fn has_drive_prefix(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 #[cfg(test)]
@@ -401,21 +436,69 @@ mod tests {
 
     #[test]
     fn dot_dot_absolute_and_empty_results_are_rejected() {
-        for (template, dat, error) in [
-            ("../{dat}", "X", PathError::ParentDir),
-            ("{dat}", "..", PathError::ParentDir),
-            ("{provider}/../../{dat}", "X", PathError::ParentDir),
-            ("/{dat}", "X", PathError::Absolute),
-            ("{dat}", "/etc", PathError::Absolute),
-            ("", "X", PathError::Empty),
-            ("{dat}", "", PathError::Empty),
-            ("./", "X", PathError::Empty),
+        for (dat, error) in [
+            ("..", PathError::ParentDir),
+            ("a/../..", PathError::ParentDir),
+            ("/etc", PathError::Absolute),
+            ("", PathError::Empty),
+            ("./", PathError::Empty),
         ] {
-            let rendered = render(template, "No-Intro", dat);
+            let rendered = render("{dat}", "No-Intro", dat);
             assert!(
                 matches!(&rendered, Err(TemplateError::Path { error: e, .. }) if *e == error),
-                "{template} with {dat:?}: {rendered:?}"
+                "{dat:?}: {rendered:?}"
             );
+        }
+    }
+
+    #[test]
+    fn windows_drive_unc_and_backslash_paths_are_rejected_on_every_host() {
+        for (path, error) in [
+            (r"C:\root\folder", PathError::Absolute),
+            ("C:/root/folder", PathError::Absolute),
+            ("c:folder", PathError::Absolute),
+            (r"\\server\share\folder", PathError::Backslash),
+            ("//server/share/folder", PathError::Absolute),
+            (r"\\?\C:\folder", PathError::Backslash),
+            (r"a\..\b", PathError::Backslash),
+            (r"\folder", PathError::Backslash),
+            (r"No-Intro\Atari", PathError::Backslash),
+        ] {
+            assert_eq!(relative_path(path), Err(error), "{path}");
+        }
+        assert_eq!(
+            render("{dat}", "No-Intro", r"C:\x").unwrap_err(),
+            TemplateError::Path {
+                path: r"C:\x".into(),
+                error: PathError::Absolute
+            }
+        );
+        assert_eq!(relative_path("No-Intro/a:b").unwrap(), "No-Intro/a:b");
+    }
+
+    #[test]
+    fn a_template_that_no_dat_could_make_valid_is_refused_when_parsed() {
+        for (template, error) in [
+            ("", PathError::Empty),
+            ("./", PathError::Empty),
+            ("../{dat}", PathError::ParentDir),
+            ("{provider}/../../{dat}", PathError::ParentDir),
+            ("/{dat}", PathError::Absolute),
+            ("C:/{dat}", PathError::Absolute),
+            (r"{provider}\{dat}", PathError::Backslash),
+        ] {
+            assert_eq!(
+                PathTemplate::parse(template),
+                Err(TemplateError::Unusable(error)),
+                "{template:?}"
+            );
+        }
+        assert_eq!(
+            PathTemplate::parse("../{dat}").unwrap_err().to_string(),
+            "the template must not contain `..`"
+        );
+        for template in ["{dat}", "{dat}..", "..{dat}", "{provider}:{dat}", "{dat}/."] {
+            assert!(PathTemplate::parse(template).is_ok(), "{template:?}");
         }
     }
 
@@ -430,7 +513,7 @@ mod tests {
             .unwrap(),
             "No-Intro/Nintendo - Game & Watch: \"Ö\""
         );
-        assert_eq!(render("{dat}", "No-Intro", " a\\b ").unwrap(), " a\\b ");
+        assert_eq!(render("{dat}", "No-Intro", " a b ").unwrap(), " a b ");
     }
 
     #[test]

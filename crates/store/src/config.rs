@@ -374,6 +374,25 @@ mod tests {
         ] {
             assert!(Config::parse(text).is_err(), "{text}");
         }
+        for (template, reason) in [
+            ("", "the template must name a folder inside its root"),
+            ("../{dat}", "the template must not contain `..`"),
+            ("/{dat}", "the template must be relative to its root"),
+            ("C:/{dat}", "the template must be relative to its root"),
+            (
+                r"{provider}\{dat}",
+                "the template must separate folders with /",
+            ),
+        ] {
+            for key in ["source_set", "managed_folder"] {
+                let text = format!("[path_templates]\n{key} = {template:?}");
+                let error = Config::parse(&text).unwrap_err().to_string();
+                assert!(
+                    error.contains(reason) && error.contains(key),
+                    "{text}: {error}"
+                );
+            }
+        }
     }
 
     #[test]

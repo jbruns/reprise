@@ -1,6 +1,6 @@
 //! The Source Set registry: each Source Set is a Root plus a relative path, bound to a DAT.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
@@ -86,6 +86,15 @@ pub(super) fn resolve(config: &Config, root: &str, rel: &str) -> Result<Resolved
         .ok_or_else(|| Error::Refused(format!("no root named {root} is configured")))?;
     let rel = relative_path(rel)
         .map_err(|e| Error::Refused(format!("{rel}: a source set's path {e}")))?;
+    // Defence in depth: the Host's own reading of the path must agree that every component is a plain folder name.
+    if !Path::new(&rel)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)))
+    {
+        return Err(Error::Refused(format!(
+            "{rel}: a source set's path must be relative to its root"
+        )));
+    }
     let canonical_root = root_config.path.canonicalize().map_err(|e| {
         Error::Refused(format!("root {root} ({}): {e}", root_config.path.display()))
     })?;

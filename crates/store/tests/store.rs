@@ -192,6 +192,11 @@ fn a_source_set_path_that_escapes_its_root_is_refused() {
         "/No-Intro",
         "escape",
         "",
+        r"C:\root\folder",
+        "C:folder",
+        r"\\server\share\folder",
+        "//server/share/folder",
+        r"No-Intro\..\..\outside",
     ] {
         let refused = env
             .store
