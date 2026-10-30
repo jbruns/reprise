@@ -2,7 +2,7 @@
 //! what was written before it is renamed into place.
 
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use title_select_api::build::ExpectedRom;
@@ -41,27 +41,21 @@ pub fn is_torrentzip(path: &Path) -> bool {
         .is_ok()
 }
 
-/// Copies `source` to the new file `dest`. On Linux the standard library uses `copy_file_range`, so that the
-/// filesystem may share or offload the copy; nowhere is a hardlink made.
-pub fn copy(source: &Path, dest: &Path) -> io::Result<u64> {
+/// Copies `source` into `dest`, a new, empty file the caller created. On Linux the standard library uses
+/// `copy_file_range`, so that the filesystem may share or offload the copy; nowhere is a hardlink made.
+pub fn copy(source: &Path, dest: &mut File) -> io::Result<u64> {
     let mut from = File::open(source)?;
-    let mut to = File::options().write(true).create_new(true).open(dest)?;
-    let copied = io::copy(&mut from, &mut to)?;
-    to.sync_all()?;
+    let copied = io::copy(&mut from, dest)?;
+    dest.sync_all()?;
     Ok(copied)
 }
 
-/// Writes the TorrentZip of `roms` to the new file `dest`, each ROM's payload read from its source. A payload of
-/// the wrong size is refused; checksums are checked by [`verify`] afterwards.
-pub fn repack(dest: &Path, roms: &[(&ExpectedRom, Source)]) -> Result<(), String> {
+/// Writes the TorrentZip of `roms` into `dest`, a new, empty file the caller created, each ROM's payload read from
+/// its source. A payload of the wrong size is refused; checksums are checked by [`verify`] afterwards.
+pub fn repack(dest: &File, roms: &[(&ExpectedRom, Source)]) -> Result<(), String> {
     let mut order: Vec<_> = roms.iter().collect();
     order.sort_by(|a, b| compare_names(&a.0.name, &b.0.name));
-    let file = File::options()
-        .write(true)
-        .create_new(true)
-        .open(dest)
-        .map_err(|e| format!("{}: {e}", dest.display()))?;
-    let mut writer = Writer::new(BufWriter::new(file)).map_err(|e| e.to_string())?;
+    let mut writer = Writer::new(BufWriter::new(dest)).map_err(|e| e.to_string())?;
     for (rom, source) in order {
         let opened =
             File::open(source.path).map_err(|e| format!("{}: {e}", source.path.display()))?;
@@ -84,10 +78,11 @@ pub fn repack(dest: &Path, roms: &[(&ExpectedRom, Source)]) -> Result<(), String
     file.sync_all().map_err(|e| e.to_string())
 }
 
-/// Checks that the file at `path` is valid TorrentZip whose members are exactly `roms`, under their names, and that
-/// each member's payload, decompressed and hashed again, is the one its ROM expects.
-pub fn verify(path: &Path, roms: &[ExpectedRom]) -> Result<(), String> {
-    let mut file = BufReader::new(File::open(path).map_err(|e| e.to_string())?);
+/// Checks that `file`, read from its start, is valid TorrentZip whose members are exactly `roms`, under their names,
+/// and that each member's payload, decompressed and hashed again, is the one its ROM expects.
+pub fn verify(file: &File, roms: &[ExpectedRom]) -> Result<(), String> {
+    let mut file = BufReader::new(file);
+    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     let members = torrentzip::validate(&mut file).map_err(|e| e.to_string())?;
     let mut names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
     let mut wanted: Vec<&str> = roms.iter().map(|r| r.name.as_str()).collect();

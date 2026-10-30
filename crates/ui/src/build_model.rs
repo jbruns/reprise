@@ -50,6 +50,7 @@ pub fn blocker_label(kind: BlockerKind) -> &'static str {
         BlockerKind::Marker => "Marker",
         BlockerKind::Replacement => "Replacement",
         BlockerKind::Removal => "Removal",
+        BlockerKind::Recovery => "Recovery",
     }
 }
 
@@ -65,8 +66,10 @@ pub fn build_state_label(state: BuildState) -> &'static str {
 pub fn item_state_label(state: ItemState) -> &'static str {
     match state {
         ItemState::Pending => "Not written",
+        ItemState::Publishing => "Writing",
         ItemState::Applied => "Written",
         ItemState::Failed => "Failed",
+        ItemState::Uncertain => "Uncertain",
     }
 }
 

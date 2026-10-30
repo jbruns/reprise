@@ -215,6 +215,9 @@ pub enum BlockerKind {
     Replacement,
     /// A built file would go; that needs a later build step.
     Removal,
+    /// An earlier build stopped and its folder has not been cleaned up since, or the folder holds leftovers no
+    /// build of this store accounts for.
+    Recovery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,25 +387,38 @@ pub struct BuildSummary {
 pub enum ItemState {
     /// Not written yet; after an interruption, never written.
     Pending,
+    /// Written and verified, and being renamed into place.
+    Publishing,
     /// Renamed into place.
     Applied,
     /// Its re-hash or validation failed, or it could not be written; nothing was put in place.
     Failed,
+    /// The build stopped while renaming it into place, and what is at its target now is not the file it wrote; that
+    /// file is left as it is.
+    Uncertain,
 }
 
 impl ItemState {
     pub fn as_str(self) -> &'static str {
         match self {
             ItemState::Pending => "pending",
+            ItemState::Publishing => "publishing",
             ItemState::Applied => "applied",
             ItemState::Failed => "failed",
+            ItemState::Uncertain => "uncertain",
         }
     }
 
     pub fn parse(s: &str) -> Option<ItemState> {
-        [ItemState::Pending, ItemState::Applied, ItemState::Failed]
-            .into_iter()
-            .find(|k| k.as_str() == s)
+        [
+            ItemState::Pending,
+            ItemState::Publishing,
+            ItemState::Applied,
+            ItemState::Failed,
+            ItemState::Uncertain,
+        ]
+        .into_iter()
+        .find(|k| k.as_str() == s)
     }
 }
 
@@ -457,7 +473,25 @@ pub fn invalid_name(name: &str) -> Option<String> {
             "{name:?} ends with a dot or a space, which Windows and SMB drop"
         ));
     }
+    if reserved_device(name) {
+        return Some(format!(
+            "{name} is named for a device, which Windows and SMB reserve"
+        ));
+    }
     None
+}
+
+/// Whether `name`, up to its first dot, is a Windows device name, whatever its case and extension.
+fn reserved_device(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    let upper = stem.to_ascii_uppercase();
+    match upper.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => match upper.as_bytes() {
+            [b'C', b'O', b'M', digit] | [b'L', b'P', b'T', digit] => (b'1'..=b'9').contains(digit),
+            _ => false,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -470,6 +504,10 @@ mod tests {
             "Pong (USA).zip",
             "Combat (USA, Europe) (Rev 1).zip",
             "Café ★.zip",
+            "Console (USA).zip",
+            "COM10.zip",
+            "LPT0.bin",
+            "Auxiliary.a26",
         ] {
             assert_eq!(invalid_name(ok), None, "{ok}");
         }
@@ -488,6 +526,13 @@ mod tests {
             "name ",
             "",
             "..",
+            "CON.zip",
+            "con",
+            "Prn.a26",
+            "aux.tar.gz",
+            "NUL .zip",
+            "com1.zip",
+            "LPT9",
         ] {
             assert!(invalid_name(bad).is_some(), "{bad:?}");
         }

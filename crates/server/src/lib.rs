@@ -98,7 +98,12 @@ fn prepare(settings: Settings) -> Result<Prepared, StartError> {
             ),
         }
     }
-    store.recover_builds(&config)?;
+    for (build, reason) in store.recover_builds(&config)? {
+        eprintln!(
+            "title-select: build {build} stopped and its folder was left as it is: {reason}. Plans for the folder are \
+             blocked until it is cleaned up when the service next starts"
+        );
+    }
     let listener =
         std::net::TcpListener::bind(listen).map_err(|e| StartError::Listen(listen, e))?;
     listener

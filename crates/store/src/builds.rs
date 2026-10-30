@@ -1,13 +1,18 @@
-//! Builds: carrying out an approved Change Plan in its Managed Folder. Each file is written and verified in the
-//! folder's staging directory, then renamed into place without replacing anything, and recorded applied in its own
-//! transaction. The marker's generation advances in the transaction that finishes the Build.
+//! Builds: carrying out an approved Change Plan in its Managed Folder. The folder is opened once without following a
+//! symlink, and every change is made through that handle (see [`FolderDir`]). Each file is written and verified in
+//! the folder's staging directory, its SHA-256 recorded as the item's publish intent, the marker checked again, and
+//! the file renamed into place without replacing anything; it is recorded applied in its own transaction. The
+//! Build's finalize intent is committed before the marker advances, and the marker advances before the transaction
+//! that finishes the Build. Recovery changes a folder only for a Build the store records as unfinished, and only once
+//! the folder's marker shows it is that folder.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use sha2::{Digest, Sha256};
 use title_select_api::build::{
     BuildDetail, BuildItem, BuildSummary, BuiltFile, ExpectedRom, FileStat, ItemKind, ItemState,
     Marker, PlanItem, STAGING,
@@ -16,92 +21,19 @@ use title_select_api::{Job, JobKind, JobState};
 use title_select_engine::Progress;
 use title_select_engine::build::{Source, copy, repack, verify};
 
-use super::blobs::sync_dir;
+use super::folder_dir::{FolderDir, file_stat};
 use super::folders::{
-    MARKER_NEW, MarkerState, build_by_id, builds_where, folder_by_id, locate, read_marker,
-    store_id, write_marker,
+    MARKER_NEW, MarkerState, build_by_id, builds_where, check_marker, folder_by_id, open_folder,
+    read_marker, store_id, write_marker,
 };
 use super::jobs::finish_running;
 use super::plans::{digest, json, stat, to_json};
-use super::{Error, Result, Store, io_error, now};
+use super::{Error, Fault, Result, Store, now};
 use crate::config::Config;
 
 /// What a Managed Folder's current Build cites, in `audit_citations` and `selection_citations`.
 fn cited_by(folder: i64) -> String {
     format!("managed-folder:{folder}")
-}
-
-/// Renames `from` to `to`, failing with `AlreadyExists` rather than replacing anything at `to`.
-pub(super) fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
-    match rename_noreplace(from, to) {
-        Some(result) => result,
-        None => {
-            // The filesystem cannot rename exclusively; nothing else writes to a Managed Folder while a Build runs,
-            // so a check first is the best there is.
-            if std::fs::symlink_metadata(to).is_ok() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("{} already exists", to.display()),
-                ));
-            }
-            std::fs::rename(from, to)
-        }
-    }
-}
-
-#[cfg(unix)]
-fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
-    use std::os::unix::ffi::OsStrExt;
-    std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
-}
-
-/// An exclusive rename, or `None` when the filesystem or kernel has none.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn rename_noreplace(from: &Path, to: &Path) -> Option<io::Result<()>> {
-    let (from, to) = match (c_path(from), c_path(to)) {
-        (Ok(from), Ok(to)) => (from, to),
-        (Err(e), _) | (_, Err(e)) => return Some(Err(e)),
-    };
-    // SAFETY: both paths are NUL-terminated strings that outlive the call.
-    let done = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    exclusive_outcome(done, &[libc::EINVAL, libc::ENOSYS])
-}
-
-#[cfg(target_os = "macos")]
-fn rename_noreplace(from: &Path, to: &Path) -> Option<io::Result<()>> {
-    let (from, to) = match (c_path(from), c_path(to)) {
-        (Ok(from), Ok(to)) => (from, to),
-        (Err(e), _) | (_, Err(e)) => return Some(Err(e)),
-    };
-    // SAFETY: both paths are NUL-terminated strings that outlive the call.
-    let done = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
-    exclusive_outcome(done, &[libc::EINVAL, libc::ENOTSUP])
-}
-
-#[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
-fn exclusive_outcome(done: libc::c_int, unsupported: &[libc::c_int]) -> Option<io::Result<()>> {
-    if done == 0 {
-        return Some(Ok(()));
-    }
-    let err = io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(code) if unsupported.contains(&code) => None,
-        _ => Some(Err(err)),
-    }
-}
-
-#[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
-fn rename_noreplace(_from: &Path, _to: &Path) -> Option<io::Result<()>> {
-    None
 }
 
 /// One file to write, as the approved plan lists it.
@@ -110,15 +42,49 @@ struct Work<'a> {
     item: &'a PlanItem,
 }
 
-/// Writes `item` to `staged`, verifies it, and renames it to its target in `folder`. Returns the placed file.
-fn apply(
+/// Why a file was not built: its sources or its output, which fails only the item, or the folder, which stops the
+/// Build.
+enum Failure {
+    Item(String),
+    Folder(String),
+}
+
+/// A file written and verified in the staging directory, with its SHA-256 and size.
+struct Staged {
+    sha256: String,
+    size: u64,
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The SHA-256 and size of `file`, read from its start.
+fn sha256_of(mut file: &File) -> io::Result<(String, u64)> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0; 1 << 16];
+    let mut size = 0;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+    Ok((hex(&hasher.finalize()), size))
+}
+
+/// Writes `item` to the new file `name` in `staging` and verifies it.
+fn stage(
     item: &PlanItem,
-    staged: &Path,
-    folder: &Path,
+    staging: &FolderDir,
+    name: &str,
     set_dir: &Path,
     set_root: &Path,
     built_at: SystemTime,
-) -> std::result::Result<FileStat, String> {
+) -> std::result::Result<Staged, Failure> {
     let sources: Vec<PathBuf> = item
         .sources
         .iter()
@@ -133,10 +99,15 @@ fn apply(
                 Err(format!("{}: resolves outside its root", path.display()))
             }
         })
-        .collect::<std::result::Result<_, String>>()?;
+        .collect::<std::result::Result<_, String>>()
+        .map_err(Failure::Item)?;
+    let mut file = staging
+        .create_new(name)
+        .map_err(|e| Failure::Folder(e.to_string()))?;
     match item.kind {
         ItemKind::Copy => {
-            copy(&sources[0], staged).map_err(|e| format!("{}: {e}", sources[0].display()))?;
+            copy(&sources[0], &mut file)
+                .map_err(|e| Failure::Item(format!("{}: {e}", sources[0].display())))?;
         }
         ItemKind::Repack => {
             let pairs: Vec<(&ExpectedRom, Source)> = item
@@ -157,37 +128,96 @@ fn apply(
                     )
                 })
                 .collect();
-            repack(staged, &pairs)?;
+            repack(&file, &pairs).map_err(Failure::Item)?;
         }
         _ => unreachable!("only copies and repacks are written"),
     }
-    verify(staged, &item.roms)?;
-    let file = File::options()
-        .write(true)
-        .open(staged)
-        .map_err(|e| format!("{}: {e}", staged.display()))?;
+    verify(&file, &item.roms).map_err(Failure::Item)?;
+    let staged = staging.path().join(name);
     file.set_modified(built_at)
         .and_then(|()| file.sync_all())
-        .map_err(|e| format!("{}: {e}", staged.display()))?;
-    drop(file);
-    let target = folder.join(&item.target);
-    rename_new(staged, &target).map_err(|e| match e.kind() {
-        io::ErrorKind::AlreadyExists => format!(
-            "{} appeared in the folder during the build; it was left as it is",
-            item.target
-        ),
-        _ => format!("{}: {e}", target.display()),
-    })?;
-    sync_dir(folder).map_err(|e| e.to_string())?;
-    let meta = std::fs::metadata(&target).map_err(|e| format!("{}: {e}", target.display()))?;
-    Ok(stat(&meta))
+        .map_err(|e| Failure::Folder(format!("{}: {e}", staged.display())))?;
+    let (sha256, size) =
+        sha256_of(&file).map_err(|e| Failure::Folder(format!("{}: {e}", staged.display())))?;
+    Ok(Staged { sha256, size })
 }
 
-fn remove_staging(dir: &Path) -> Result<()> {
-    match std::fs::remove_dir_all(dir) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io_error(dir, e)),
-        _ => Ok(()),
+/// Removes what a Build put in the folder's staging directory, then the directory. Anything but regular files in it
+/// is left, and the error says so.
+fn clear_staging(dir: &FolderDir) -> std::result::Result<(), String> {
+    let Some(st) = dir.stat(STAGING).map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    if FolderDir::kind(&st) != rustix::fs::FileType::Directory {
+        return Err(format!(
+            "{}/{STAGING} is not a directory; it was left as it is",
+            dir.path().display()
+        ));
     }
+    let staging = dir.sub(STAGING).map_err(|e| e.to_string())?;
+    for (name, _) in staging.entries().map_err(|e| e.to_string())? {
+        match staging.stat(&name).map_err(|e| e.to_string())? {
+            Some(st) if FolderDir::kind(&st) == rustix::fs::FileType::RegularFile => {
+                staging.unlink(&name).map_err(|e| e.to_string())?;
+            }
+            None => {}
+            Some(_) => {
+                return Err(format!(
+                    "{}/{name} is not a file a build wrote; the staging directory was left as it is",
+                    staging.path().display()
+                ));
+            }
+        }
+    }
+    dir.rmdir(STAGING)
+        .and_then(|()| dir.sync())
+        .map_err(|e| e.to_string())
+}
+
+/// Records the item `seq` of Build `build` applied and its file built, with `file`'s stat.
+fn record_applied(
+    tx: &Transaction,
+    build: i64,
+    folder: i64,
+    seq: i64,
+    item: &PlanItem,
+    file: &FileStat,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE build_items SET state = 'applied', error = NULL WHERE build_id = ?1 AND seq = ?2",
+        params![build, seq],
+    )?;
+    tx.execute(
+        "INSERT INTO built_files (folder_id, target, game, kind, build_id, selection_id, audit_id, dat_revision_id,
+                                  roms, sources, size, mtime_ns)
+         SELECT ?1, ?2, ?3, ?4, b.id, b.selection_id, b.audit_id, b.dat_revision_id, ?5, ?6, ?7, ?8
+         FROM builds b WHERE b.id = ?9
+         ON CONFLICT (folder_id, target) DO UPDATE SET
+             game = excluded.game, kind = excluded.kind, build_id = excluded.build_id,
+             selection_id = excluded.selection_id, audit_id = excluded.audit_id,
+             dat_revision_id = excluded.dat_revision_id, roms = excluded.roms, sources = excluded.sources,
+             size = excluded.size, mtime_ns = excluded.mtime_ns",
+        params![
+            folder,
+            item.target,
+            item.game,
+            item.kind.as_str(),
+            to_json(&item.roms),
+            to_json(&item.sources),
+            file.size as i64,
+            file.mtime_ns as i64,
+            build
+        ],
+    )?;
+    Ok(())
+}
+
+fn set_item(tx: &Transaction, build: i64, seq: i64, state: ItemState, error: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE build_items SET state = ?3, error = ?4 WHERE build_id = ?1 AND seq = ?2",
+        params![build, seq, state.as_str(), error],
+    )?;
+    Ok(())
 }
 
 fn build_items(c: &Connection, build: i64) -> Result<Vec<BuildItem>> {
@@ -208,7 +238,7 @@ fn build_items(c: &Connection, build: i64) -> Result<Vec<BuildItem>> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// Ends the Running Build `build` of Job `job` as `state`, and the Job as Failed with `error`.
+/// Ends the Running Build `build` of Job `job` as Failed, and the Job as Failed with `error`.
 fn end_failed(tx: &Transaction, job: i64, build: Option<i64>, error: &str) -> Result<()> {
     if let Some(build) = build {
         tx.execute(
@@ -222,11 +252,29 @@ fn end_failed(tx: &Transaction, job: i64, build: Option<i64>, error: &str) -> Re
     }
 }
 
+/// An item that was being renamed into place when its Build stopped.
+struct Publishing {
+    seq: i64,
+    target: String,
+    sha256: Option<String>,
+    size: Option<i64>,
+}
+
+/// What recovery reads about an unfinished Build.
+struct Unfinished {
+    plan: i64,
+    generation: u64,
+    finalizing: bool,
+    publishing: Vec<Publishing>,
+}
+
 impl Store {
     /// Carries out the approved plan of the Running Build Job `id`, calling `progress` as files are written. The plan
     /// is computed again first and must still have the approved digest; when it does not, the new plan is stored and
     /// the Job Failed. Files are added only: nothing in the folder is replaced or removed. A file whose sources fail
-    /// their re-hash, or whose output fails validation, is skipped and the rest go on. Returns the Job as it ends.
+    /// their re-hash, or whose output fails validation, is skipped and the rest go on; anything wrong with the folder
+    /// itself, its marker included, stops the Build, which then fails without advancing the marker. Returns the Job
+    /// as it ends.
     pub fn run_build_job(
         &self,
         config: &Config,
@@ -256,17 +304,13 @@ impl Store {
         }
         let plan_id = plan_id.ok_or_else(|| Error::Io(format!("build job {id} has no plan")))?;
         let mut build = None;
-        let mut staging = None;
-        let outcome = self.carry_out(config, id, plan_id, &mut build, &mut staging, progress);
+        let outcome = self.carry_out(config, id, plan_id, &mut build, progress);
         if let Err(err) = &outcome {
             let message = err.to_string();
             self.write(|tx| end_failed(tx, id, build, &message))?;
-        }
-        if let Some(staging) = staging {
-            remove_staging(&staging)?;
-        }
-        if let Some(build) = build {
-            self.restore_marker(config, build)?;
+            if let Some(build) = build {
+                self.recover_build(config, build)?;
+            }
         }
         let job = self.job(id)?;
         if job.state == JobState::Succeeded {
@@ -281,7 +325,6 @@ impl Store {
         job: i64,
         plan_id: i64,
         build_id: &mut Option<i64>,
-        staging_dir: &mut Option<PathBuf>,
         progress: Option<&(dyn Fn(Progress) + Sync)>,
     ) -> Result<()> {
         let plan = self.plan(plan_id)?;
@@ -301,8 +344,28 @@ impl Store {
         let audit = content
             .audit
             .ok_or_else(|| Error::Io(format!("plan {plan_id} has no audit")))?;
-        let folder_row = self.read(|c| folder_by_id(c, content.folder))?;
-        let folder = locate(config, &folder_row.root, &folder_row.path).map_err(Error::Refused)?;
+        let (folder_row, store) =
+            self.read(|c| Ok((folder_by_id(c, content.folder)?, store_id(c)?)))?;
+        let dir =
+            open_folder(config, &folder_row.root, &folder_row.path).map_err(Error::Refused)?;
+        let expected = Marker {
+            store,
+            folder: content.folder,
+            generation: content.generation,
+        };
+        check_marker(&dir, &expected).map_err(Error::Refused)?;
+        for leftover in [STAGING, MARKER_NEW] {
+            if dir
+                .stat(leftover)
+                .map_err(|e| Error::Io(e.to_string()))?
+                .is_some()
+            {
+                return Err(Error::Refused(format!(
+                    "{} holds {leftover}, which no build of this store left there; nothing was written",
+                    dir.path().display()
+                )));
+            }
+        }
         let (set_dir, set_root) = self.set_folder(config, folder_row.source_set_id)?;
         let work: Vec<Work> = content
             .items
@@ -348,10 +411,9 @@ impl Store {
         })?;
         *build_id = Some(id);
 
-        let staging = folder.canonical.join(STAGING);
-        remove_staging(&staging)?;
-        std::fs::create_dir(&staging).map_err(|e| io_error(&staging, e))?;
-        *staging_dir = Some(staging.clone());
+        let folder_io = |e: io::Error| Error::Io(e.to_string());
+        dir.mkdir(STAGING).map_err(folder_io)?;
+        let staging = dir.sub(STAGING).map_err(folder_io)?;
         let built_at = SystemTime::now();
         let total = work.len();
         if let Some(progress) = progress {
@@ -361,58 +423,56 @@ impl Store {
             });
         }
         for (done, w) in work.iter().enumerate() {
-            let staged = staging.join(format!("{}.zip", w.seq));
-            let outcome = apply(
-                w.item,
-                &staged,
-                &folder.canonical,
-                &set_dir,
-                &set_root,
-                built_at,
-            );
-            if outcome.is_err() {
-                let _ = std::fs::remove_file(&staged);
-            }
-            self.write(|tx| {
-                match &outcome {
-                    Ok(file) => {
-                        tx.execute(
-                            "UPDATE build_items SET state = 'applied' WHERE build_id = ?1 AND seq = ?2",
-                            params![id, w.seq],
-                        )?;
-                        tx.execute(
-                            "INSERT INTO built_files (folder_id, target, game, kind, build_id, selection_id,
-                                                      audit_id, dat_revision_id, roms, sources, size, mtime_ns)
-                             SELECT ?1, ?2, ?3, ?4, b.id, b.selection_id, b.audit_id, b.dat_revision_id, ?5, ?6,
-                                    ?7, ?8
-                             FROM builds b WHERE b.id = ?9
-                             ON CONFLICT (folder_id, target) DO UPDATE SET
-                                 game = excluded.game, kind = excluded.kind, build_id = excluded.build_id,
-                                 selection_id = excluded.selection_id, audit_id = excluded.audit_id,
-                                 dat_revision_id = excluded.dat_revision_id, roms = excluded.roms,
-                                 sources = excluded.sources, size = excluded.size, mtime_ns = excluded.mtime_ns",
-                            params![
-                                content.folder,
-                                w.item.target,
-                                w.item.game,
-                                w.item.kind.as_str(),
-                                to_json(&w.item.roms),
-                                to_json(&w.item.sources),
-                                file.size as i64,
-                                file.mtime_ns as i64,
-                                id
-                            ],
-                        )?;
+            let name = format!("{}.zip", w.seq);
+            let target = &w.item.target;
+            match stage(w.item, &staging, &name, &set_dir, &set_root, built_at) {
+                Err(Failure::Item(error)) => {
+                    match staging.unlink(&name) {
+                        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                            return Err(Error::Io(e.to_string()));
+                        }
+                        _ => {}
                     }
-                    Err(error) => {
-                        tx.execute(
-                            "UPDATE build_items SET state = 'failed', error = ?3 WHERE build_id = ?1 AND seq = ?2",
-                            params![id, w.seq, error],
-                        )?;
-                    }
+                    self.write(|tx| set_item(tx, id, w.seq, ItemState::Failed, &error))?;
                 }
-                Ok(())
-            })?;
+                Err(Failure::Folder(error)) => {
+                    self.write(|tx| set_item(tx, id, w.seq, ItemState::Failed, &error))?;
+                    return Err(Error::Io(error));
+                }
+                Ok(staged) => {
+                    self.write(|tx| {
+                        tx.execute(
+                            "UPDATE build_items SET state = 'publishing', sha256 = ?3, size = ?4
+                             WHERE build_id = ?1 AND seq = ?2",
+                            params![id, w.seq, staged.sha256, staged.size as i64],
+                        )?;
+                        Ok(())
+                    })?;
+                    let renamed = check_marker(&dir, &expected).and_then(|()| {
+                        staging
+                            .rename_new(&name, &dir, target)
+                            .map_err(|e| match e.kind() {
+                                io::ErrorKind::AlreadyExists => format!(
+                                    "{target} appeared in the folder during the build; it was left as it is"
+                                ),
+                                _ => e.to_string(),
+                            })
+                    });
+                    if let Err(error) = renamed {
+                        self.write(|tx| set_item(tx, id, w.seq, ItemState::Failed, &error))?;
+                        return Err(Error::Refused(error));
+                    }
+                    // From here until the item is recorded applied, recovery settles it from its publish intent.
+                    dir.sync().map_err(folder_io)?;
+                    self.fault_point(Fault::AfterPublish(w.seq));
+                    let st = dir.stat(target).map_err(folder_io)?.ok_or_else(|| {
+                        Error::Io(format!("{target} vanished once it was in place"))
+                    })?;
+                    self.write(|tx| {
+                        record_applied(tx, id, content.folder, w.seq, w.item, &file_stat(&st))
+                    })?;
+                }
+            }
             if let Some(progress) = progress {
                 progress(Progress {
                     files_done: done + 1,
@@ -420,7 +480,25 @@ impl Store {
                 });
             }
         }
+        drop(staging);
+        clear_staging(&dir).map_err(Error::Io)?;
 
+        check_marker(&dir, &expected).map_err(Error::Refused)?;
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE builds SET finalizing_at = ?2 WHERE id = ?1",
+                params![id, now()],
+            )?;
+            Ok(())
+        })?;
+        write_marker(
+            &dir,
+            &Marker {
+                generation,
+                ..expected.clone()
+            },
+        )?;
+        self.fault_point(Fault::AfterMarker);
         let key = cited_by(content.folder);
         self.write(|tx| {
             tx.execute(
@@ -428,7 +506,7 @@ impl Store {
                 params![content.folder, generation as i64, id],
             )?;
             tx.execute(
-                "UPDATE builds SET state = 'succeeded', finished_at = ?2 WHERE id = ?1",
+                "UPDATE builds SET state = 'succeeded', finished_at = ?2, cleaned_at = ?2 WHERE id = ?1",
                 params![id, now()],
             )?;
             tx.execute("DELETE FROM audit_citations WHERE cited_by = ?1", [&key])?;
@@ -444,72 +522,223 @@ impl Store {
                 "INSERT INTO selection_citations (selection_id, cited_by) VALUES (?1, ?2)",
                 params![content.selection, key],
             )?;
-            finish_running(tx, job, JobState::Succeeded, None)?;
-            // Last, so that the marker advances only if everything else will commit; a crash between the two
-            // leaves the marker one ahead, which recovery puts back.
-            write_marker(
-                &folder.canonical,
-                &Marker {
-                    store: store_id(tx)?,
-                    folder: content.folder,
-                    generation,
-                },
-            )
+            finish_running(tx, job, JobState::Succeeded, None)
         })
     }
 
-    /// Puts the marker of Build `build`'s folder back to the store's generation when it is one ahead because the
-    /// Build did not finish, and removes a half-written marker.
-    fn restore_marker(&self, config: &Config, build: i64) -> Result<()> {
-        let (folder, state) = self.read(|c| {
-            let b = build_by_id(c, build)?;
-            Ok((folder_by_id(c, b.folder)?, b.state))
+    /// Cleans up the folder of the unfinished Build `build`: settles each item it was renaming into place, removes
+    /// its staging directory and a half-written marker, and puts back a marker it advanced. Nothing is changed unless
+    /// the folder's marker shows it is the store's folder, at the store's generation or, with the Build's finalize
+    /// intent recorded, at the Build's. Returns why the folder was left as it is, if it was; the Build then still
+    /// needs recovery, and plans for its folder are blocked.
+    fn recover_build(&self, config: &Config, build: i64) -> Result<Option<String>> {
+        let (unfinished, folder, store) = self.read(|c| {
+            let (folder, plan, generation, finalizing): (i64, i64, i64, bool) = c.query_row(
+                "SELECT folder_id, plan_id, generation, finalizing_at IS NOT NULL FROM builds WHERE id = ?1",
+                [build],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            let mut stmt = c.prepare(
+                "SELECT seq, target, sha256, size FROM build_items
+                 WHERE build_id = ?1 AND state = 'publishing' ORDER BY seq",
+            )?;
+            let publishing = stmt
+                .query_map([build], |r| {
+                    Ok(Publishing {
+                        seq: r.get(0)?,
+                        target: r.get(1)?,
+                        sha256: r.get(2)?,
+                        size: r.get(3)?,
+                    })
+                })?
+                .collect::<Result<_, _>>()?;
+            Ok((
+                Unfinished {
+                    plan,
+                    generation: generation as u64,
+                    finalizing,
+                    publishing,
+                },
+                folder_by_id(c, folder)?,
+                store_id(c)?,
+            ))
         })?;
-        if state == title_select_api::build::BuildState::Succeeded {
-            return Ok(());
-        }
-        self.restore_folder(config, folder.id)
+        let outcome = self.clean_folder(config, build, &unfinished, &folder, store)?;
+        let error = outcome.as_ref().err().cloned();
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE builds SET cleaned_at = CASE WHEN ?2 IS NULL THEN ?3 END, recovery_error = ?2 WHERE id = ?1",
+                params![build, error, now()],
+            )?;
+            Ok(())
+        })?;
+        Ok(error)
     }
 
-    fn restore_folder(&self, config: &Config, id: i64) -> Result<()> {
-        let (folder, store) = self.read(|c| Ok((folder_by_id(c, id)?, store_id(c)?)))?;
-        let Ok(located) = locate(config, &folder.root, &folder.path) else {
-            return Ok(());
+    fn clean_folder(
+        &self,
+        config: &Config,
+        build: i64,
+        unfinished: &Unfinished,
+        folder: &super::folders::FolderRow,
+        store: String,
+    ) -> Result<std::result::Result<(), String>> {
+        let dir = match open_folder(config, &folder.root, &folder.path) {
+            Ok(dir) => dir,
+            Err(reason) => return Ok(Err(reason)),
         };
-        let _ = std::fs::remove_file(located.path.join(MARKER_NEW));
-        if let MarkerState::Present(marker) = read_marker(&located.path)
-            && marker.store == store
-            && marker.folder == folder.id
-            && marker.generation == folder.generation + 1
-        {
+        let rewind = match read_marker(&dir) {
+            MarkerState::Present(m) if m.store == store && m.folder == folder.id => {
+                if m.generation == folder.generation {
+                    false
+                } else if m.generation == folder.generation + 1
+                    && unfinished.generation == m.generation
+                    && unfinished.finalizing
+                {
+                    true
+                } else {
+                    return Ok(Err(format!(
+                        "its marker is at build generation {}, and the store is at {} with no record of build {build} \
+                         advancing it; the folder was left as it is",
+                        m.generation, folder.generation
+                    )));
+                }
+            }
+            MarkerState::Present(_) => {
+                return Ok(Err(
+                    "its marker is for another folder or another store; the folder was left as it is".into(),
+                ));
+            }
+            MarkerState::Absent => {
+                return Ok(Err("it has no marker; the folder was left as it is".into()));
+            }
+            MarkerState::Unreadable(e) => {
+                return Ok(Err(format!(
+                    "its marker cannot be read ({e}); the folder was left as it is"
+                )));
+            }
+        };
+        let expected = Marker {
+            store,
+            folder: folder.id,
+            generation: if rewind {
+                folder.generation + 1
+            } else {
+                folder.generation
+            },
+        };
+
+        match dir.stat(MARKER_NEW) {
+            Ok(None) => {}
+            Ok(Some(st)) if FolderDir::kind(&st) == rustix::fs::FileType::RegularFile => {
+                if let Err(e) = dir.unlink(MARKER_NEW) {
+                    return Ok(Err(e.to_string()));
+                }
+            }
+            Ok(Some(_)) => {
+                return Ok(Err(format!(
+                    "{MARKER_NEW} is not a file a build wrote; the folder was left as it is"
+                )));
+            }
+            Err(e) => return Ok(Err(e.to_string())),
+        }
+
+        if !unfinished.publishing.is_empty() {
+            let items = self.plan(unfinished.plan)?.content.items;
+            for p in &unfinished.publishing {
+                let item = items
+                    .iter()
+                    .find(|i| i.kind.writes() && i.target == p.target)
+                    .ok_or_else(|| {
+                        Error::Io(format!("build {build}: no plan item for {}", p.target))
+                    })?;
+                if let Err(reason) = check_marker(&dir, &expected) {
+                    return Ok(Err(reason));
+                }
+                let found = match dir.open_file(&p.target) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                    Err(e) => Some(Err(e.to_string())),
+                    Ok(file) => Some(
+                        sha256_of(&file)
+                            .and_then(|hash| Ok((hash, stat(&file.metadata()?))))
+                            .map_err(|e| e.to_string()),
+                    ),
+                };
+                self.write(|tx| match found {
+                    None => set_item(
+                        tx,
+                        build,
+                        p.seq,
+                        ItemState::Failed,
+                        "the build stopped before the file was put in place",
+                    ),
+                    Some(Ok(((sha256, size), file)))
+                        if Some(&sha256) == p.sha256.as_ref() && Some(size as i64) == p.size =>
+                    {
+                        record_applied(tx, build, folder.id, p.seq, item, &file)
+                    }
+                    Some(Ok(_)) => set_item(
+                        tx,
+                        build,
+                        p.seq,
+                        ItemState::Uncertain,
+                        &format!(
+                            "the build stopped while putting {} in place, and the file there now is not the one it \
+                             wrote; it was left as it is",
+                            p.target
+                        ),
+                    ),
+                    Some(Err(e)) => set_item(
+                        tx,
+                        build,
+                        p.seq,
+                        ItemState::Uncertain,
+                        &format!(
+                            "the build stopped while putting {} in place, and what is there now cannot be checked \
+                             ({e}); it was left as it is",
+                            p.target
+                        ),
+                    ),
+                })?;
+            }
+        }
+
+        if let Err(reason) = clear_staging(&dir) {
+            return Ok(Err(reason));
+        }
+        if rewind {
+            if let Err(reason) = check_marker(&dir, &expected) {
+                return Ok(Err(reason));
+            }
             write_marker(
-                &located.path,
+                &dir,
                 &Marker {
                     generation: folder.generation,
-                    ..marker
+                    ..expected
                 },
             )?;
         }
-        Ok(())
+        Ok(Ok(()))
     }
 
-    /// Run when the service starts, after [`Store::recover_jobs`]: removes each Managed Folder's staging directory,
-    /// and puts back a marker an unfinished Build advanced. A folder that cannot be reached is left for its next plan
-    /// to report.
-    pub fn recover_builds(&self, config: &Config) -> Result<()> {
-        let folders: Vec<i64> = self.read(|c| {
-            let mut stmt = c.prepare("SELECT id FROM managed_folders ORDER BY id")?;
+    /// Run when the service starts, after [`Store::recover_jobs`]: cleans up the folder of each Build that ended
+    /// without its folder being cleaned up. A folder that is not the store's, or
+    /// cannot be reached, is left as it is; returns, for each, the Build and why.
+    pub fn recover_builds(&self, config: &Config) -> Result<Vec<(i64, String)>> {
+        let builds: Vec<i64> = self.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id FROM builds WHERE cleaned_at IS NULL AND state IN ('failed', 'interrupted') ORDER BY id",
+            )?;
             let rows = stmt.query_map([], |r| r.get(0))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })?;
-        for id in folders {
-            let folder = self.read(|c| folder_by_id(c, id))?;
-            if let Ok(located) = locate(config, &folder.root, &folder.path) {
-                remove_staging(&located.path.join(STAGING))?;
+        let mut blocked = Vec::new();
+        for id in builds {
+            if let Some(reason) = self.recover_build(config, id)? {
+                blocked.push((id, reason));
             }
-            self.restore_folder(config, id)?;
         }
-        Ok(())
+        Ok(blocked)
     }
 
     pub fn build(&self, id: i64) -> Result<BuildDetail> {

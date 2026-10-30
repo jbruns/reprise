@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use sha2::{Digest, Sha256};
 use title_select_api::build::{
     Approval, Blocker, BlockerKind, Cause, ExpectedRom, FileStat, ItemKind, Plan, PlanChange,
-    PlanContent, PlanItem, PlanSource, invalid_name,
+    PlanContent, PlanItem, PlanSource, STAGING, invalid_name,
 };
 use title_select_api::report::{Entry, EvidenceLevel, Finding};
 use title_select_api::selection::{ReleaseRow, Role, Selection, diff_rows};
@@ -21,7 +21,10 @@ use title_select_engine::dat::Dat;
 
 use super::audits::{ENTRY_COLUMNS, entry_from_row};
 use super::dats::revision_by_id;
-use super::folders::{FolderRow, MarkerState, folder_by_id, is_own, locate, read_marker, store_id};
+use super::folder_dir::{FolderDir, file_stat};
+use super::folders::{
+    FolderRow, MARKER_NEW, MarkerState, folder_by_id, is_own, open_folder, read_marker, store_id,
+};
 use super::jobs::job_by_id;
 use super::selections::{read_rows, read_selection, record_by_id};
 use super::sets::{resolve, set_by_id};
@@ -120,6 +123,8 @@ struct Inputs {
     entries: Vec<Entry>,
     built: BTreeMap<String, Built>,
     previous: Option<Previous>,
+    /// The folder's earliest Build that ended without its folder being cleaned up, and why recovery left it.
+    unrecovered: Option<(i64, Option<String>)>,
 }
 
 fn load(c: &Connection, folder_id: i64, selection_id: i64) -> Result<Inputs> {
@@ -192,7 +197,17 @@ fn load(c: &Connection, folder_id: i64, selection_id: i64) -> Result<Inputs> {
         }
         None => None,
     };
+    let unrecovered = c
+        .query_row(
+            "SELECT id, recovery_error FROM builds
+             WHERE folder_id = ?1 AND cleaned_at IS NULL AND state IN ('failed', 'interrupted')
+             ORDER BY id LIMIT 1",
+            [folder.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
     Ok(Inputs {
+        unrecovered,
         store: store_id(c)?,
         built: read_built(c, folder.id)?,
         folder,
@@ -242,38 +257,40 @@ fn check_folder(config: &Config, inputs: &Inputs, blockers: &mut Vec<Blocker>) -
             ),
         ));
     }
-    let located = match locate(config, &folder.root, &folder.path) {
-        Ok(located) => located,
+    let dir = match open_folder(config, &folder.root, &folder.path) {
+        Ok(dir) => dir,
         Err(reason) => {
             blockers.push(blocker(
                 BlockerKind::FolderMissing,
-                format!("the managed folder cannot be found: {reason}. Is its share mounted?"),
+                format!("the managed folder cannot be opened: {reason}. Is its share mounted?"),
             ));
+            return None;
+        }
+    };
+    let listing = match dir.entries() {
+        Ok(listing) => listing,
+        Err(e) => {
+            blockers.push(blocker(BlockerKind::FolderMissing, e.to_string()));
             return None;
         }
     };
     let mut files = HashMap::new();
-    let listing = match std::fs::read_dir(&located.path) {
-        Ok(listing) => listing,
-        Err(e) => {
-            blockers.push(blocker(
-                BlockerKind::FolderMissing,
-                format!("{}: {e}", located.path.display()),
-            ));
-            return None;
-        }
-    };
-    for entry in listing {
-        let Ok(entry) = entry else { continue };
-        let name = entry.file_name().to_string_lossy().into_owned();
+    let mut leftovers = Vec::new();
+    for (name, _) in listing {
         if is_own(&name) {
+            if name == STAGING || name == MARKER_NEW {
+                leftovers.push(name);
+            }
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue };
-        files.insert(name.to_lowercase(), (name, stat(&meta)));
+        let Ok(Some(st)) = dir.stat(&name) else {
+            continue;
+        };
+        files.insert(name.to_lowercase(), (name, file_stat(&st)));
     }
+    check_recovery(inputs, &dir, &leftovers, blockers);
     let generation = folder.generation;
-    let problem = match read_marker(&located.path) {
+    let problem = match read_marker(&dir) {
         MarkerState::Absent if files.is_empty() && generation == 0 => None,
         MarkerState::Absent if files.is_empty() => Some(format!(
             "the folder is empty and has no marker, though {generation} builds went into it; is its share mounted?"
@@ -309,6 +326,39 @@ fn check_folder(config: &Config, inputs: &Inputs, blockers: &mut Vec<Blocker>) -
         blockers.push(blocker(BlockerKind::Marker, problem));
     }
     Some(files)
+}
+
+/// Blocks on an earlier Build whose folder recovery has not cleaned up, or on a staging directory or half-written
+/// marker that no Build of this store accounts for.
+fn check_recovery(
+    inputs: &Inputs,
+    dir: &FolderDir,
+    leftovers: &[String],
+    blockers: &mut Vec<Blocker>,
+) {
+    if let Some((build, reason)) = &inputs.unrecovered {
+        blockers.push(blocker(
+            BlockerKind::Recovery,
+            format!(
+                "build {build} stopped, and its folder has not been cleaned up since{}. The service cleans it up \
+                 when it starts; restart it once the folder is as build {build} left it",
+                reason
+                    .as_deref()
+                    .map(|r| format!(": {r}"))
+                    .unwrap_or_default()
+            ),
+        ));
+    } else if !leftovers.is_empty() && inputs.folder.active_job.is_none() {
+        blockers.push(blocker(
+            BlockerKind::Recovery,
+            format!(
+                "{} holds {}, which no build of this store left there; remove {} to build here",
+                dir.path().display(),
+                leftovers.join(" and "),
+                if leftovers.len() == 1 { "it" } else { "them" }
+            ),
+        ));
+    }
 }
 
 /// One Entry that holds a ROM's payload.
@@ -620,6 +670,12 @@ fn plan_items(
         let blocked = if !games.contains_key(game) {
             Some(format!("the DAT revision lists no game named {game}"))
         } else if let Some(reason) = invalid_name(&target) {
+            Some(reason)
+        } else if let Some(reason) = item
+            .roms
+            .iter()
+            .find_map(|r| invalid_name(&r.name).map(|why| format!("a ROM's name: {why}")))
+        {
             Some(reason)
         } else if lowered[&target.to_lowercase()] > 1 {
             Some(format!(

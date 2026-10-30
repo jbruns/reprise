@@ -384,8 +384,18 @@ approved it, storing the new plan for you to review. Otherwise it writes each fi
 managed folder, re-hashes its ROMs against the DAT, checks the TorrentZip's structure, and renames it into place
 without replacing anything; a source that fails its re-hash fails only its own file. Files get your umask's
 permissions and the build's time as their modification time. The marker's generation goes up last, when the build
-succeeds. A build cut off by a stop is not run again: the staging folder is removed when the server starts, the
-files already in place are recorded, and the next plan starts from them.
+succeeds. Every write goes through the managed folder as it was opened, never a symlink, and the build checks the
+marker again before each file and before the marker; if the marker changed, or the folder itself fails a write, the
+build fails and the marker stays where it was. Renaming without replacing needs a filesystem that supports it; when
+yours does not, the build fails rather than risk overwriting a file. A ROM name with a path separator, a `..`
+part, a drive or a device name such as `CON` is a blocked item.
+
+A build cut off by a stop or a failure is not run again. When the server starts, it cleans up after such a build only
+if the folder's marker is still this store's and matches what the build recorded: it then removes the staging folder,
+records each file already put in place whose content it re-hashes and finds as planned, and marks any other file at
+that target uncertain, leaving it as it is. A marker the build advanced just before the stop is put back. Otherwise it
+changes nothing, and planning for that folder is blocked until you resolve it and restart the server. A staging folder
+or a marker temporary file that no build accounts for also blocks planning until you remove it.
 
 The current build of each managed folder keeps its selection and its audit from being pruned.
 

@@ -1,7 +1,6 @@
 //! Managed Folders: folders in writable Roots that Builds write a Source Set's Selections into, each holding one
 //! marker that ties it to this store.
 
-use std::fs::File;
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -12,8 +11,8 @@ use title_select_api::build::{
 };
 use title_select_api::paths::{PathTemplate, TokenValues, relative_path};
 
-use super::blobs::sync_dir;
 use super::dats::split_dat;
+use super::folder_dir::FolderDir;
 use super::profiles::profile_id;
 use super::sets::{resolve, set_by_id, set_by_name};
 use super::{Error, Result, Store, io_error, now};
@@ -175,63 +174,48 @@ fn record(c: &Connection, config: &Config, row: FolderRow) -> Result<ManagedFold
     })
 }
 
-/// A Managed Folder's directory.
-pub(super) struct FolderPath {
-    /// The Root's path, as configured, joined with the folder's path.
-    pub path: PathBuf,
-    /// The folder's canonical path.
-    pub canonical: PathBuf,
-}
-
-/// Where the Managed Folder `rel` in the Root `root` is, checked to be a directory inside the Root after following
-/// symlinks. The error is a sentence for a plan's blocker.
-pub(super) fn locate(
+/// Opens the Managed Folder `rel` in the Root `root`, no component of `rel` followed if it is a symlink. The error
+/// is a sentence for a plan's blocker.
+pub(super) fn open_folder(
     config: &Config,
     root: &str,
     rel: &str,
-) -> std::result::Result<FolderPath, String> {
+) -> std::result::Result<FolderDir, String> {
     let root_config = config
         .root(root)
         .ok_or_else(|| format!("no root named {root} is configured any more"))?;
-    let canonical_root = root_config
-        .path
-        .canonicalize()
-        .map_err(|e| format!("root {root} ({}): {e}", root_config.path.display()))?;
-    let path = rel
-        .split('/')
-        .fold(root_config.path.clone(), |p, part| p.join(part));
-    let canonical = path
-        .canonicalize()
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    if !canonical.starts_with(&canonical_root) {
-        return Err(format!("{rel}: resolves outside root {root}"));
-    }
-    if !canonical.is_dir() {
-        return Err(format!("{}: not a directory", path.display()));
-    }
-    Ok(FolderPath { path, canonical })
+    FolderDir::open(&root_config.path, rel).map_err(|e| {
+        format!("{e} (no part of a managed folder's path inside its root may be a symlink)")
+    })
 }
 
 /// The temp file a marker is written to before it is renamed over the marker.
 pub(super) const MARKER_NEW: &str = ".title-select.new";
+
+/// The largest marker read.
+const MARKER_LIMIT: u64 = 64 << 10;
 
 /// Whether `name` is one of the files Title Select keeps in a Managed Folder for itself.
 pub(super) fn is_own(name: &str) -> bool {
     name == MARKER || name == STAGING || name == MARKER_NEW
 }
 
-/// Replaces the folder's marker atomically and durably.
-pub(super) fn write_marker(dir: &Path, marker: &Marker) -> Result<()> {
-    let tmp = dir.join(MARKER_NEW);
+/// Replaces the folder's marker atomically and durably. The new marker is written to a file created exclusively and
+/// without following a symlink, so anything already at [`MARKER_NEW`] makes it fail.
+pub(super) fn write_marker(dir: &FolderDir, marker: &Marker) -> Result<()> {
     let mut json = serde_json::to_vec_pretty(marker).expect("a marker always serializes");
     json.push(b'\n');
-    let mut file = File::create(&tmp).map_err(|e| io_error(&tmp, e))?;
-    file.write_all(&json).map_err(|e| io_error(&tmp, e))?;
-    file.sync_all().map_err(|e| io_error(&tmp, e))?;
+    let tmp = dir.path().join(MARKER_NEW);
+    let mut file = dir
+        .create_new(MARKER_NEW)
+        .map_err(|e| Error::Io(e.to_string()))?;
+    file.write_all(&json)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| io_error(&tmp, e))?;
     drop(file);
-    let path = dir.join(MARKER);
-    std::fs::rename(&tmp, &path).map_err(|e| io_error(&path, e))?;
-    sync_dir(dir)
+    dir.replace(MARKER_NEW, MARKER)
+        .and_then(|()| dir.sync())
+        .map_err(|e| Error::Io(e.to_string()))
 }
 
 /// What a Managed Folder's marker says.
@@ -241,9 +225,8 @@ pub(super) enum MarkerState {
     Present(Marker),
 }
 
-pub(super) fn read_marker(dir: &Path) -> MarkerState {
-    let path = dir.join(MARKER);
-    match std::fs::read(&path) {
+pub(super) fn read_marker(dir: &FolderDir) -> MarkerState {
+    match dir.read(MARKER, MARKER_LIMIT) {
         Err(e) if e.kind() == ErrorKind::NotFound => MarkerState::Absent,
         Err(e) => MarkerState::Unreadable(e.to_string()),
         Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -253,41 +236,60 @@ pub(super) fn read_marker(dir: &Path) -> MarkerState {
     }
 }
 
-/// Creates the folder `rel` in the Root at `root_path` (canonically `canonical_root`), creating each missing
-/// component, or checks that it is empty. Each existing component must resolve inside the Root.
-fn create_or_check_empty(root_path: &Path, canonical_root: &Path, rel: &str) -> Result<FolderPath> {
-    let mut path = root_path.to_path_buf();
-    for part in rel.split('/') {
-        path.push(part);
-        match path.canonicalize() {
-            Ok(canonical) => {
-                if !canonical.starts_with(canonical_root) {
-                    return Err(Error::Refused(format!("{rel}: resolves outside its root")));
-                }
-                if !canonical.is_dir() {
-                    return Err(Error::Refused(format!(
-                        "{}: not a directory",
-                        path.display()
-                    )));
-                }
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                std::fs::create_dir(&path).map_err(|e| io_error(&path, e))?;
-            }
-            Err(e) => return Err(io_error(&path, e)),
-        }
+/// Checks, through `dir`, that the folder's marker is exactly `expected`; the error says what it is instead.
+pub(super) fn check_marker(dir: &FolderDir, expected: &Marker) -> std::result::Result<(), String> {
+    match read_marker(dir) {
+        MarkerState::Present(marker) if marker == *expected => Ok(()),
+        MarkerState::Present(marker) => Err(format!(
+            "{}: the marker is for store {}, managed folder {}, generation {}, where this build expected store {}, \
+             managed folder {}, generation {}; the folder was left as it is",
+            dir.path().display(),
+            marker.store,
+            marker.folder,
+            marker.generation,
+            expected.store,
+            expected.folder,
+            expected.generation
+        )),
+        MarkerState::Absent => Err(format!(
+            "{}: the marker is gone; the folder was left as it is",
+            dir.path().display()
+        )),
+        MarkerState::Unreadable(e) => Err(format!(
+            "{}: the marker cannot be read ({e}); the folder was left as it is",
+            dir.path().display()
+        )),
     }
-    let mut entries = std::fs::read_dir(&path).map_err(|e| io_error(&path, e))?;
-    if let Some(entry) = entries.next() {
-        let name = entry.map_err(|e| io_error(&path, e))?.file_name();
+}
+
+/// Opens the folder `rel` in the Root at `root_path`, creating each missing component, and checks that it is
+/// empty. No existing component may be a symlink.
+fn create_or_check_empty(root_path: &Path, rel: &str) -> Result<FolderDir> {
+    let refused = |e: std::io::Error| Error::Refused(e.to_string());
+    let mut dir = FolderDir::open(root_path, "").map_err(refused)?;
+    for part in rel.split('/') {
+        dir = match dir.sub(part) {
+            Ok(sub) => sub,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                dir.mkdir(part).map_err(refused)?;
+                dir.sub(part).map_err(refused)?
+            }
+            Err(e) => {
+                return Err(Error::Refused(format!(
+                    "{e} (no part of a managed folder's path inside its root may be a symlink)"
+                )));
+            }
+        };
+    }
+    let entries = dir.entries().map_err(refused)?;
+    if let Some((name, _)) = entries.first() {
         return Err(Error::Refused(format!(
-            "{} is not empty (it holds {}); a managed folder starts empty, and adopting a folder's files comes later",
-            path.display(),
-            name.to_string_lossy()
+            "{} is not empty (it holds {name}); a managed folder starts empty, and adopting a folder's files comes \
+             later",
+            dir.path().display(),
         )));
     }
-    let canonical = path.canonicalize().map_err(|e| io_error(&path, e))?;
-    Ok(FolderPath { path, canonical })
+    Ok(dir)
 }
 
 /// Whether one of two canonical folders lies inside the other.
@@ -407,7 +409,7 @@ impl Store {
                 )));
             }
         }
-        let folder = create_or_check_empty(&root.path, &canonical_root, &rel)?;
+        let folder = create_or_check_empty(&root.path, &rel)?;
         self.write(|tx| {
             let store = store_id(tx)?;
             tx.execute(
@@ -417,7 +419,7 @@ impl Store {
             )?;
             let id = tx.last_insert_rowid();
             write_marker(
-                &folder.path,
+                &folder,
                 &Marker {
                     store,
                     folder: id,

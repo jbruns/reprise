@@ -58,20 +58,32 @@ CREATE TABLE builds (
     state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed', 'interrupted')),
     generation INTEGER NOT NULL,
     started_at TEXT NOT NULL,
-    finished_at TEXT
+    finished_at TEXT,
+    -- Set, and committed, before the marker is advanced to `generation`: the only evidence on which recovery puts
+    -- a marker one generation ahead of the store back.
+    finalizing_at TEXT,
+    -- When the folder was last left clean after the Build: no staging directory, no half-written marker, every
+    -- publishing item settled. A Build that ended without it still needs recovery, and its folder is not planned.
+    cleaned_at TEXT,
+    -- Why recovery left the folder as it was.
+    recovery_error TEXT
 );
 CREATE INDEX builds_by_folder ON builds (folder_id, id);
 
 -- Each file a Build writes, recorded pending before the first is written, so that an interrupted Build shows what
--- it never reached.
+-- it never reached. An item is 'uncertain' when recovery found something other than its file at its target.
 CREATE TABLE build_items (
     build_id INTEGER NOT NULL REFERENCES builds (id),
     seq INTEGER NOT NULL,
     target TEXT NOT NULL,
     game TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('copy', 'repack')),
-    state TEXT NOT NULL CHECK (state IN ('pending', 'applied', 'failed')),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'publishing', 'applied', 'failed', 'uncertain')),
     error TEXT,
+    -- The staged file's SHA-256 and size, recorded with state 'publishing' before it is renamed into place, so that
+    -- recovery can tell the file it put there from any other.
+    sha256 TEXT,
+    size INTEGER,
     PRIMARY KEY (build_id, seq)
 );
 

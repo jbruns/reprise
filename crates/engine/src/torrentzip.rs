@@ -130,6 +130,27 @@ fn decode_name(bytes: &[u8], utf8: bool) -> Result<String, Error> {
         .collect())
 }
 
+/// Why `name` could escape the folder a ZIP tool extracts it into, or `None`: an absolute path, a drive, a backslash, an
+/// empty, `.` or `..` component, or a control character.
+pub fn unsafe_name(name: &str) -> Option<&'static str> {
+    if name.chars().any(char::is_control) {
+        return Some("a member name holds a control character");
+    }
+    if name.contains('\\') {
+        return Some("a member name holds a backslash");
+    }
+    if name.starts_with('/') || name.as_bytes().get(1) == Some(&b':') {
+        return Some("a member name is an absolute path");
+    }
+    if name
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Some("a member name has an empty, . or .. component");
+    }
+    None
+}
+
 /// TorrentZip's member order: by the stored name's bytes with ASCII letters lowercased, then by the bytes as stored.
 pub fn compare_names(a: &str, b: &str) -> Ordering {
     compare_stored(&encode_name(a).0, &encode_name(b).0)
@@ -201,6 +222,9 @@ impl<W: Write + Seek> Writer<W> {
     /// Deflates `size` bytes read from `payload` as the member `name`. Members must be added in [`compare_names`]
     /// order, and `size` must be the payload's exact size: it decides the member's header before it is read.
     pub fn add(&mut self, name: &str, size: u64, payload: &mut dyn Read) -> Result<(), Error> {
+        if let Some(why) = unsafe_name(name) {
+            return Err(invalid(format!("{name:?}: {why}")));
+        }
         let (stored, utf8) = encode_name(name);
         if stored.is_empty() || stored.len() > u16::MAX as usize {
             return Err(invalid(format!(
@@ -887,5 +911,29 @@ mod tests {
             w.add("a.bin", 5, &mut &b"abc"[..]),
             Err(Error::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn member_names_that_could_escape_the_folder_are_refused() {
+        for name in [
+            "/etc/passwd",
+            "C:evil.bin",
+            "..\\evil.bin",
+            "../evil.bin",
+            "a/../../evil.bin",
+            "a//b.bin",
+            "./a.bin",
+            "dir/",
+            "a\0b.bin",
+            "a\nb.bin",
+        ] {
+            let mut w = Writer::new(Cursor::new(Vec::new())).unwrap();
+            assert!(
+                matches!(w.add(name, 1, &mut &b"x"[..]), Err(Error::Invalid(_))),
+                "{name:?}"
+            );
+        }
+        let mut w = Writer::new(Cursor::new(Vec::new())).unwrap();
+        w.add("disc/a.bin", 1, &mut &b"x"[..]).unwrap();
     }
 }

@@ -19,7 +19,7 @@ use title_select_api::{JobKind, JobState};
 use title_select_engine::build::verify;
 use title_select_engine::torrentzip::{self, Writer};
 use title_select_store::config::Config;
-use title_select_store::{Error, Store, Workers};
+use title_select_store::{Error, Fault, Store, Workers};
 
 const SET: &str = "Test - System";
 const PROFILE: &str = "Mine";
@@ -44,8 +44,29 @@ fn games() -> Vec<(&'static str, Vec<RomSpec>)> {
         ("Yars (USA)", vec![rom("Yars (USA).a26", b"yars")]),
         ("Missing (USA)", vec![rom("Missing (USA).a26", b"missing")]),
         ("Bad: Name (USA)", vec![rom("Bad (USA).a26", b"bad")]),
+        ("Sub (USA)", vec![rom("sub/Sub (USA).a26", b"sub")]),
+        ("Back (USA)", vec![rom("..\\Back (USA).a26", b"back")]),
+        ("Up (USA)", vec![rom("..", b"up")]),
+        ("Root (USA)", vec![rom("/Root (USA).a26", b"root")]),
+        ("Device (USA)", vec![rom("CON.a26", b"con")]),
+        ("Colon (USA)", vec![rom("C:Colon (USA).a26", b"colon")]),
+        ("LPT1", vec![rom("LPT1.a26", b"lpt")]),
+        ("aux", vec![rom("aux.a26", b"aux")]),
     ]
 }
+
+/// The Games whose names cannot be written into a Managed Folder: a ROM name with a path separator, a parent
+/// component, an absolute path, a device name or a drive, and Game names that are device names.
+const UNSAFE: [&str; 8] = [
+    "Sub (USA)",
+    "Back (USA)",
+    "Up (USA)",
+    "Root (USA)",
+    "Device (USA)",
+    "Colon (USA)",
+    "LPT1",
+    "aux",
+];
 
 /// A store, a read-only Root `sets` holding the Source Set, and a writable Root `play` for Managed Folders.
 struct Env {
@@ -150,6 +171,62 @@ impl Env {
             .unwrap()
     }
 
+    /// Approves `plan`, claims its Build Job and runs it with `progress`.
+    fn build_with(
+        &self,
+        plan: &Plan,
+        progress: &(dyn Fn(title_select_engine::Progress) + Sync),
+    ) -> title_select_api::Job {
+        let job = self
+            .store
+            .approve_plan(&self.config, plan.id, &plan.digest, "Operator", WORKERS)
+            .unwrap();
+        self.store.claim_job().unwrap().unwrap();
+        self.store
+            .run_build_job(&self.config, job.id, Some(progress))
+            .unwrap()
+    }
+
+    /// Approves `plan` and runs its Build Job until `fault` stops it as a kill would. Returns the Job's id.
+    fn crash(&self, plan: &Plan, fault: Fault) -> i64 {
+        let job = self
+            .store
+            .approve_plan(&self.config, plan.id, &plan.digest, "Operator", WORKERS)
+            .unwrap();
+        self.store.claim_job().unwrap().unwrap();
+        self.store.inject_fault(Some(fault));
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.store.run_build_job(&self.config, job.id, None)
+        }));
+        assert!(ran.is_err(), "{ran:?}");
+        job.id
+    }
+
+    /// Opens the store again, as the service does when it starts, and recovers. Returns the Builds whose folders
+    /// recovery left as they were.
+    fn restart(self) -> (Env, Vec<(i64, String)>) {
+        let Env {
+            tmp,
+            store,
+            config,
+            sha256,
+        } = self;
+        let path = store.dir().to_path_buf();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        store.recover_jobs(WORKERS).unwrap();
+        let blocked = store.recover_builds(&config).unwrap();
+        (
+            Env {
+                tmp,
+                store,
+                config,
+                sha256,
+            },
+            blocked,
+        )
+    }
+
     fn plan(&self, folder: &ManagedFolder, selection: i64) -> Plan {
         self.store
             .plan_build(&self.config, folder.id, selection)
@@ -243,7 +320,14 @@ fn selection(sha256: &str, groups: Vec<SelectionGroup>) -> Selection {
 
 /// Every Game of the DAT a winner.
 fn everything(sha256: &str) -> Selection {
-    selection(sha256, games().iter().map(|(g, _)| group(g)).collect())
+    selection(
+        sha256,
+        games()
+            .iter()
+            .filter(|(g, _)| !UNSAFE.contains(g))
+            .map(|(g, _)| group(g))
+            .collect(),
+    )
 }
 
 fn kinds(plan: &Plan) -> BTreeMap<String, ItemKind> {
@@ -352,7 +436,7 @@ fn a_selection_is_built_from_matched_misnamed_and_conflicting_entries_as_torrent
     for item in plan.content.items.iter().filter(|i| i.kind.writes()) {
         let path = dir.join(&item.target);
         validate(&path);
-        verify(&path, &item.roms).unwrap();
+        verify(&std::fs::File::open(&path).unwrap(), &item.roms).unwrap();
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert!(before <= mtime && mtime <= after, "{}", item.target);
     }
@@ -823,4 +907,365 @@ fn the_current_build_keeps_its_selection_and_audit_from_pruning_until_a_later_bu
     assert!(env.store.selection_record(first).unwrap().pruned);
     assert!(env.store.selection_record(second).unwrap().pruned);
     assert!(env.store.audit(audit).unwrap().pruned);
+}
+
+/// The files of `plan` a Build writes, in the order it writes them.
+fn written(plan: &Plan) -> Vec<String> {
+    plan.content
+        .items
+        .iter()
+        .filter(|i| i.kind.writes())
+        .map(|i| i.target.clone())
+        .collect()
+}
+
+#[test]
+fn a_crash_between_putting_a_file_in_place_and_recording_it_is_settled_from_its_publish_intent() {
+    let env = Env::new();
+    env.audit();
+    let id = env.record(&everything(&env.sha256));
+    let folder = env.folder("atari2600");
+    let plan = env.plan(&folder, id);
+    let targets = written(&plan);
+    let dir = env.play().join("atari2600");
+
+    let job = env.crash(&plan, Fault::AfterPublish(1));
+    assert!(dir.join(&targets[1]).is_file());
+    let (env, blocked) = env.restart();
+
+    assert!(blocked.is_empty(), "{blocked:?}");
+    let build = env.store.build_of_job(job).unwrap().unwrap();
+    let detail = env.store.build(build.id).unwrap();
+    assert_eq!(detail.build.state, BuildState::Interrupted);
+    assert_eq!(detail.items[1].state, ItemState::Applied, "{detail:?}");
+    assert_eq!(detail.items[2].state, ItemState::Pending);
+    let files = env.store.built_files(folder.id).unwrap();
+    assert!(files.iter().any(|f| f.target == targets[1]));
+    assert!(!dir.join(".title-select-staging").exists());
+    assert_eq!(marker(&dir)["generation"], 0);
+    let next = env.plan(&folder, id);
+    assert!(next.approvable(), "{:?}", next.content.blockers);
+    let item = next
+        .content
+        .items
+        .iter()
+        .find(|i| i.target == targets[1])
+        .unwrap();
+    assert_eq!(item.kind, ItemKind::Unchanged, "adopted, not a conflict");
+}
+
+#[test]
+fn a_file_changed_at_its_target_before_recovery_is_left_untouched_and_reported_uncertain() {
+    let env = Env::new();
+    env.audit();
+    let id = env.record(&everything(&env.sha256));
+    let folder = env.folder("atari2600");
+    let plan = env.plan(&folder, id);
+    let targets = written(&plan);
+    let dir = env.play().join("atari2600");
+
+    let job = env.crash(&plan, Fault::AfterPublish(1));
+    std::fs::write(dir.join(&targets[1]), b"not the build's").unwrap();
+    let (env, blocked) = env.restart();
+
+    assert!(blocked.is_empty(), "{blocked:?}");
+    let build = env.store.build_of_job(job).unwrap().unwrap();
+    let detail = env.store.build(build.id).unwrap();
+    assert_eq!(detail.items[1].state, ItemState::Uncertain);
+    assert!(
+        detail.items[1]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("left as it is")
+    );
+    assert_eq!(
+        std::fs::read(dir.join(&targets[1])).unwrap(),
+        b"not the build's"
+    );
+    let files = env.store.built_files(folder.id).unwrap();
+    assert!(!files.iter().any(|f| f.target == targets[1]));
+    let next = env.plan(&folder, id);
+    let item = next
+        .content
+        .items
+        .iter()
+        .find(|i| i.target == targets[1])
+        .unwrap();
+    assert_eq!(item.kind, ItemKind::Conflict);
+}
+
+#[test]
+fn an_interrupted_finalize_puts_the_marker_back_from_the_builds_recorded_intent() {
+    let env = Env::new();
+    env.audit();
+    let id = env.record(&everything(&env.sha256));
+    let folder = env.folder("atari2600");
+    let plan = env.plan(&folder, id);
+    let dir = env.play().join("atari2600");
+
+    let job = env.crash(&plan, Fault::AfterMarker);
+    assert_eq!(marker(&dir)["generation"], 1, "the marker advanced");
+    let (env, blocked) = env.restart();
+
+    assert!(blocked.is_empty(), "{blocked:?}");
+    assert_eq!(marker(&dir)["generation"], 0, "and was put back");
+    let build = env.store.build_of_job(job).unwrap().unwrap();
+    assert_eq!(build.state, BuildState::Interrupted);
+    assert_eq!(build.applied, written(&plan).len() as u64);
+    let next = env.plan(&folder, id);
+    assert!(next.approvable(), "{:?}", next.content.blockers);
+    assert_eq!(next.content.generation, 0);
+    assert_eq!(next.summary.unchanged, written(&plan).len() as u64);
+    assert_eq!(env.build(&next).state, JobState::Succeeded);
+    assert_eq!(marker(&dir)["generation"], 1);
+}
+
+#[test]
+fn a_store_restored_one_generation_behind_its_folder_blocks_and_recovery_leaves_the_marker() {
+    let env = Env::new();
+    env.audit();
+    let id = env.record(&everything(&env.sha256));
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    // A backup of the store, taken before the folder's first Build.
+    let Env {
+        tmp,
+        store,
+        config,
+        sha256,
+    } = env;
+    let path = store.dir().to_path_buf();
+    drop(store);
+    let backup = tmp.path().join("backup");
+    copy_dir(&path, &backup);
+    let env = Env {
+        store: Store::open(&path).unwrap(),
+        tmp,
+        config,
+        sha256,
+    };
+    assert_eq!(env.build(&env.plan(&folder, id)).state, JobState::Succeeded);
+    assert_eq!(marker(&dir)["generation"], 1);
+
+    let Env {
+        tmp,
+        store,
+        config,
+        sha256,
+    } = env;
+    drop(store);
+    let store = Store::open(&backup).unwrap();
+    store.recover_jobs(WORKERS).unwrap();
+    let blocked = store.recover_builds(&config).unwrap();
+    assert!(
+        blocked.is_empty(),
+        "the restored store has no build to recover"
+    );
+    assert_eq!(marker(&dir)["generation"], 1, "the marker is left as it is");
+    let plan = store.plan_build(&config, folder.id, id).unwrap();
+    assert_eq!(blockers(&plan), BTreeSet::from([BlockerKind::Marker]));
+    assert!(plan.content.blockers[0].message.contains("restored"));
+    drop((tmp, sha256));
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
+#[test]
+fn recovery_leaves_a_folder_whose_marker_is_not_the_stores_and_leftovers_no_build_accounts_for() {
+    let env = Env::new();
+    env.audit();
+    let id = env.record(&everything(&env.sha256));
+    let folder = env.folder("atari2600");
+    let other = env.folder("atari2600-b");
+    let dir = env.play().join("atari2600");
+    let plan = env.plan(&folder, id);
+    let job = env.crash(&plan, Fault::AfterPublish(1));
+    assert!(dir.join(".title-select-staging").is_dir());
+    let mut foreign = marker(&dir);
+    foreign["store"] = "elsewhere".into();
+    std::fs::write(dir.join(".title-select"), foreign.to_string()).unwrap();
+    // A staging directory in a folder no unfinished Build of the store accounts for.
+    let other_dir = env.play().join("atari2600-b");
+    std::fs::create_dir(other_dir.join(".title-select-staging")).unwrap();
+    std::fs::write(other_dir.join(".title-select-staging/0.zip"), b"x").unwrap();
+
+    let (env, blocked) = env.restart();
+
+    let build = env.store.build_of_job(job).unwrap().unwrap();
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0].0, build.id);
+    assert!(blocked[0].1.contains("another store"), "{blocked:?}");
+    assert!(dir.join(".title-select-staging").is_dir(), "left as it is");
+    assert_eq!(marker(&dir)["store"], "elsewhere");
+    let detail = env.store.build(build.id).unwrap();
+    assert_eq!(detail.items[1].state, ItemState::Publishing, "not settled");
+    let plan = env.plan(&folder, id);
+    assert!(blockers(&plan).contains(&BlockerKind::Recovery));
+    assert!(other_dir.join(".title-select-staging/0.zip").is_file());
+    let plan = env.plan(&other, id);
+    assert_eq!(blockers(&plan), BTreeSet::from([BlockerKind::Recovery]));
+    assert!(plan.content.blockers[0].message.contains("remove it"));
+
+    // Once the marker is the store's again, the next start cleans up.
+    let mut ours = marker(&dir);
+    ours["store"] = marker(&other_dir)["store"].clone();
+    std::fs::write(dir.join(".title-select"), ours.to_string()).unwrap();
+    let (env, blocked) = env.restart();
+    assert!(blocked.is_empty(), "{blocked:?}");
+    assert!(!dir.join(".title-select-staging").exists());
+    assert!(env.plan(&folder, id).approvable());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_planted_at_the_markers_temp_file_is_never_followed() {
+    let env = Env::new();
+    env.audit();
+    let id = env.record(&everything(&env.sha256));
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    let victim = env.tmp.path().join("victim.txt");
+    std::fs::write(&victim, b"precious").unwrap();
+    let plan = env.plan(&folder, id);
+
+    let plant = |p: title_select_engine::Progress| {
+        if p.files_done == 1 {
+            std::os::unix::fs::symlink(&victim, dir.join(".title-select.new")).unwrap();
+        }
+    };
+    let job = env.build_with(&plan, &plant);
+
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+    assert_eq!(marker(&dir)["generation"], 0, "the marker did not advance");
+    assert!(
+        std::fs::symlink_metadata(dir.join(".title-select.new"))
+            .unwrap()
+            .is_symlink(),
+        "recovery leaves what no build wrote"
+    );
+    let next = env.plan(&folder, id);
+    assert!(blockers(&next).contains(&BlockerKind::Recovery));
+}
+
+#[test]
+fn a_marker_changed_during_a_build_stops_it_before_the_next_file_is_put_in_place() {
+    let env = Env::new();
+    env.audit();
+    let id = env.record(&everything(&env.sha256));
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    let plan = env.plan(&folder, id);
+    let targets = written(&plan);
+
+    let swap = |p: title_select_engine::Progress| {
+        if p.files_done == 1 {
+            let mut m = marker(&dir);
+            m["generation"] = 5.into();
+            std::fs::write(dir.join(".title-select"), m.to_string()).unwrap();
+        }
+    };
+    let job = env.build_with(&plan, &swap);
+
+    assert_eq!(job.state, JobState::Failed);
+    assert!(job.error.as_ref().unwrap().contains("marker"), "{job:?}");
+    assert!(dir.join(&targets[0]).is_file());
+    for target in &targets[1..] {
+        assert!(!dir.join(target).exists(), "{target}");
+    }
+    assert_eq!(marker(&dir)["generation"], 5, "left as it is");
+    let build = env.store.build_of_job(job.id).unwrap().unwrap();
+    assert_eq!(build.state, BuildState::Failed);
+    assert_eq!(build.applied, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_folder_swapped_for_a_symlink_mid_build_never_redirects_a_write() {
+    let env = Env::new();
+    env.audit();
+    let id = env.record(&everything(&env.sha256));
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    let moved = env.play().join("moved");
+    let elsewhere = env.tmp.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join(".title-select"), b"someone else's").unwrap();
+    let plan = env.plan(&folder, id);
+    let targets = written(&plan);
+
+    let swap = |p: title_select_engine::Progress| {
+        if p.files_done == 1 {
+            std::fs::rename(&dir, &moved).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+        }
+    };
+    let job = env.build_with(&plan, &swap);
+
+    assert_eq!(job.state, JobState::Succeeded, "{:?}", job.error);
+    assert_eq!(
+        names(&elsewhere),
+        BTreeSet::from([".title-select".to_owned()])
+    );
+    assert_eq!(
+        std::fs::read(elsewhere.join(".title-select")).unwrap(),
+        b"someone else's"
+    );
+    for target in &targets {
+        assert!(moved.join(target).is_file(), "{target}");
+    }
+    assert_eq!(marker(&moved)["generation"], 1);
+    // The path is now a symlink, which a managed folder's path never is.
+    let next = env.plan(&folder, id);
+    assert_eq!(
+        blockers(&next),
+        BTreeSet::from([BlockerKind::FolderMissing])
+    );
+    assert!(
+        env.store
+            .add_managed_folder(&env.config, &add("atari2600/sub"))
+            .is_err()
+    );
+}
+
+#[test]
+fn rom_names_with_path_parts_and_device_names_are_blocked_items() {
+    let env = Env::new();
+    env.audit();
+    let id = env.record(&selection(
+        &env.sha256,
+        UNSAFE
+            .iter()
+            .map(|g| group(g))
+            .chain([group("Pong (USA)")])
+            .collect(),
+    ));
+    let folder = env.folder("atari2600");
+
+    let plan = env.plan(&folder, id);
+
+    for game in UNSAFE {
+        let item = plan.content.items.iter().find(|i| i.game == game).unwrap();
+        assert_eq!(item.kind, ItemKind::Blocked, "{game}");
+        assert!(item.reason.is_some(), "{game}");
+    }
+    assert!(plan.approvable(), "{:?}", plan.content.blockers);
+    let job = env.build(&plan);
+    assert_eq!(job.state, JobState::Succeeded);
+    assert_eq!(
+        names(&env.play().join("atari2600")),
+        BTreeSet::from([".title-select".to_owned(), "Pong (USA).zip".to_owned()])
+    );
 }

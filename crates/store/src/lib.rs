@@ -5,6 +5,7 @@ mod blobs;
 mod builds;
 pub mod config;
 mod dats;
+mod folder_dir;
 mod folders;
 mod jobs;
 mod migrations;
@@ -88,6 +89,17 @@ pub struct Store {
     readers: Mutex<Vec<Connection>>,
     /// Holds the exclusive lock on `lock` until the store is dropped.
     _lock: File,
+    fault: Mutex<Option<Fault>>,
+}
+
+/// A point at which a Build stops as if the service were killed there, for tests of its recovery.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// After the file of the item with this sequence number is renamed into place, before the store records it.
+    AfterPublish(i64),
+    /// After the marker advances, before the store records the Build finished.
+    AfterMarker,
 }
 
 /// Takes the store directory's exclusive lock, failing at once if another process holds it.
@@ -142,12 +154,25 @@ impl Store {
             writer: Mutex::new(writer),
             readers: Mutex::new(Vec::new()),
             _lock: lock,
+            fault: Mutex::new(None),
         };
         // Retention is not run here: it runs after an import or an Audit, so a blob restored by one command is
         // still there for the Audit the next command runs.
         store.discard_unfinished_audits()?;
         store.collect_garbage()?;
         Ok(store)
+    }
+
+    #[doc(hidden)]
+    pub fn inject_fault(&self, fault: Option<Fault>) {
+        *self.fault.lock().unwrap() = fault;
+    }
+
+    /// Stops the thread, as a kill would, at `fault` if a test injected it.
+    fn fault_point(&self, fault: Fault) {
+        if *self.fault.lock().unwrap() == Some(fault) {
+            panic!("injected fault: {fault:?}");
+        }
     }
 
     pub fn dir(&self) -> &Path {
