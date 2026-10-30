@@ -1,6 +1,7 @@
 //! The types of Title Select's versioned JSON API (`/api/v1`), shared by the Service, the headless client and the UI
 //! (ADR 0005). Every response body is one of these, or the `schema: 2` [`Report`].
 
+pub mod paths;
 pub mod report;
 pub mod selection;
 
@@ -116,10 +117,22 @@ pub struct SourceSetRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddSourceSet {
     pub root: String,
-    /// Relative to the Root.
-    pub path: String,
+    /// Relative to the Root. When absent, the path `template` proposes for the DAT is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The Path Template to propose the path from when `path` is absent; by default the configured one. Giving
+    /// both is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
     /// The DAT to audit it against, as `<provider>/<name>`.
     pub dat: String,
+}
+
+/// The configured default Path Template of each kind of registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathTemplateDefaults {
+    pub source_set: String,
+    pub managed_folder: String,
 }
 
 /// One Audit in a Source Set's history. A pruned Audit keeps only this summary.

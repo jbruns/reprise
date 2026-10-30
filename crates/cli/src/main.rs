@@ -132,15 +132,20 @@ enum DatCommand {
 
 #[derive(Subcommand)]
 enum SetCommand {
-    /// Register a folder in a root as a source set, bound to a DAT.
+    /// Register a folder in a root as a source set, bound to a DAT. With no path, the path template proposes
+    /// one from the DAT: by default `{provider}/{dat}`, such as `No-Intro/Atari - Atari 2600`.
     Add {
         /// The root's name in the configuration.
         root: String,
-        /// The source set's folder, relative to the root.
-        path: String,
+        /// The source set's folder, relative to the root. Leave it out to use the path the template proposes.
+        path: Option<String>,
         /// The DAT to audit it against, as `<provider>/<name>`.
         #[arg(long)]
         dat: String,
+        /// The path template to propose the path from, instead of `path_templates.source_set` in your
+        /// configuration. Its tokens are `{provider}`, `{dat}` and `{platform}`.
+        #[arg(long, conflicts_with = "path")]
+        template: Option<String>,
     },
     /// List the source sets with the DAT revision each was last verified against.
     List,
@@ -317,10 +322,23 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::Set {
-            command: SetCommand::Add { root, path, dat },
+            command:
+                SetCommand::Add {
+                    root,
+                    path,
+                    dat,
+                    template,
+                },
         } => {
             let config = load_config(config)?;
-            let set = open_store(store)?
+            let store = open_store(store)?;
+            let path = match path {
+                Some(path) => path,
+                None => store
+                    .propose_source_set_path(&config, &dat, template.as_deref())
+                    .map_err(|e| e.to_string())?,
+            };
+            let set = store
                 .add_source_set(&config, &root, &path, &dat)
                 .map_err(|e| e.to_string())?;
             println!(

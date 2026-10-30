@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use ipnet::IpNet;
 use serde::Deserialize;
 use title_select_api::Workers;
+use title_select_api::paths::{
+    DEFAULT_MANAGED_FOLDER_TEMPLATE, DEFAULT_SOURCE_SET_TEMPLATE, PathTemplate,
+};
 
 /// How many full Audits a Source Set keeps when the configuration does not say.
 pub const DEFAULT_AUDITS_KEPT: usize = 20;
@@ -26,6 +29,8 @@ pub struct Config {
     pub auth: Auth,
     #[serde(default)]
     pub jobs: Jobs,
+    #[serde(default)]
+    pub path_templates: PathTemplates,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,6 +78,35 @@ impl Default for Selections {
     fn default() -> Self {
         Selections {
             keep: DEFAULT_SELECTIONS_KEPT,
+        }
+    }
+}
+
+/// The default Path Templates that propose a registration's path. Each can be overridden at registration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathTemplates {
+    /// For a Source Set, relative to its Root.
+    #[serde(default = "default_source_set_template")]
+    pub source_set: PathTemplate,
+    /// For a Managed Folder, relative to its Play Library Root.
+    #[serde(default = "default_managed_folder_template")]
+    pub managed_folder: PathTemplate,
+}
+
+fn default_source_set_template() -> PathTemplate {
+    PathTemplate::parse(DEFAULT_SOURCE_SET_TEMPLATE).expect("the default template parses")
+}
+
+fn default_managed_folder_template() -> PathTemplate {
+    PathTemplate::parse(DEFAULT_MANAGED_FOLDER_TEMPLATE).expect("the default template parses")
+}
+
+impl Default for PathTemplates {
+    fn default() -> Self {
+        PathTemplates {
+            source_set: default_source_set_template(),
+            managed_folder: default_managed_folder_template(),
         }
     }
 }
@@ -162,7 +196,7 @@ impl Pace {
 }
 
 impl Default for Config {
-    /// No Roots, the default Audit history and Job limits, and no auth.
+    /// No Roots, the default Audit history, Job limits and Path Templates, and no auth.
     fn default() -> Self {
         Config {
             roots: BTreeMap::new(),
@@ -170,6 +204,7 @@ impl Default for Config {
             selections: Selections::default(),
             auth: Auth::default(),
             jobs: Jobs::default(),
+            path_templates: PathTemplates::default(),
         }
     }
 }
@@ -315,6 +350,49 @@ mod tests {
             "[jobs]\nhashers = 0",
         ] {
             assert!(Config::parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn path_templates_default_when_absent_and_are_checked_when_given() {
+        let defaults = Config::parse("").unwrap().path_templates;
+        assert_eq!(defaults.source_set.as_str(), "{provider}/{dat}");
+        assert_eq!(defaults.managed_folder.as_str(), "{platform}");
+
+        let config =
+            Config::parse("[path_templates]\nsource_set = \"Sets/{platform}/{dat}\"").unwrap();
+        assert_eq!(
+            config.path_templates.source_set.as_str(),
+            "Sets/{platform}/{dat}"
+        );
+        assert_eq!(config.path_templates.managed_folder.as_str(), "{platform}");
+
+        for text in [
+            "[path_templates]\nsource_set = \"{system}\"",
+            "[path_templates]\nmanaged_folder = \"{platform\"",
+            "[path_templates]\nother = \"{dat}\"",
+        ] {
+            assert!(Config::parse(text).is_err(), "{text}");
+        }
+        for (template, reason) in [
+            ("", "the template must name a folder inside its root"),
+            ("../{dat}", "the template must not contain `..`"),
+            ("/{dat}", "the template must be relative to its root"),
+            ("C:/{dat}", "the template must be relative to its root"),
+            ("./C:/{dat}", "the template must be relative to its root"),
+            (
+                r"{provider}\{dat}",
+                "the template must separate folders with /",
+            ),
+        ] {
+            for key in ["source_set", "managed_folder"] {
+                let text = format!("[path_templates]\n{key} = {template:?}");
+                let error = Config::parse(&text).unwrap_err().to_string();
+                assert!(
+                    error.contains(reason) && error.contains(key),
+                    "{text}: {error}"
+                );
+            }
         }
     }
 

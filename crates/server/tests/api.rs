@@ -537,6 +537,66 @@ fn the_api_uploads_a_dat_registers_a_source_set_and_audits_it_end_to_end() {
 }
 
 #[test]
+fn a_source_set_registered_without_a_path_takes_the_one_its_template_proposes() {
+    let env = Env::new();
+    std::fs::create_dir_all(env.tmp.path().join("roots/sets/No-Intro/Test - System")).unwrap();
+    let service = env.start();
+    let client = Client::new(&service);
+    client.upload("Test - System (20260101).dat", &env.dat());
+    let send = |body: serde_json::Value| {
+        let mut response = client.post("/source-sets").send_json(body).unwrap();
+        let status = response.status().as_u16();
+        (
+            status,
+            response
+                .body_mut()
+                .read_json::<serde_json::Value>()
+                .unwrap(),
+        )
+    };
+
+    let defaults: title_select_api::PathTemplateDefaults = client.json("/path-templates");
+    assert_eq!(
+        (
+            defaults.source_set.as_str(),
+            defaults.managed_folder.as_str()
+        ),
+        ("{provider}/{dat}", "{platform}")
+    );
+    let (status, both) = send(serde_json::json!(
+        {"root": "sets", "path": SET, "template": "{dat}", "dat": "No-Intro/Test - System"}
+    ));
+    assert_eq!(status, 400, "{both}");
+    let (status, unmapped) = send(serde_json::json!(
+        {"root": "sets", "template": "{platform}", "dat": "No-Intro/Test - System"}
+    ));
+    assert_eq!(status, 400);
+    assert!(
+        unmapped["error"]
+            .as_str()
+            .unwrap()
+            .contains("type the path"),
+        "{unmapped}"
+    );
+
+    let (status, proposed) =
+        send(serde_json::json!({"root": "sets", "dat": "No-Intro/Test - System"}));
+    assert_eq!(status, 201, "{proposed}");
+    assert_eq!(proposed["path"], "No-Intro/Test - System");
+    let (status, absent) = send(serde_json::json!(
+        {"root": "sets", "template": "Absent/{dat}", "dat": "No-Intro/Test - System"}
+    ));
+    assert_eq!(status, 400);
+    assert!(
+        absent["error"]
+            .as_str()
+            .unwrap()
+            .contains("Absent/Test - System"),
+        "the override proposed the path: {absent}"
+    );
+}
+
+#[test]
 fn the_bulk_ndjson_endpoint_returns_every_entry() {
     let env = Env::new();
     let set = env.tmp.path().join("roots/sets").join(SET);

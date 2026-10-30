@@ -150,6 +150,67 @@ fn a_registered_source_set_is_audited_into_the_store_and_listed_in_its_history()
 }
 
 #[test]
+fn set_add_with_no_path_registers_the_path_the_template_proposes() {
+    let (f, dat) = pong_fixture();
+    let root = f.dat_dir.path().join("sets");
+    std::fs::create_dir_all(root.join("Test/Test - System")).unwrap();
+    std::fs::create_dir_all(root.join("Mine/Test - System")).unwrap();
+    let config = f.dat_dir.path().join("title-select.toml");
+    std::fs::write(
+        &config,
+        format!("[roots.sets]\npath = {:?}\n", root.display().to_string()),
+    )
+    .unwrap();
+    let store = f.dat_dir.path().join("store");
+    let ts = || {
+        let mut cmd = title_select();
+        cmd.env("TITLE_SELECT_STORE", &store)
+            .env("TITLE_SELECT_CONFIG", &config);
+        cmd
+    };
+    run_ok(
+        ts().args(["dat", "import"])
+            .arg(&dat)
+            .args(["--provider", "Test"]),
+    );
+
+    let out = ts()
+        .args([
+            "set",
+            "add",
+            "sets",
+            "--dat",
+            "Test/Test - System",
+            "--template",
+            "{platform}",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("type the path"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let added = run_ok(ts().args(["set", "add", "sets", "--dat", "Test/Test - System"]));
+
+    assert!(added.contains("sets:Test/Test - System"), "{added}");
+    let both = ts()
+        .args([
+            "set",
+            "add",
+            "sets",
+            "Mine/Test - System",
+            "--dat",
+            "Test/Test - System",
+        ])
+        .args(["--template", "Mine/{dat}"])
+        .output()
+        .unwrap();
+    assert!(!both.status.success(), "a path and a template conflict");
+}
+
+#[test]
 fn version_prints_the_pinned_upstream_commits() {
     let pins = include_str!("../../../third_party/retool/pins.toml");
     let commits: Vec<&str> = pins
