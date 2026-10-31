@@ -27,7 +27,7 @@ use super::folders::{
     FolderRow, MARKER_NEW, folder_by_id, is_own, marker_problem, open_folder, store_id,
 };
 use super::jobs::{build_hold, job_by_id};
-use super::kept::{deletion_active, folder_dirs};
+use super::kept::{deletion_active, folder_dirs, is_dir_temp};
 use super::selections::{read_rows, read_selection, record_by_id};
 use super::sets::{resolve, set_by_id};
 use super::{Error, Result, Store, now};
@@ -342,7 +342,7 @@ fn check_folder(
     let mut leftovers = Vec::new();
     for (name, _) in &listing {
         if is_own(name) {
-            if name == STAGING || name == MARKER_NEW {
+            if name == STAGING || name == MARKER_NEW || is_dir_temp(name) {
                 leftovers.push(name.clone());
             }
             continue;
@@ -1355,11 +1355,8 @@ impl Store {
                     content.folder
                 )));
             }
-            if let Some(deletion) = deletion_active(tx, content.folder)? {
-                return Err(Error::Conflict(format!(
-                    "kept files of managed folder {} are being deleted: deletion {deletion}",
-                    content.folder
-                )));
+            if let Some(busy) = deletion_active(tx, content.folder)? {
+                return Err(Error::Conflict(busy));
             }
             let folder = folder_by_id(tx, content.folder)?;
             let revision_id: i64 = tx.query_row(

@@ -387,7 +387,9 @@ a check finds it as built, forgets its record when it is gone already, and leave
 built. A built file the plan writes again from other ROMs, as when a newer DAT revision changes the game, is a
 replacement: the old file is kept aside and the new one written in the same build. Keeping a file aside moves it, by
 one rename that never replaces anything, into `.title-select-retained/<generation>/<name>.kept` in the same folder,
-only while it is still the file the plan found. The store records each kept file with its original name, the build
+only while it is still the file the plan found. The retention area and each generation's folder are created under a
+temporary name the store records, made durable, renamed into place without replacing anything, and used only while
+they are still the folder made. The store records each kept file with its original name, the build
 that kept it and its provenance, and holds that provenance's selection and audit from pruning. A plan never removes a
 file Title Select did not build.
 
@@ -397,8 +399,12 @@ place. To change one, plan again with it. The removals are part of the digest to
 
 Kept files stay until you delete them: list them (`GET /managed-folders/{id}/kept-files`), plan deleting some or all
 (`POST /managed-folders/{id}/kept-deletions`), review the plan's digest, and approve it. Each kept file is deleted
-only while it is still the file that was kept; anything else at its name, a symlink or a directory included, is left
-and reported. Checks and drift never report the retention area.
+only while it is still the file that was kept: it is moved, without replacing anything, into the private folder
+`.title-select-retained/.deleting`, and deleted there only once what was moved is found to be that file. Anything
+else, a symlink or a directory included, is left or moved back, and reported. A kept file found already gone, with the
+folder's marker checked, is reported gone and no longer listed. A deletion the service stopped during is finished
+when it next starts, once the folder's root is writable and its marker shows it is this store's folder; until then
+its kept files stay recorded and plans for the folder are blocked. Checks and drift never report the retention area.
 
 Planning also checks the folder, as a check job does. A check job (`POST /managed-folders/{id}/checks`) reads the
 folder and writes only to the store. It reads a built file only when its size or modification time differs from the

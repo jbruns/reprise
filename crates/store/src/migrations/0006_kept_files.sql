@@ -21,9 +21,12 @@ FROM build_items;
 DROP TABLE build_items;
 ALTER TABLE build_items_new RENAME TO build_items;
 
--- The directories a Build created in a Managed Folder that outlive it: the retention area ('.title-select-retained')
--- and each generation's folder in it ('.title-select-retained/<generation>'), by device and inode, committed before
--- anything is moved into them. One found with another identity, or not recorded at all, is never used or removed.
+-- The directories Title Select created in a Managed Folder that outlive a Build: the retention area
+-- ('.title-select-retained'),
+-- each generation's folder in it ('.title-select-retained/<generation>') and the private folder kept files are
+-- deleted from ('.title-select-retained/.deleting'), by device and inode, committed before anything is moved into
+-- them. Each is created under a temporary name recorded in folder_temps, then renamed into place without replacing
+-- anything. One found with another identity, or not recorded at all, is never used or removed.
 CREATE TABLE folder_dirs (
     folder_id INTEGER NOT NULL REFERENCES managed_folders (id),
     name TEXT NOT NULL,
@@ -45,14 +48,18 @@ CREATE TABLE kept_deletions (
     approved_at TEXT,
     finished_at TEXT,
     -- KeptDeletionOutcome JSON, once carried out.
-    outcomes TEXT
+    outcomes TEXT,
+    -- Why recovery left it unfinished when the service last started, if it did.
+    recovery_error TEXT
 );
 CREATE INDEX kept_deletions_by_folder ON kept_deletions (folder_id, id);
 
 -- A file a Build moved from its Managed Folder into '.title-select-retained/<generation>/<kept_name>', with what it
 -- was: its name, its SHA-256, size and identity, and, for a file Title Select built, its game, ROMs and provenance.
 -- Recorded 'keeping', the intent, before it is moved, and 'kept' once it is found moved; recovery settles a 'keeping'
--- one from what is in the folder. 'deleting' is the intent to delete it, recorded before it is removed.
+-- one from what is in the folder. 'deleting' is the intent to delete it, recorded before it is moved into the
+-- private '.deleting' folder and removed there. 'gone' is one found already gone, with its folder's marker and
+-- retention area checked, when its deletion was carried out.
 CREATE TABLE kept_files (
     id INTEGER PRIMARY KEY,
     folder_id INTEGER NOT NULL REFERENCES managed_folders (id),
@@ -73,7 +80,7 @@ CREATE TABLE kept_files (
     mtime_ns INTEGER NOT NULL,
     dev INTEGER NOT NULL,
     ino INTEGER NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('keeping', 'kept', 'lost', 'deleting', 'deleted')),
+    state TEXT NOT NULL CHECK (state IN ('keeping', 'kept', 'lost', 'deleting', 'deleted', 'gone')),
     error TEXT,
     created_at TEXT NOT NULL,
     kept_at TEXT,

@@ -108,6 +108,12 @@ fn prepare(settings: Settings) -> Result<Prepared, StartError> {
              blocked until it is cleaned up when the service next starts"
         );
     }
+    for (deletion, reason) in store.recover_kept_deletions(&config)? {
+        eprintln!(
+            "title-select: deletion {deletion} of kept files stopped and was not finished: {reason}. Its kept files \
+             stay recorded, and plans for the folder are blocked, until it is finished when the service next starts"
+        );
+    }
     let listener =
         std::net::TcpListener::bind(listen).map_err(|e| StartError::Listen(listen, e))?;
     listener

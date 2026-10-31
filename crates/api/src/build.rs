@@ -994,6 +994,10 @@ pub struct KeptDeletion {
     /// What each deletion did, once carried out.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outcomes: Vec<KeptDeletionOutcome>,
+    /// Why recovery could not finish it when the service last started: its folder could not be shown to be this
+    /// store's. Its kept files stay recorded until it can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_error: Option<String>,
 }
 
 /// Why a name cannot be a file name on every filesystem a Play Library may be shared from, or `None` when it can.

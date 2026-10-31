@@ -33,7 +33,7 @@ use super::folders::{
     open_writable_folder, read_marker, store_id, write_marker,
 };
 use super::jobs::finish_running;
-use super::kept::{Keep, Retention, open_retention};
+use super::kept::{Keep, Retention, open_retention, settle_dir_temps};
 use super::plans::{digest, json, to_json};
 use super::{Error, Fault, Result, Store, now};
 use crate::config::Config;
@@ -209,7 +209,7 @@ fn staged_temp(name: &str) -> String {
 }
 
 /// The entries Builds and recovery created in Managed Folder `folder`, by name.
-fn temps(c: &Connection, folder: i64) -> Result<HashMap<String, Identity>> {
+pub(super) fn temps(c: &Connection, folder: i64) -> Result<HashMap<String, Identity>> {
     let mut stmt = c.prepare("SELECT name, dev, ino FROM folder_temps WHERE folder_id = ?1")?;
     let rows = stmt.query_map([folder], |r| {
         Ok((r.get(0)?, Identity::from_sql(r.get(1)?, r.get(2)?)))
@@ -218,7 +218,7 @@ fn temps(c: &Connection, folder: i64) -> Result<HashMap<String, Identity>> {
 }
 
 /// Records, and commits, that the entry `name` in Managed Folder `folder` was created as `id`.
-fn record_temp(store: &Store, folder: i64, name: &str, id: Identity) -> Result<()> {
+pub(super) fn record_temp(store: &Store, folder: i64, name: &str, id: Identity) -> Result<()> {
     let (dev, ino) = id.to_sql();
     store.write(|tx| {
         tx.execute(
@@ -1000,6 +1000,9 @@ impl Store {
         };
         let temps = self.read(|c| temps(c, folder.id))?;
 
+        if let Err(reason) = settle_dir_temps(self, folder.id, &dir)? {
+            return Ok(Err(reason));
+        }
         if let Err(reason) = self.settle_keeping(&dir, folder.id, build)? {
             return Ok(Err(reason));
         }
@@ -1137,7 +1140,6 @@ impl Store {
                 blocked.push((id, reason));
             }
         }
-        self.recover_kept_deletions(config)?;
         Ok(blocked)
     }
 

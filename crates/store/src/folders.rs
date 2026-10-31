@@ -196,7 +196,7 @@ fn unfinished(c: &Connection, row: &FolderRow) -> Result<Option<UnfinishedBuild>
                 (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'applied'),
                 (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'uncertain'),
                 (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state IN ('pending', 'failed')),
-                (SELECT count(*) FROM kept_files k WHERE k.build_id = b.id AND k.state IN ('kept', 'deleting', 'deleted'))
+                (SELECT count(*) FROM kept_files k WHERE k.build_id = b.id AND k.state IN ('kept', 'deleting', 'deleted', 'gone'))
          FROM builds b
          WHERE b.folder_id = ?1 AND b.state IN ('failed', 'interrupted')
            AND NOT EXISTS (SELECT 1 FROM builds s WHERE s.folder_id = ?1 AND s.id > b.id AND s.state = 'succeeded')
@@ -348,7 +348,11 @@ const MARKER_LIMIT: u64 = 64 << 10;
 
 /// Whether `name` is one of the files Title Select keeps in a Managed Folder for itself.
 pub(super) fn is_own(name: &str) -> bool {
-    name == MARKER || name == STAGING || name == MARKER_NEW || name == RETENTION
+    name == MARKER
+        || name == STAGING
+        || name == MARKER_NEW
+        || name == RETENTION
+        || super::kept::is_dir_temp(name)
 }
 
 /// Replaces the folder's marker atomically and durably. The new marker is written to a file created exclusively and

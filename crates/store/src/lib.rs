@@ -112,6 +112,16 @@ pub enum Fault {
     /// After the file of the item with this sequence number is moved into the retention area, before the store
     /// records it kept.
     AfterKeep(i64),
+    /// After a folder Title Select is creating in a Managed Folder is made and recorded under its temporary name,
+    /// before it is renamed into place.
+    BeforePublishDir,
+    /// After the intent to delete the kept file with this id is committed and it is found to be the kept file, before
+    /// it is moved into the private folder it is deleted from.
+    BeforeDeleteMove(i64),
+    /// After the kept file with this id is moved into the private folder it is deleted from, before it is checked.
+    AfterDeleteMove(i64),
+    /// After the kept file with this id is deleted, before the store records it deleted.
+    AfterUnlink(i64),
     /// After the store commits the folder's next generation, before the marker advances to it.
     AfterFinalize,
     /// After the marker advances, before the store records the Build finished.
