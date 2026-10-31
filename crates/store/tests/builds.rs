@@ -10,7 +10,8 @@ use std::time::{Duration, SystemTime};
 use common::*;
 use title_select_api::build::{
     AddManagedFolder, BlockerKind, BuildState, Cause, DriftKind, FileOutcome, FolderCheck,
-    IncompleteReason, ItemKind, ItemState, ManagedFolder, Plan, PlanBuild, PlanChoices,
+    IncompleteReason, ItemKind, ItemState, KeepReason, ManagedFolder, Plan, PlanBuild, PlanChoices,
+    PlanKeptDeletion, RemovalKind,
 };
 use title_select_api::selection::{
     Alternative, CoverageDrift, Exclusion, Rule, Selection, SelectionGroup, SelectionPins,
@@ -206,6 +207,12 @@ impl Env {
     /// Opens the store again, as the service does when it starts, and recovers. Returns the Builds whose folders
     /// recovery left as they were.
     fn restart(self) -> (Env, Vec<(i64, String)>) {
+        let (env, blocked) = self.restart_until(None);
+        (env, blocked.unwrap())
+    }
+
+    /// Restarts with `stop` hooked to the faults recovery passes; `None` for the blocked folders when it stopped.
+    fn restart_until(self, stop: Option<Fault>) -> (Env, Option<Vec<(i64, String)>>) {
         let Env {
             tmp,
             store,
@@ -215,8 +222,21 @@ impl Env {
         let path = store.dir().to_path_buf();
         drop(store);
         let store = Store::open(&path).unwrap();
-        store.recover_jobs(WORKERS).unwrap();
-        let blocked = store.recover_builds(&config).unwrap();
+        if let Some(stop) = stop {
+            store.hook_faults(Some(std::sync::Arc::new(move |fault| {
+                if fault == stop {
+                    panic!("killed at {fault:?}");
+                }
+            })));
+        }
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.recover_jobs(WORKERS).unwrap();
+            let blocked = store.recover_builds(&config).unwrap();
+            store.recover_kept_deletions(&config).unwrap();
+            blocked
+        }))
+        .ok();
+        store.hook_faults(None);
         (
             Env {
                 tmp,
@@ -626,26 +646,1170 @@ fn a_dat_revision_mismatch_and_an_unresolved_group_block_the_plan() {
     assert!(!plan.approvable());
 }
 
-#[test]
-fn a_release_no_longer_selected_needs_a_later_build_step() {
-    let env = Env::new();
+const RETAINED: &str = ".title-select-retained";
+
+/// Builds every game into a new folder, then plans the selection of Pong alone: every other built file is no
+/// longer selected.
+fn built_then_deselected(env: &Env) -> (ManagedFolder, Plan) {
     env.audit();
     let id = env.record(&everything(&env.sha256));
     let folder = env.folder("atari2600");
-    env.build(&env.plan(&folder, id));
+    assert_eq!(env.build(&env.plan(&folder, id)).state, JobState::Succeeded);
+    let fewer = env.record(&selection(&env.sha256, vec![group("Pong (USA)")]));
+    let plan = env.plan(&folder, fewer);
+    (folder, plan)
+}
 
-    let fewer = selection(&env.sha256, vec![group("Pong (USA)")]);
-    let id = env.record(&fewer);
-    let plan = env.plan(&folder, id);
+#[test]
+fn a_deselected_group_is_removed_by_keeping_its_file_aside() {
+    let env = Env::new();
+    let (folder, plan) = built_then_deselected(&env);
+    let dir = env.play().join("atari2600");
+    let built: BTreeSet<String> = env
+        .store
+        .built_files(folder.id)
+        .unwrap()
+        .into_iter()
+        .map(|f| f.target)
+        .filter(|t| t != "Pong (USA).zip")
+        .collect();
+    assert!(built.len() >= 3, "{built:?}");
+    let bytes: BTreeMap<String, Vec<u8>> = built
+        .iter()
+        .map(|t| (t.clone(), std::fs::read(dir.join(t)).unwrap()))
+        .collect();
+    let gone = built.iter().next().unwrap().clone();
+    std::fs::remove_file(dir.join(&gone)).unwrap();
+    let plan = env.plan(&folder, plan.content.selection);
 
-    assert!(blockers(&plan).contains(&BlockerKind::Removal));
+    assert!(plan.approvable(), "{:?}", plan.content.blockers);
+    let removals: BTreeMap<&str, RemovalKind> = plan
+        .content
+        .removals
+        .iter()
+        .map(|r| (r.target.as_str(), r.kind))
+        .collect();
+    let expected: BTreeMap<&str, RemovalKind> = built
+        .iter()
+        .map(|t| {
+            let kind = if *t == gone {
+                RemovalKind::Forget
+            } else {
+                RemovalKind::Keep
+            };
+            (t.as_str(), kind)
+        })
+        .collect();
+    assert_eq!(removals, expected);
+    assert_eq!(plan.summary.remove, built.len() as u64);
+    assert_eq!(plan.summary.keep, built.len() as u64 - 1);
+    assert!(plan.content.items.iter().all(|i| i.keep.is_none()));
+
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+
+    assert_eq!(
+        names(&dir),
+        BTreeSet::from([
+            ".title-select".to_string(),
+            RETAINED.to_string(),
+            "Pong (USA).zip".to_string()
+        ])
+    );
+    let kept = env.store.kept_files(folder.id).unwrap();
+    assert_eq!(kept.len(), built.len() - 1);
+    let generation = dir.join(RETAINED).join("2");
+    for k in &kept {
+        assert_eq!(
+            (k.generation, k.reason, k.kept_name.clone()),
+            (2, KeepReason::Removal, format!("{}.kept", k.name))
+        );
+        assert_eq!(
+            std::fs::read(generation.join(&k.kept_name)).unwrap(),
+            bytes[&k.name]
+        );
+        assert!(k.built_by.is_some() && k.game.is_some());
+    }
+    let after = env.store.built_files(folder.id).unwrap();
+    assert_eq!(after.len(), 1);
+    let folder = env.store.managed_folder(&env.config, folder.id).unwrap();
+    assert_eq!((folder.generation, folder.incomplete.clone()), (2, None));
+    // The retention area is never drift, and its files are not built files.
+    let checked = check(&env, &folder);
+    assert!(checked.drift.is_empty(), "{:?}", checked.drift);
+    assert_eq!(checked.files.len(), 1);
+    // Planned again, nothing is left to remove.
+    let again = env.plan(&folder, plan.content.selection);
+    assert!(again.content.removals.is_empty());
+}
+
+#[test]
+fn a_kept_file_is_deleted_only_once_you_approve_its_deletion() {
+    let env = Env::new();
+    let (folder, plan) = built_then_deselected(&env);
+    let dir = env.play().join("atari2600");
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+    let kept = env.store.kept_files(folder.id).unwrap();
+    let path = |k: &title_select_api::build::KeptFile| {
+        dir.join(RETAINED)
+            .join(k.generation.to_string())
+            .join(&k.kept_name)
+    };
+
+    let one = env
+        .store
+        .plan_kept_deletion(
+            folder.id,
+            &PlanKeptDeletion {
+                ids: vec![kept[0].id],
+                all: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(one.content.files, vec![kept[0].clone()]);
+    assert!(path(&kept[0]).exists(), "planning deletes nothing");
+    let stale = env
+        .store
+        .approve_kept_deletion(&env.config, one.id, "0000", "Operator");
+    assert!(matches!(stale, Err(Error::Conflict(_))), "{stale:?}");
+    assert!(path(&kept[0]).exists());
+
+    let done = env
+        .store
+        .approve_kept_deletion(&env.config, one.id, &one.digest, "Operator")
+        .unwrap();
     assert!(
-        plan.content
+        done.outcomes.iter().all(|o| o.deleted),
+        "{:?}",
+        done.outcomes
+    );
+    assert!(!path(&kept[0]).exists());
+    assert!(kept[1..].iter().all(|k| path(k).exists()));
+    assert_eq!(env.store.kept_files(folder.id).unwrap(), kept[1..].to_vec());
+
+    let rest = env
+        .store
+        .plan_kept_deletion(
+            folder.id,
+            &PlanKeptDeletion {
+                ids: vec![],
+                all: true,
+            },
+        )
+        .unwrap();
+    let done = env
+        .store
+        .approve_kept_deletion(&env.config, rest.id, &rest.digest, "Operator")
+        .unwrap();
+    assert!(
+        done.outcomes.iter().all(|o| o.deleted),
+        "{:?}",
+        done.outcomes
+    );
+    assert!(env.store.kept_files(folder.id).unwrap().is_empty());
+    // The emptied folders are left in place, and are never drift.
+    assert_eq!(
+        names(&dir.join(RETAINED)),
+        BTreeSet::from([".deleting".to_string(), "2".to_string()])
+    );
+    assert!(names(&dir.join(RETAINED).join("2")).is_empty());
+    let checked = check(
+        &env,
+        &env.store.managed_folder(&env.config, folder.id).unwrap(),
+    );
+    assert!(checked.drift.is_empty(), "{:?}", checked.drift);
+    assert_eq!(checked.files.len(), 1);
+    let again = env
+        .store
+        .approve_kept_deletion(&env.config, rest.id, &rest.digest, "Operator");
+    assert!(matches!(again, Err(Error::Refused(_))), "{again:?}");
+}
+
+#[test]
+fn a_substituted_retention_entry_is_never_deleted() {
+    let env = Env::new();
+    let (folder, plan) = built_then_deselected(&env);
+    let dir = env.play().join("atari2600");
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+    let kept = env.store.kept_files(folder.id).unwrap();
+    assert!(kept.len() >= 3);
+    let generation = dir.join(RETAINED).join("2");
+    let deletion = env
+        .store
+        .plan_kept_deletion(
+            folder.id,
+            &PlanKeptDeletion {
+                ids: vec![],
+                all: true,
+            },
+        )
+        .unwrap();
+    // After you review the deletion: one kept file is swapped for another file, one for a symlink to a file
+    // outside the folder, and one for a directory.
+    let outside = env.tmp.path().join("precious");
+    std::fs::write(&outside, b"precious").unwrap();
+    let swapped = generation.join(&kept[0].kept_name);
+    std::fs::remove_file(&swapped).unwrap();
+    std::fs::write(&swapped, b"someone else's").unwrap();
+    let linked = generation.join(&kept[1].kept_name);
+    std::fs::remove_file(&linked).unwrap();
+    std::os::unix::fs::symlink(&outside, &linked).unwrap();
+    let made_dir = generation.join(&kept[2].kept_name);
+    std::fs::remove_file(&made_dir).unwrap();
+    std::fs::create_dir(&made_dir).unwrap();
+
+    let done = env
+        .store
+        .approve_kept_deletion(&env.config, deletion.id, &deletion.digest, "Operator")
+        .unwrap();
+
+    for o in &done.outcomes[..3] {
+        assert!(!o.deleted, "{o:?}");
+        assert!(
+            o.detail.as_deref().unwrap().contains("never deleted"),
+            "{o:?}"
+        );
+    }
+    assert!(done.outcomes[3..].iter().all(|o| o.deleted));
+    assert_eq!(std::fs::read(&swapped).unwrap(), b"someone else's");
+    assert!(linked.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"precious");
+    assert!(made_dir.is_dir());
+    let left: Vec<i64> = env
+        .store
+        .kept_files(folder.id)
+        .unwrap()
+        .iter()
+        .map(|k| k.id)
+        .collect();
+    assert_eq!(left, vec![kept[0].id, kept[1].id, kept[2].id]);
+
+    // A retention area swapped for a symlink is never followed: the plan is blocked and nothing is deleted.
+    let env2 = Env::new();
+    let (folder, plan) = built_then_deselected(&env2);
+    let dir = env2.play().join("atari2600");
+    assert_eq!(env2.build(&plan).state, JobState::Succeeded);
+    let deletion = env2
+        .store
+        .plan_kept_deletion(
+            folder.id,
+            &PlanKeptDeletion {
+                ids: vec![],
+                all: true,
+            },
+        )
+        .unwrap();
+    let elsewhere = env2.tmp.path().join("elsewhere");
+    std::fs::rename(dir.join(RETAINED), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, dir.join(RETAINED)).unwrap();
+    let before = names(&elsewhere.join("2"));
+    let done = env2
+        .store
+        .approve_kept_deletion(&env2.config, deletion.id, &deletion.digest, "Operator")
+        .unwrap();
+    assert!(
+        done.outcomes.iter().all(|o| !o.deleted),
+        "{:?}",
+        done.outcomes
+    );
+    assert_eq!(names(&elsewhere.join("2")), before);
+    let blocked = env2.plan(&folder, plan.content.selection);
+    assert!(
+        blocked
+            .content
             .blockers
             .iter()
-            .all(|b| b.message.contains("needs a later build step"))
+            .any(|b| b.message.contains(RETAINED))
     );
-    assert!(!plan.approvable());
+}
+
+#[test]
+fn a_replacement_keeps_the_old_file_and_writes_the_new_one_in_one_plan() {
+    let env = Env::new();
+    env.audit();
+    let id = titles(&env, &["Pong (USA)", "Combat (USA)"]);
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    assert_eq!(env.build(&env.plan(&folder, id)).state, JobState::Succeeded);
+    let old = std::fs::read(dir.join("Pong (USA).zip")).unwrap();
+
+    // The newer revision keeps Pong's title but lists another ROM for it, which the source set now has.
+    let mut newer = games();
+    newer
+        .iter_mut()
+        .find(|(game, _)| *game == "Pong (USA)")
+        .unwrap()
+        .1 = vec![rom("Pong (USA).a26", b"pong, revised")];
+    let dat = write_dat_version(
+        &env.tmp.path().join("in"),
+        "Test - System (2).dat",
+        "20260102-000000",
+        &newer,
+    );
+    let (revision, _) = env.store.import_dat(&dat, "No-Intro", None).unwrap();
+    write_file(&env.set_dir().join("pong-revised.bin"), b"pong, revised");
+    env.store
+        .audit_source_set(&env.config, SET, Some(&revision.sha256))
+        .unwrap();
+    let id = env.record(&selection(
+        &revision.sha256,
+        vec![group("Pong (USA)"), group("Combat (USA)")],
+    ));
+    let plan = env.plan(&folder, id);
+
+    assert!(plan.approvable(), "{:?}", plan.content.blockers);
+    let pong = plan
+        .content
+        .items
+        .iter()
+        .find(|i| i.game == "Pong (USA)")
+        .unwrap();
+    assert!(pong.kind.writes(), "{pong:?}");
+    let keep = pong.keep.as_ref().unwrap();
+    assert_eq!(
+        (keep.reason, keep.name.as_str()),
+        (KeepReason::Replacement, "Pong (USA).zip")
+    );
+    assert_eq!(plan.summary.keep, 1);
+    assert!(plan.content.removals.is_empty());
+
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+
+    let members = validate(&dir.join("Pong (USA).zip"));
+    assert_eq!(members[0].name, "Pong (USA).a26");
+    assert_eq!(members[0].size, b"pong, revised".len() as u64);
+    assert_eq!(
+        std::fs::read(dir.join(RETAINED).join("2").join("Pong (USA).zip.kept")).unwrap(),
+        old
+    );
+    let kept = env.store.kept_files(folder.id).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(
+        (kept[0].reason, kept[0].generation),
+        (KeepReason::Replacement, 2)
+    );
+    let folder = env.store.managed_folder(&env.config, folder.id).unwrap();
+    assert_eq!(folder.incomplete, None);
+    assert_eq!(
+        kinds(&env.plan(&folder, id))["Pong (USA)"],
+        ItemKind::Unchanged
+    );
+}
+
+#[test]
+fn a_conflict_is_kept_aside_and_rebuilt_only_when_you_choose_it() {
+    let env = Env::new();
+    env.audit();
+    let id = titles(&env, &["Pong (USA)", "Combat (USA)"]);
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    std::fs::write(dir.join("Combat (USA).zip"), b"theirs").unwrap();
+
+    let left = env.plan(&folder, id);
+    let combat = left
+        .content
+        .items
+        .iter()
+        .find(|i| i.game == "Combat (USA)")
+        .unwrap();
+    assert_eq!(
+        (combat.kind, combat.keepable, combat.keep.is_some()),
+        (ItemKind::Conflict, true, false)
+    );
+    assert_eq!(left.summary.keep, 0);
+
+    let keep = plan_with(
+        &env,
+        &folder,
+        id,
+        PlanChoices {
+            resolved_only: false,
+            adopt: vec![],
+            keep_aside: vec!["Combat (USA).zip".into()],
+        },
+    );
+    assert_ne!(keep.digest, left.digest);
+    let combat = keep
+        .content
+        .items
+        .iter()
+        .find(|i| i.game == "Combat (USA)")
+        .unwrap();
+    assert!(combat.kind.writes(), "{combat:?}");
+    assert_eq!(combat.keep.as_ref().unwrap().reason, KeepReason::Conflict);
+    // The choice is part of the digest: the plan you did not choose builds nothing over the conflict.
+    assert_eq!(env.build(&left).state, JobState::Succeeded);
+    assert_eq!(
+        std::fs::read(dir.join("Combat (USA).zip")).unwrap(),
+        b"theirs"
+    );
+    assert!(!dir.join(RETAINED).exists());
+
+    let keep = plan_with(
+        &env,
+        &folder,
+        id,
+        PlanChoices {
+            resolved_only: false,
+            adopt: vec![],
+            keep_aside: vec!["Combat (USA).zip".into()],
+        },
+    );
+    assert_eq!(env.build(&keep).state, JobState::Succeeded);
+
+    validate(&dir.join("Combat (USA).zip"));
+    assert_eq!(
+        std::fs::read(dir.join(RETAINED).join("2").join("Combat (USA).zip.kept")).unwrap(),
+        b"theirs"
+    );
+    let kept = env.store.kept_files(folder.id).unwrap();
+    assert_eq!(
+        (kept.len(), kept[0].reason, kept[0].built_by),
+        (1, KeepReason::Conflict, None)
+    );
+    let folder = env.store.managed_folder(&env.config, folder.id).unwrap();
+    assert_eq!(folder.incomplete, None);
+
+    // Choosing to adopt and to keep aside the same file is refused.
+    let both = env.store.plan_build_with(
+        &env.config,
+        folder.id,
+        &PlanBuild {
+            selection: id,
+            choices: PlanChoices {
+                resolved_only: false,
+                adopt: vec!["Combat (USA).zip".into()],
+                keep_aside: vec!["Combat (USA).zip".into()],
+            },
+        },
+    );
+    assert!(both.is_err(), "{both:?}");
+}
+
+#[test]
+fn a_crash_mid_removal_leaves_the_file_in_place_or_kept_and_recovery_reports_it() {
+    for fault in [Fault::BeforeKeep(0), Fault::AfterKeep(0)] {
+        let env = Env::new();
+        let (folder, plan) = built_then_deselected(&env);
+        let dir = env.play().join("atari2600");
+        let first = plan.content.removals[0].target.clone();
+        let bytes = std::fs::read(dir.join(&first)).unwrap();
+        env.crash(&plan, fault);
+        let (env, blocked) = env.restart();
+        assert!(blocked.is_empty(), "{fault:?}: {blocked:?}");
+
+        let badged = env.store.managed_folder(&env.config, folder.id).unwrap();
+        let unfinished = badged.unfinished.clone().unwrap();
+        let detail = env.store.build(unfinished.build).unwrap();
+        let item = detail.items.iter().find(|i| i.target == first).unwrap();
+        let kept = env.store.kept_files(folder.id).unwrap();
+        let retained = dir.join(RETAINED).join("2").join(format!("{first}.kept"));
+        match fault {
+            Fault::BeforeKeep(_) => {
+                assert_eq!(item.state, ItemState::Failed);
+                assert!(
+                    item.error.as_deref().unwrap().contains("still in place"),
+                    "{item:?}"
+                );
+                assert_eq!(std::fs::read(dir.join(&first)).unwrap(), bytes);
+                assert!(!retained.exists());
+                assert!(kept.is_empty());
+                assert_eq!(unfinished.kept, 0);
+                assert!(
+                    env.store
+                        .built_files(folder.id)
+                        .unwrap()
+                        .iter()
+                        .any(|f| f.target == first)
+                );
+            }
+            _ => {
+                assert_eq!(item.state, ItemState::Applied);
+                assert!(
+                    item.error.as_deref().unwrap().contains("kept as"),
+                    "{item:?}"
+                );
+                assert!(!dir.join(&first).exists());
+                assert_eq!(std::fs::read(&retained).unwrap(), bytes);
+                assert_eq!(kept.len(), 1);
+                assert_eq!(kept[0].name, first);
+                assert_eq!(unfinished.kept, 1);
+                assert!(
+                    !env.store
+                        .built_files(folder.id)
+                        .unwrap()
+                        .iter()
+                        .any(|f| f.target == first)
+                );
+            }
+        }
+
+        // A new plan finishes the removals.
+        let next = env.plan(&badged, plan.content.selection);
+        assert!(next.approvable(), "{fault:?}: {:?}", next.content.blockers);
+        assert_eq!(env.build(&next).state, JobState::Succeeded);
+        let kept = env.store.kept_files(folder.id).unwrap();
+        assert_eq!(kept.len(), plan.content.removals.len(), "{fault:?}");
+        assert!(kept.iter().any(|k| k.name == first));
+        let done = env.store.managed_folder(&env.config, folder.id).unwrap();
+        assert_eq!((done.unfinished, done.incomplete), (None, None));
+    }
+}
+
+/// Plans deleting every kept file of `folder`.
+fn plan_delete_all(env: &Env, folder: &ManagedFolder) -> title_select_api::build::KeptDeletion {
+    env.store
+        .plan_kept_deletion(
+            folder.id,
+            &PlanKeptDeletion {
+                ids: vec![],
+                all: true,
+            },
+        )
+        .unwrap()
+}
+
+/// Approves `deletion` until `fault` stops it as a kill would.
+fn crash_deletion(env: &Env, deletion: &title_select_api::build::KeptDeletion, fault: Fault) {
+    env.store.inject_fault(Some(fault));
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.store
+            .approve_kept_deletion(&env.config, deletion.id, &deletion.digest, "Operator")
+    }));
+    assert!(ran.is_err(), "{ran:?}");
+    env.store.inject_fault(None);
+}
+
+#[test]
+fn a_kept_file_swapped_just_before_it_is_deleted_is_moved_back_and_never_deleted() {
+    let env = Env::new();
+    let (folder, plan) = built_then_deselected(&env);
+    let dir = env.play().join("atari2600");
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+    let kept = env.store.kept_files(folder.id).unwrap();
+    let generation = dir.join(RETAINED).join("2");
+    let swapped = generation.join(&kept[0].kept_name);
+    let deletion = plan_delete_all(&env, &folder);
+    // After every check, just before the kept file is moved to be deleted, another file takes its place.
+    let target = kept[0].id;
+    let at = swapped.clone();
+    env.store
+        .hook_faults(Some(std::sync::Arc::new(move |fault| {
+            if fault == Fault::BeforeDeleteMove(target) {
+                std::fs::remove_file(&at).unwrap();
+                std::fs::write(&at, b"someone else's").unwrap();
+            }
+        })));
+
+    let done = env
+        .store
+        .approve_kept_deletion(&env.config, deletion.id, &deletion.digest, "Operator")
+        .unwrap();
+    env.store.hook_faults(None);
+
+    let detail = done.outcomes[0].detail.as_deref().unwrap();
+    assert!(!done.outcomes[0].deleted);
+    assert!(
+        detail.contains("never deleted") && detail.contains("moved back"),
+        "{detail}"
+    );
+    assert!(
+        done.outcomes[1..].iter().all(|o| o.deleted),
+        "{:?}",
+        done.outcomes
+    );
+    assert_eq!(std::fs::read(&swapped).unwrap(), b"someone else's");
+    assert_eq!(
+        env.store
+            .kept_files(folder.id)
+            .unwrap()
+            .iter()
+            .map(|k| k.id)
+            .collect::<Vec<_>>(),
+        vec![target]
+    );
+    assert_eq!(
+        names(&dir.join(RETAINED)),
+        BTreeSet::from([".deleting".to_string(), "2".to_string()])
+    );
+    assert!(names(&dir.join(RETAINED).join(".deleting")).is_empty());
+}
+
+#[test]
+fn a_crash_mid_deletion_never_loses_a_kept_file_and_recovery_settles_it() {
+    for at in ["before the move", "after the move", "after the unlink"] {
+        let env = Env::new();
+        let (folder, plan) = built_then_deselected(&env);
+        let dir = env.play().join("atari2600");
+        assert_eq!(env.build(&plan).state, JobState::Succeeded);
+        let kept = env.store.kept_files(folder.id).unwrap();
+        let first = kept[0].clone();
+        let path = dir.join(RETAINED).join("2").join(&first.kept_name);
+        let bytes = std::fs::read(&path).unwrap();
+        let deletion = env
+            .store
+            .plan_kept_deletion(
+                folder.id,
+                &PlanKeptDeletion {
+                    ids: vec![first.id],
+                    all: false,
+                },
+            )
+            .unwrap();
+        let fault = match at {
+            "before the move" => Fault::BeforeDeleteMove(first.id),
+            "after the move" => Fault::AfterDeleteMove(first.id),
+            _ => Fault::AfterUnlink(first.id),
+        };
+        crash_deletion(&env, &deletion, fault);
+        let unfinished = env.store.kept_deletion(deletion.id).unwrap();
+        assert!(unfinished.finished_at.is_none(), "{at}");
+        let again = env.plan(&folder, plan.content.selection);
+        let approve =
+            env.store
+                .approve_plan(&env.config, again.id, &again.digest, "Operator", WORKERS);
+        assert!(
+            matches!(approve, Err(Error::Conflict(_))),
+            "{at}: {approve:?}"
+        );
+
+        let (env, _) = env.restart();
+        let done = env.store.kept_deletion(deletion.id).unwrap();
+        assert!(
+            done.finished_at.is_some() && done.recovery_error.is_none(),
+            "{at}: {done:?}"
+        );
+        let listed = env.store.kept_files(folder.id).unwrap();
+        if at == "before the move" {
+            assert!(!done.outcomes[0].deleted, "{at}: {:?}", done.outcomes);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{at}");
+            assert_eq!(listed, kept, "{at}");
+        } else {
+            assert!(done.outcomes[0].deleted, "{at}: {:?}", done.outcomes);
+            assert!(!path.exists(), "{at}");
+            assert_eq!(listed, kept[1..].to_vec(), "{at}");
+        }
+        assert!(
+            names(&dir.join(RETAINED).join(".deleting")).is_empty(),
+            "{at}"
+        );
+        assert!(
+            kept[1..]
+                .iter()
+                .all(|k| dir.join(RETAINED).join("2").join(&k.kept_name).exists())
+        );
+    }
+}
+
+#[test]
+fn deletion_recovery_waits_until_the_folder_is_shown_to_be_the_stores() {
+    let env = Env::new();
+    let (folder, plan) = built_then_deselected(&env);
+    let dir = env.play().join("atari2600");
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+    let kept = env.store.kept_files(folder.id).unwrap();
+    let deletion = plan_delete_all(&env, &folder);
+    crash_deletion(&env, &deletion, Fault::BeforeDeleteMove(kept[0].id));
+
+    // The library is unmounted: its mount point is there, empty.
+    let mounted = env.tmp.path().join("unmounted");
+    std::fs::rename(&dir, &mounted).unwrap();
+    std::fs::create_dir(&dir).unwrap();
+    let (env, _) = env.restart();
+    let pending = env.store.kept_deletion(deletion.id).unwrap();
+    assert!(pending.finished_at.is_none());
+    assert!(
+        pending
+            .recovery_error
+            .as_deref()
+            .unwrap()
+            .contains("marker"),
+        "{pending:?}"
+    );
+    let blocked = env.store.recover_kept_deletions(&env.config).unwrap();
+    assert_eq!(blocked.len(), 1, "{blocked:?}");
+    let again = env.plan(&folder, plan.content.selection);
+    assert!(!again.approvable());
+
+    // Mounted again, but the root is read-only: still nothing is settled.
+    std::fs::remove_dir(&dir).unwrap();
+    std::fs::rename(&mounted, &dir).unwrap();
+    let mut env = env;
+    env.config = config(&env.tmp.path().join("roots/sets"), &env.play(), false);
+    let (env, _) = env.restart();
+    let pending = env.store.kept_deletion(deletion.id).unwrap();
+    assert!(
+        pending
+            .recovery_error
+            .as_deref()
+            .unwrap()
+            .contains("not writable"),
+        "{pending:?}"
+    );
+    let deletion_again = plan_delete_all(&env, &folder);
+    let approve = env.store.approve_kept_deletion(
+        &env.config,
+        deletion_again.id,
+        &deletion_again.digest,
+        "Operator",
+    );
+    assert!(
+        matches!(&approve, Err(Error::Conflict(m)) if m.contains("not finished")),
+        "{approve:?}"
+    );
+
+    let mut env = env;
+    env.config = config(&env.tmp.path().join("roots/sets"), &env.play(), true);
+    let (env, _) = env.restart();
+    let done = env.store.kept_deletion(deletion.id).unwrap();
+    assert!(
+        done.finished_at.is_some() && done.recovery_error.is_none(),
+        "{done:?}"
+    );
+    assert!(!done.outcomes[0].deleted, "{:?}", done.outcomes);
+    // The file that was about to be deleted is still there and still kept; the rest were never started.
+    assert_eq!(env.store.kept_files(folder.id).unwrap(), kept);
+    assert!(
+        dir.join(RETAINED)
+            .join("2")
+            .join(&kept[0].kept_name)
+            .exists()
+    );
+}
+
+#[test]
+fn a_kept_file_that_vanished_is_no_longer_listed_once_its_deletion_is_carried_out() {
+    let env = Env::new();
+    let (folder, plan) = built_then_deselected(&env);
+    let dir = env.play().join("atari2600");
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+    let kept = env.store.kept_files(folder.id).unwrap();
+    std::fs::remove_file(dir.join(RETAINED).join("2").join(&kept[0].kept_name)).unwrap();
+
+    // Without the folder's marker, nothing can be shown gone.
+    std::fs::rename(dir.join(".title-select"), env.tmp.path().join("marker")).unwrap();
+    let deletion = plan_delete_all(&env, &folder);
+    let done = env
+        .store
+        .approve_kept_deletion(&env.config, deletion.id, &deletion.digest, "Operator")
+        .unwrap();
+    assert!(done.outcomes.iter().all(|o| !o.deleted));
+    assert_eq!(env.store.kept_files(folder.id).unwrap(), kept);
+
+    std::fs::rename(env.tmp.path().join("marker"), dir.join(".title-select")).unwrap();
+    let deletion = env
+        .store
+        .plan_kept_deletion(
+            folder.id,
+            &PlanKeptDeletion {
+                ids: vec![kept[0].id],
+                all: false,
+            },
+        )
+        .unwrap();
+    let done = env
+        .store
+        .approve_kept_deletion(&env.config, deletion.id, &deletion.digest, "Operator")
+        .unwrap();
+    assert!(!done.outcomes[0].deleted);
+    assert!(
+        done.outcomes[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("it is gone"),
+        "{:?}",
+        done.outcomes
+    );
+    assert_eq!(env.store.kept_files(folder.id).unwrap(), kept[1..].to_vec());
+}
+
+/// The temporary names, in `dir`, of a folder being created there.
+fn creating(dir: &Path) -> Vec<String> {
+    names(dir)
+        .into_iter()
+        .filter(|n| n.starts_with(&format!("{RETAINED}.new-")))
+        .collect()
+}
+
+#[test]
+fn a_retention_area_swapped_while_it_is_created_is_never_used() {
+    let env = Env::new();
+    let (folder, plan) = built_then_deselected(&env);
+    let dir = env.play().join("atari2600");
+    let before = names(&dir);
+    let at = dir.clone();
+    let elsewhere = env.tmp.path().join("elsewhere");
+    let away = elsewhere.clone();
+    // Once the area is made under its temporary name, someone else's folder takes its place.
+    env.store
+        .hook_faults(Some(std::sync::Arc::new(move |fault| {
+            if fault == Fault::BeforePublishDir && !away.exists() {
+                let temp = at.join(&creating(&at)[0]);
+                std::fs::rename(&temp, &away).unwrap();
+                std::fs::create_dir(&temp).unwrap();
+                std::fs::write(temp.join("theirs"), b"theirs").unwrap();
+            }
+        })));
+    let job = env.build(&plan);
+    env.store.hook_faults(None);
+
+    assert_eq!(job.state, JobState::Failed);
+    assert!(elsewhere.is_dir());
+    assert_eq!(
+        std::fs::read(dir.join(RETAINED).join("theirs")).unwrap(),
+        b"theirs",
+        "the folder put in its place is left as it is"
+    );
+    let mut expected = before.clone();
+    expected.insert(RETAINED.to_string());
+    assert_eq!(names(&dir), expected, "nothing was kept aside");
+    assert!(env.store.kept_files(folder.id).unwrap().is_empty());
+    let (env, _) = env.restart();
+    let next = env.plan(&folder, plan.content.selection);
+    assert!(
+        next.content
+            .blockers
+            .iter()
+            .any(|b| b.message.contains(RETAINED)),
+        "{:?}",
+        next.content.blockers
+    );
+    assert_eq!(names(&dir), expected);
+}
+
+#[test]
+fn a_retention_area_left_mid_creation_is_recorded_or_adopted_by_recovery_and_an_unknown_one_blocks()
+{
+    for adopt in [false, true] {
+        let env = Env::new();
+        let (folder, plan) = built_then_deselected(&env);
+        let dir = env.play().join("atari2600");
+        env.crash(&plan, Fault::BeforePublishDir);
+        let temps = creating(&dir);
+        assert_eq!(temps.len(), 1, "{temps:?}");
+        if adopt {
+            // As if the stop came just after the rename.
+            std::fs::rename(dir.join(&temps[0]), dir.join(RETAINED)).unwrap();
+        }
+        let (env, blocked) = env.restart();
+        assert!(blocked.is_empty(), "{adopt}: {blocked:?}");
+        // Never removed by name: one never renamed into place stays, recorded as this store's.
+        assert_eq!(
+            creating(&dir),
+            if adopt { vec![] } else { temps.clone() },
+            "{adopt}"
+        );
+        assert_eq!(dir.join(RETAINED).is_dir(), adopt);
+
+        let next = env.plan(&folder, plan.content.selection);
+        assert!(next.approvable(), "{adopt}: {:?}", next.content.blockers);
+        assert_eq!(env.build(&next).state, JobState::Succeeded);
+        assert_eq!(
+            env.store.kept_files(folder.id).unwrap().len(),
+            plan.content.removals.len()
+        );
+
+        // One no build of this store recorded making is never removed, and blocks.
+        let unknown = dir.join(format!("{RETAINED}.new-1"));
+        std::fs::create_dir(&unknown).unwrap();
+        let (env, _) = env.restart();
+        assert!(unknown.is_dir());
+        let next = env.plan(&folder, plan.content.selection);
+        assert!(blockers(&next).contains(&BlockerKind::Recovery), "{adopt}");
+        assert!(
+            check(
+                &env,
+                &env.store.managed_folder(&env.config, folder.id).unwrap()
+            )
+            .drift
+            .is_empty()
+        );
+    }
+}
+
+#[test]
+fn a_move_back_is_recorded_only_once_it_is_found_back_and_made_durable() {
+    let env = Env::new();
+    let (folder, plan) = built_then_deselected(&env);
+    let dir = env.play().join("atari2600");
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+    let kept = env.store.kept_files(folder.id).unwrap();
+    let first = kept[0].clone();
+    let path = dir.join(RETAINED).join("2").join(&first.kept_name);
+    let slot = dir
+        .join(RETAINED)
+        .join(".deleting")
+        .join(first.id.to_string());
+    let aside = env.tmp.path().join("aside");
+    let deletion = env
+        .store
+        .plan_kept_deletion(
+            folder.id,
+            &PlanKeptDeletion {
+                ids: vec![first.id],
+                all: false,
+            },
+        )
+        .unwrap();
+    // Another file takes the kept file's place just before it is moved; the service stops once that is moved back,
+    // before either folder is synced.
+    let (at, away) = (path.clone(), env.tmp.path().join("original"));
+    let id = first.id;
+    env.store
+        .hook_faults(Some(std::sync::Arc::new(move |fault| {
+            if fault == Fault::BeforeDeleteMove(id) {
+                std::fs::rename(&at, &away).unwrap();
+                std::fs::write(&at, b"someone else's").unwrap();
+            } else if fault == Fault::MovedBack(id) {
+                panic!("killed");
+            }
+        })));
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.store
+            .approve_kept_deletion(&env.config, deletion.id, &deletion.digest, "Operator")
+    }));
+    env.store.hook_faults(None);
+    assert!(ran.is_err());
+    assert!(!slot.exists());
+    assert_eq!(std::fs::read(&path).unwrap(), b"someone else's");
+    let held = |env: &Env| {
+        let pending = env.store.kept_deletion(deletion.id).unwrap();
+        assert!(pending.finished_at.is_none(), "{pending:?}");
+        assert!(
+            !env.store
+                .kept_files(folder.id)
+                .unwrap()
+                .iter()
+                .any(|k| k.id == id)
+        );
+        pending.recovery_error.unwrap_or_default()
+    };
+
+    // Found back under its name, it is still held aside until both folders are synced.
+    let (env, stopped) = env.restart_until(Some(Fault::MoveBackSynced(id)));
+    assert!(
+        stopped.is_none(),
+        "recovery syncs before it records it kept"
+    );
+    held(&env);
+
+    // Something else at its name, or nothing at either place, keeps it recorded as held aside.
+    std::fs::rename(&path, &aside).unwrap();
+    let (env, _) = env.restart();
+    let error = held(&env);
+    assert!(error.contains("nor at"), "{error}");
+    std::fs::write(&path, b"a third").unwrap();
+    let (env, _) = env.restart();
+    let error = held(&env);
+    assert!(error.contains("holds something else"), "{error}");
+    std::fs::remove_file(&path).unwrap();
+    assert!(env.store.kept_files(folder.id).unwrap().len() < kept.len());
+
+    // Back under its name, synced, it is recorded kept again and the deletion finishes.
+    std::fs::rename(&aside, &path).unwrap();
+    let (env, _) = env.restart();
+    let done = env.store.kept_deletion(deletion.id).unwrap();
+    assert!(
+        done.finished_at.is_some() && done.recovery_error.is_none(),
+        "{done:?}"
+    );
+    assert!(!done.outcomes[0].deleted);
+    assert_eq!(std::fs::read(&path).unwrap(), b"someone else's");
+    assert_eq!(env.store.kept_files(folder.id).unwrap(), kept);
+}
+
+#[test]
+fn something_moved_aside_that_cannot_be_moved_back_stays_tracked_until_it_is() {
+    for crash in [false, true] {
+        let env = Env::new();
+        let (folder, plan) = built_then_deselected(&env);
+        let dir = env.play().join("atari2600");
+        assert_eq!(env.build(&plan).state, JobState::Succeeded);
+        let kept = env.store.kept_files(folder.id).unwrap();
+        let first = kept[0].clone();
+        let path = dir.join(RETAINED).join("2").join(&first.kept_name);
+        let slot = dir
+            .join(RETAINED)
+            .join(".deleting")
+            .join(first.id.to_string());
+        let original = env.tmp.path().join("original");
+        let deletion = env
+            .store
+            .plan_kept_deletion(
+                folder.id,
+                &PlanKeptDeletion {
+                    ids: vec![first.id],
+                    all: false,
+                },
+            )
+            .unwrap();
+        // Just before the kept file is moved, another file takes its place; once that is moved aside, a third takes
+        // its name, so what was moved aside cannot be moved back.
+        let (at, away) = (path.clone(), original.clone());
+        let id = first.id;
+        env.store
+            .hook_faults(Some(std::sync::Arc::new(move |fault| {
+                if fault == Fault::BeforeDeleteMove(id) {
+                    std::fs::rename(&at, &away).unwrap();
+                    std::fs::write(&at, b"someone else's").unwrap();
+                } else if fault == Fault::AfterDeleteMove(id) {
+                    std::fs::write(&at, b"a third").unwrap();
+                } else if crash && fault == Fault::Quarantined(id) {
+                    panic!("killed");
+                }
+            })));
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            env.store
+                .approve_kept_deletion(&env.config, deletion.id, &deletion.digest, "Operator")
+        }));
+        env.store.hook_faults(None);
+        if crash {
+            assert!(ran.is_err());
+        } else {
+            let done = ran.unwrap().unwrap();
+            assert!(done.finished_at.is_none(), "{done:?}");
+            let error = done.recovery_error.unwrap();
+            assert!(error.contains("could not be moved back"), "{error}");
+        }
+
+        let (env, _) = env.restart();
+        let pending = env.store.kept_deletion(deletion.id).unwrap();
+        assert!(pending.finished_at.is_none(), "{crash}: {pending:?}");
+        let error = pending.recovery_error.unwrap();
+        assert!(
+            error.contains(&format!(".deleting/{}", first.id))
+                && error.contains("could not be moved back"),
+            "{crash}: {error}"
+        );
+        // Nothing is lost: each file is where it was left, and the one held aside is still tracked.
+        assert_eq!(std::fs::read(&slot).unwrap(), b"someone else's");
+        assert_eq!(std::fs::read(&path).unwrap(), b"a third");
+        assert!(original.exists());
+        assert!(
+            !env.store
+                .kept_files(folder.id)
+                .unwrap()
+                .iter()
+                .any(|k| k.id == first.id)
+        );
+        let others = plan_delete_all(&env, &folder);
+        let refused =
+            env.store
+                .approve_kept_deletion(&env.config, others.id, &others.digest, "Operator");
+        assert!(
+            matches!(&refused, Err(Error::Conflict(m)) if m.contains("not finished")),
+            "{refused:?}"
+        );
+
+        // Once its name is free, recovery moves it back, and the deletion finishes.
+        std::fs::remove_file(&path).unwrap();
+        let (env, _) = env.restart();
+        let done = env.store.kept_deletion(deletion.id).unwrap();
+        assert!(
+            done.finished_at.is_some() && done.recovery_error.is_none(),
+            "{done:?}"
+        );
+        assert!(!done.outcomes[0].deleted);
+        assert!(
+            done.outcomes[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("moved back")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"someone else's");
+        assert!(!slot.exists());
+        assert_eq!(env.store.kept_files(folder.id).unwrap(), kept);
+
+        // It is still not the file that was kept: a later deletion never deletes it, nor records it gone.
+        let again = env
+            .store
+            .plan_kept_deletion(
+                folder.id,
+                &PlanKeptDeletion {
+                    ids: vec![first.id],
+                    all: false,
+                },
+            )
+            .unwrap();
+        let done = env
+            .store
+            .approve_kept_deletion(&env.config, again.id, &again.digest, "Operator")
+            .unwrap();
+        assert!(!done.outcomes[0].deleted);
+        assert!(
+            done.outcomes[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("never deleted")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"someone else's");
+        assert_eq!(env.store.kept_files(folder.id).unwrap(), kept);
+    }
+}
+
+#[test]
+fn a_folder_that_is_not_the_empty_private_one_just_made_is_never_used() {
+    use std::os::unix::fs::PermissionsExt;
+    for tamper in ["a file in it", "a group-writable mode"] {
+        let env = Env::new();
+        let (folder, plan) = built_then_deselected(&env);
+        let dir = env.play().join("atari2600");
+        let at = dir.clone();
+        // Once the area is made under its temporary name, before it is checked, it is changed.
+        env.store
+            .hook_faults(Some(std::sync::Arc::new(move |fault| {
+                if fault == Fault::MadeDir {
+                    let temp = at.join(&creating(&at)[0]);
+                    if tamper == "a file in it" {
+                        std::fs::write(temp.join("theirs"), b"theirs").unwrap();
+                    } else {
+                        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o770))
+                            .unwrap();
+                    }
+                }
+            })));
+        let job = env.build(&plan);
+        env.store.hook_faults(None);
+
+        assert_eq!(job.state, JobState::Failed, "{tamper}");
+        let temps = creating(&dir);
+        assert_eq!(temps.len(), 1, "{tamper}: left in place");
+        if tamper == "a file in it" {
+            assert_eq!(
+                std::fs::read(dir.join(&temps[0]).join("theirs")).unwrap(),
+                b"theirs"
+            );
+        }
+        assert!(!dir.join(RETAINED).exists(), "{tamper}");
+        assert!(env.store.kept_files(folder.id).unwrap().is_empty());
+        let (env, _) = env.restart();
+        let next = env.plan(&folder, plan.content.selection);
+        assert!(blockers(&next).contains(&BlockerKind::Recovery), "{tamper}");
+    }
+
+    // A recorded retention area whose mode was opened up is no longer trusted.
+    let env = Env::new();
+    let (folder, plan) = built_then_deselected(&env);
+    let dir = env.play().join("atari2600");
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+    let area = dir.join(RETAINED);
+    std::fs::set_permissions(&area, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let deletion = plan_delete_all(&env, &folder);
+    let done = env
+        .store
+        .approve_kept_deletion(&env.config, deletion.id, &deletion.digest, "Operator")
+        .unwrap();
+    assert!(
+        done.outcomes
+            .iter()
+            .all(|o| !o.deleted && o.detail.as_deref().unwrap().contains("private"))
+    );
+    assert_eq!(
+        env.store.kept_files(folder.id).unwrap().len(),
+        done.outcomes.len()
+    );
 }
 
 #[test]
@@ -1772,6 +2936,7 @@ fn building_resolved_groups_only_is_a_choice_the_digest_binds_and_leaves_the_res
         PlanChoices {
             resolved_only: true,
             adopt: vec![],
+            keep_aside: vec![],
         },
     );
 
@@ -1854,6 +3019,7 @@ fn a_conflict_is_adopted_only_when_its_roms_match_the_dat_and_nothing_is_written
         PlanChoices {
             resolved_only: false,
             adopt: vec!["Pong (USA).zip".into(), "Combat (USA).zip".into()],
+            keep_aside: vec![],
         },
     );
     assert_ne!(adopt.digest, left.digest);
@@ -2013,6 +3179,7 @@ fn an_unresolved_group_is_complete_only_when_its_built_file_still_holds_the_game
         PlanChoices {
             resolved_only: true,
             adopt: vec![],
+            keep_aside: vec![],
         },
     );
     assert!(plan.approvable(), "{:?}", plan.content.blockers);
@@ -2072,6 +3239,7 @@ fn an_unresolved_group_whose_roms_the_newer_dat_revision_changed_is_incomplete()
         PlanChoices {
             resolved_only: true,
             adopt: vec![],
+            keep_aside: vec![],
         },
     );
     assert!(plan.approvable(), "{:?}", plan.content.blockers);

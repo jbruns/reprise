@@ -80,6 +80,24 @@ impl Identity {
     }
 }
 
+impl From<Identity> for title_select_api::build::FileIdentity {
+    fn from(id: Identity) -> Self {
+        title_select_api::build::FileIdentity {
+            dev: id.dev,
+            ino: id.ino,
+        }
+    }
+}
+
+impl From<title_select_api::build::FileIdentity> for Identity {
+    fn from(id: title_select_api::build::FileIdentity) -> Self {
+        Identity {
+            dev: id.dev,
+            ino: id.ino,
+        }
+    }
+}
+
 /// A file's status change time in nanoseconds since the Unix epoch: it moves on any change to the file's content or
 /// metadata, and cannot be set back.
 #[allow(clippy::unnecessary_cast)]
@@ -146,6 +164,33 @@ impl FolderDir {
     pub fn mkdir_private(&self, name: &str) -> io::Result<()> {
         let name = component(name)?;
         rustix::fs::mkdirat(&self.fd, name, Mode::RWXU).map_err(|e| self.error(name, e))
+    }
+
+    /// Checks, through the open descriptor, that this is a directory [`FolderDir::mkdir_private`] could have made:
+    /// owned by this process's effective user, with permission bits exactly `rwx------`, and, with `empty`, holding
+    /// nothing. Returns its identity, or why it is not.
+    ///
+    /// The Managed Folder lets only the service's own user rename entries in it, and a process running as that user
+    /// can rewrite the store as well, so it is not defended against. What this rejects is a directory another user, or
+    /// an earlier leftover, put at a name Title Select is about to trust.
+    pub fn private(&self, empty: bool) -> io::Result<std::result::Result<Identity, String>> {
+        let st = rustix::fs::fstat(&self.fd).map_err(|e| with_path(&self.path, e.into()))?;
+        let mode = st.st_mode as u32 & 0o777;
+        if FolderDir::kind(&st) != FileType::Directory {
+            return Ok(Err("it is not a directory".into()));
+        }
+        if st.st_uid != rustix::process::geteuid().as_raw() {
+            return Ok(Err("it is owned by another user".into()));
+        }
+        if mode != 0o700 {
+            return Ok(Err(format!(
+                "its permissions are {mode:o}, not the 700 Title Select creates it with"
+            )));
+        }
+        if empty && !self.entries()?.is_empty() {
+            return Ok(Err("it is not empty".into()));
+        }
+        Ok(Ok(Identity::of(&st)))
     }
 
     /// The identity of this directory as it was opened.

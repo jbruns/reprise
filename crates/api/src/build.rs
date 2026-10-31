@@ -9,9 +9,21 @@ use crate::selection::Role;
 pub const MARKER: &str = ".title-select";
 /// The folder, inside a Managed Folder, that a Build stages its files in, so that renames never cross mounts.
 pub const STAGING: &str = ".title-select-staging";
-/// The directory, inside a Managed Folder, where Kept Files will be set aside under `<generation>/` (#37). Reserved
-/// now, so that a check never reports it as Drift.
+/// The directory, inside a Managed Folder, where Kept Files are set aside under `<generation>/`, each renamed with
+/// [`kept_name`]. A check never reports it, or what is in it, as Drift.
 pub const RETENTION: &str = ".title-select-retained";
+/// The suffix every Kept File's name ends with: no tool that scans a folder for games matches it.
+pub const KEPT_SUFFIX: &str = ".kept";
+
+/// The name a file `name` is kept under in its generation's retention folder: the name with [`KEPT_SUFFIX`]
+/// appended, and, from the second file of that name, a number before the suffix.
+pub fn kept_name(name: &str, nth: u32) -> String {
+    if nth <= 1 {
+        format!("{name}{KEPT_SUFFIX}")
+    } else {
+        format!("{name}.{nth}{KEPT_SUFFIX}")
+    }
+}
 
 /// What a Managed Folder's marker records. The store stays the source of truth; the marker lets a plan tell its
 /// folder from a folder another store manages, a folder restored from a backup, or a wrong mount.
@@ -73,6 +85,9 @@ pub struct UnfinishedBuild {
     pub uncertain: u64,
     /// Files the build never reached, or that failed.
     pub not_written: u64,
+    /// Files it kept aside before it stopped.
+    #[serde(default)]
+    pub kept: u64,
 }
 
 /// The request to register a Managed Folder.
@@ -127,6 +142,10 @@ pub struct PlanChoices {
     /// is left as it is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub adopt: Vec<String>,
+    /// The targets in conflict whose file you keep aside: moved into the folder's retention area as a kept file, so
+    /// that the game is built there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keep_aside: Vec<String>,
 }
 
 /// The request to approve a plan: the digest of the plan you reviewed.
@@ -158,10 +177,13 @@ pub enum ItemKind {
     /// Its group is unresolved and you chose to build the resolved groups only; skipped, and whatever is at its
     /// target is left untouched.
     Unresolved,
+    /// Never a plan item: a Build's item that removes a built file whose game is no longer selected, one of the
+    /// plan's removals.
+    Remove,
 }
 
 impl ItemKind {
-    pub const ALL: [ItemKind; 8] = [
+    pub const ALL: [ItemKind; 9] = [
         ItemKind::Copy,
         ItemKind::Repack,
         ItemKind::Adopt,
@@ -170,6 +192,7 @@ impl ItemKind {
         ItemKind::Conflict,
         ItemKind::Unresolved,
         ItemKind::Blocked,
+        ItemKind::Remove,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -182,6 +205,7 @@ impl ItemKind {
             ItemKind::Blocked => "blocked",
             ItemKind::Adopt => "adopt",
             ItemKind::Unresolved => "unresolved",
+            ItemKind::Remove => "remove",
         }
     }
 
@@ -208,6 +232,83 @@ pub struct ExpectedRom {
     pub sha1: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+}
+
+/// What a file is, as opposed to the name it is found at: its device and inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// Why a file is kept aside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeepReason {
+    /// A built file whose game is no longer selected.
+    Removal,
+    /// A built file whose game the selection or DAT revision now wants built from other ROMs.
+    Replacement,
+    /// A file in conflict at a selected game's target that you chose to keep aside and rebuild.
+    Conflict,
+}
+
+impl KeepReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeepReason::Removal => "removal",
+            KeepReason::Replacement => "replacement",
+            KeepReason::Conflict => "conflict",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<KeepReason> {
+        [
+            KeepReason::Removal,
+            KeepReason::Replacement,
+            KeepReason::Conflict,
+        ]
+        .into_iter()
+        .find(|k| k.as_str() == s)
+    }
+}
+
+/// A file a plan keeps aside: moved, as it is, into the folder's retention area. It is moved only while it is still
+/// this file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeepAside {
+    pub reason: KeepReason,
+    /// Its name in the folder, which may differ from the target in case.
+    pub name: String,
+    pub file: FileStat,
+    pub identity: FileIdentity,
+    /// Its SHA-256, when the store recorded it or the plan's check read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+/// What a plan does with a built file whose game is no longer selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemovalKind {
+    /// Keep it aside in the retention area.
+    Keep,
+    /// It is gone already; its record is dropped.
+    Forget,
+    /// It changed since it was built, so it is not the file Title Select built; it is left as it is.
+    Leave,
+}
+
+/// A built file whose game is no longer selected, and what the plan does with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanRemoval {
+    pub target: String,
+    pub game: String,
+    pub kind: RemovalKind,
+    pub reason: String,
+    /// The file kept aside, for a removal that keeps one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<KeepAside>,
 }
 
 /// A file's size and modification time, as a plan saw it.
@@ -256,6 +357,13 @@ pub struct PlanItem {
     /// For a conflict: the file at the target holds the ROMs the DAT expects there, so you may adopt it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub adoptable: bool,
+    /// For a conflict: the entry at the target is a regular file, so you may keep it aside and rebuild.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keepable: bool,
+    /// The file at the target that is kept aside before this one is written: a replacement, or a conflict you
+    /// chose to keep aside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<KeepAside>,
 }
 
 /// Why a plan cannot be approved.
@@ -274,9 +382,9 @@ pub enum BlockerKind {
     FolderMissing,
     /// The folder's marker does not match the store.
     Marker,
-    /// A built file would change; that needs a later build step.
+    /// No longer raised: a replacement keeps the old file aside. Kept so that older plans still read.
     Replacement,
-    /// A built file would go; that needs a later build step.
+    /// No longer raised: a removal keeps the file aside. Kept so that older plans still read.
     Removal,
     /// An earlier build stopped and its folder has not been cleaned up since, or the folder holds leftovers no
     /// build of this store accounts for.
@@ -310,6 +418,9 @@ pub struct PlanContent {
     #[serde(default, skip_serializing_if = "PlanChoices::is_default")]
     pub choices: PlanChoices,
     pub items: Vec<PlanItem>,
+    /// The built files whose games are no longer selected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removals: Vec<PlanRemoval>,
     pub blockers: Vec<Blocker>,
 }
 
@@ -355,6 +466,12 @@ pub struct PlanSummary {
     pub adopt: u64,
     #[serde(default)]
     pub unresolved: u64,
+    /// Files kept aside: replacements, conflicts you chose to keep aside, and removals.
+    #[serde(default)]
+    pub keep: u64,
+    /// Built files no longer selected, whether kept aside, forgotten or left.
+    #[serde(default)]
+    pub remove: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,8 +520,18 @@ impl PlanContent {
                 ItemKind::Blocked => &mut s.blocked,
                 ItemKind::Adopt => &mut s.adopt,
                 ItemKind::Unresolved => &mut s.unresolved,
+                ItemKind::Remove => &mut s.remove,
             } += 1;
+            if item.keep.is_some() {
+                s.keep += 1;
+            }
         }
+        s.remove = self.removals.len() as u64;
+        s.keep += self
+            .removals
+            .iter()
+            .filter(|r| r.kind == RemovalKind::Keep)
+            .count() as u64;
         s
     }
 }
@@ -506,7 +633,7 @@ impl ItemState {
     }
 }
 
-/// One file a Build writes, and how it went.
+/// One file a Build writes, adopts or removes, and how it went.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildItem {
     pub target: String,
@@ -798,6 +925,81 @@ pub struct FolderCheck {
     pub drift: Vec<DriftEntry>,
 }
 
+/// A kept file: a file a Build moved out of its Managed Folder into the folder's retention area.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptFile {
+    pub id: i64,
+    pub folder: i64,
+    /// The generation of the Build that kept it: the folder in the retention area it is in.
+    pub generation: u64,
+    /// Its name in the folder.
+    pub name: String,
+    /// Its name in the retention area, in `<generation>/`.
+    pub kept_name: String,
+    pub reason: KeepReason,
+    /// The Build that kept it.
+    pub build: i64,
+    /// The Build that wrote it, when Title Select built it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_by: Option<i64>,
+    /// The DAT's game it was built for, when Title Select built it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game: Option<String>,
+    pub sha256: String,
+    pub file: FileStat,
+    pub identity: FileIdentity,
+    pub kept_at: String,
+}
+
+/// The request to plan deleting kept files of a Managed Folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanKeptDeletion {
+    /// The kept files to delete, by id; every kept file of the folder when `all` is set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<i64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all: bool,
+}
+
+/// What deleting kept files covers, in the order its digest is computed over: each file as the store recorded it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptDeletionContent {
+    pub folder: i64,
+    pub files: Vec<KeptFile>,
+}
+
+/// What deleting one kept file did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptDeletionOutcome {
+    pub id: i64,
+    pub kept_name: String,
+    pub generation: u64,
+    pub deleted: bool,
+    /// Why it was left, when it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// A plan to delete kept files, carried out once you approve it with its digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptDeletion {
+    pub id: i64,
+    /// The SHA-256 of the canonical JSON of `content`, which an approval binds to.
+    pub digest: String,
+    pub created_at: String,
+    pub content: KeptDeletionContent,
+    pub approval: Option<Approval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// What each deletion did, once carried out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outcomes: Vec<KeptDeletionOutcome>,
+    /// Why recovery could not finish it when the service last started: its folder could not be shown to be this
+    /// store's. Its kept files stay recorded until it can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_error: Option<String>,
+}
+
 /// Why a name cannot be a file name on every filesystem a Play Library may be shared from, or `None` when it can.
 pub fn invalid_name(name: &str) -> Option<String> {
     if name.is_empty() || name == "." || name == ".." {
@@ -840,6 +1042,182 @@ fn reserved_device(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kept_name_never_ends_in_an_es_de_system_extension() {
+        // Every extension ES-DE's bundled systems match, across consoles, computers and arcade.
+        const ES_DE: &[&str] = &[
+            ".7z",
+            ".zip",
+            ".a26",
+            ".a52",
+            ".a78",
+            ".bin",
+            ".j64",
+            ".jag",
+            ".lnx",
+            ".nes",
+            ".fds",
+            ".unf",
+            ".unif",
+            ".sfc",
+            ".smc",
+            ".fig",
+            ".swc",
+            ".bs",
+            ".st",
+            ".n64",
+            ".z64",
+            ".v64",
+            ".ndd",
+            ".gb",
+            ".gbc",
+            ".gba",
+            ".agb",
+            ".cgb",
+            ".dmg",
+            ".sgb",
+            ".nds",
+            ".3ds",
+            ".cia",
+            ".gcm",
+            ".iso",
+            ".wbfs",
+            ".rvz",
+            ".ciso",
+            ".gcz",
+            ".wad",
+            ".wia",
+            ".dol",
+            ".elf",
+            ".nsp",
+            ".xci",
+            ".md",
+            ".gen",
+            ".smd",
+            ".sms",
+            ".gg",
+            ".sg",
+            ".32x",
+            ".cue",
+            ".chd",
+            ".gdi",
+            ".cdi",
+            ".m3u",
+            ".pbp",
+            ".cso",
+            ".img",
+            ".mdf",
+            ".toc",
+            ".ccd",
+            ".pce",
+            ".sgx",
+            ".ngp",
+            ".ngc",
+            ".ws",
+            ".wsc",
+            ".vb",
+            ".vboy",
+            ".col",
+            ".int",
+            ".min",
+            ".vec",
+            ".o2",
+            ".tap",
+            ".tzx",
+            ".z80",
+            ".sna",
+            ".dsk",
+            ".adf",
+            ".ipf",
+            ".hdf",
+            ".lha",
+            ".d64",
+            ".t64",
+            ".prg",
+            ".crt",
+            ".g64",
+            ".atr",
+            ".xex",
+            ".xfd",
+            ".cas",
+            ".rom",
+            ".mx1",
+            ".mx2",
+            ".exe",
+            ".com",
+            ".bat",
+            ".dosz",
+            ".kat",
+            ".lua",
+            ".p8",
+            ".png",
+            ".tic",
+            ".wasm",
+            ".sh",
+            ".desktop",
+            ".app",
+            ".lnk",
+            ".url",
+            ".rp",
+            ".pak",
+            ".scummvm",
+            ".svm",
+            ".dat",
+            ".hdi",
+            ".fdi",
+            ".d88",
+            ".88d",
+            ".cmd",
+            ".ldb",
+            ".daphne",
+            ".singe",
+            ".mgw",
+            ".rar",
+            ".tar",
+            ".gz",
+            ".xz",
+            ".zst",
+            ".squashfs",
+            ".ps3",
+            ".psvita",
+            ".vpk",
+            ".xbe",
+            ".xiso",
+            ".bml",
+            ".nca",
+            ".nro",
+            ".nso",
+            ".kip",
+            ".ecm",
+            ".mds",
+            ".vcd",
+            ".cbn",
+            ".nrg",
+            ".pdi",
+        ];
+        for name in [
+            "Pong (USA).zip",
+            "Game.7z",
+            "Disc.chd",
+            "Game.zip.kept",
+            "noext",
+            "UPPER.ZIP",
+        ] {
+            for nth in [1, 2, 10] {
+                let kept = kept_name(name, nth);
+                assert!(kept.starts_with(name), "{kept}");
+                let extension = &kept[kept.rfind('.').unwrap()..];
+                assert_eq!(extension, KEPT_SUFFIX, "{kept}");
+                assert!(
+                    !ES_DE.iter().any(|e| e.eq_ignore_ascii_case(extension)),
+                    "{kept} would be matched as a game"
+                );
+            }
+        }
+        assert_eq!(kept_name("Game.zip", 1), "Game.zip.kept");
+        assert_eq!(kept_name("Game.zip", 2), "Game.zip.2.kept");
+    }
 
     #[test]
     fn names_invalid_on_windows_or_smb_are_refused_and_dat_names_are_not() {

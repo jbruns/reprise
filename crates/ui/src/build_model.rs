@@ -4,7 +4,8 @@
 use title_select_api::SelectionRecord;
 use title_select_api::build::{
     BlockerKind, BuildState, Cause, DriftKind, FileOutcome, IncompleteCounts, IncompleteReason,
-    ItemKind, ItemState, ManagedFolder, PlanChoices, PlanItem, UnfinishedBuild,
+    ItemKind, ItemState, KeepReason, ManagedFolder, PlanChoices, PlanItem, RemovalKind,
+    UnfinishedBuild,
 };
 
 pub fn item_kind_label(kind: ItemKind) -> &'static str {
@@ -17,6 +18,7 @@ pub fn item_kind_label(kind: ItemKind) -> &'static str {
         ItemKind::Blocked => "Blocked",
         ItemKind::Adopt => "Adopt",
         ItemKind::Unresolved => "Unresolved",
+        ItemKind::Remove => "Remove",
     }
 }
 
@@ -29,7 +31,7 @@ pub fn item_kind_note(kind: ItemKind) -> &'static str {
         ItemKind::NoSource => "No audited file holds every ROM, so these are skipped.",
         ItemKind::Conflict => {
             "A file the store did not build, or one changed since it was built, is at the target. It is never \
-             overwritten, so these are skipped."
+             overwritten, so these are skipped unless you choose to keep the file aside and rebuild."
         }
         ItemKind::Blocked => "These cannot be built as planned, so they are skipped.",
         ItemKind::Adopt => {
@@ -39,6 +41,9 @@ pub fn item_kind_note(kind: ItemKind) -> &'static str {
         ItemKind::Unresolved => {
             "Their groups are unresolved, and you build the resolved groups only. Whatever is at their targets is \
              left untouched."
+        }
+        ItemKind::Remove => {
+            "Built files no longer selected: each is kept aside, or forgotten if it is gone."
         }
     }
 }
@@ -70,8 +75,12 @@ pub fn unfinished_label(unfinished: &UnfinishedBuild) -> String {
         BuildState::Failed => "Failed build",
         _ => "Interrupted build",
     };
+    let kept = match unfinished.kept {
+        0 => String::new(),
+        n => format!(", {n} kept aside"),
+    };
     format!(
-        "{what}: {} applied, {} uncertain",
+        "{what}: {} applied, {} uncertain{kept}",
         unfinished.applied, unfinished.uncertain
     )
 }
@@ -102,10 +111,39 @@ pub fn with_adopt(choices: &PlanChoices, target: &str, on: bool) -> PlanChoices 
     let mut next = choices.clone();
     next.adopt.retain(|t| t != target);
     if on {
+        next.keep_aside.retain(|t| t != target);
         next.adopt.push(target.to_owned());
         next.adopt.sort();
     }
     next
+}
+
+/// The choices of a plan made again with keeping aside the file at `target` set to `on`, keeping the rest.
+pub fn with_keep_aside(choices: &PlanChoices, target: &str, on: bool) -> PlanChoices {
+    let mut next = choices.clone();
+    next.keep_aside.retain(|t| t != target);
+    if on {
+        next.adopt.retain(|t| t != target);
+        next.keep_aside.push(target.to_owned());
+        next.keep_aside.sort();
+    }
+    next
+}
+
+pub fn keep_reason_label(reason: KeepReason) -> &'static str {
+    match reason {
+        KeepReason::Removal => "no longer selected",
+        KeepReason::Replacement => "replaced",
+        KeepReason::Conflict => "conflict kept aside",
+    }
+}
+
+pub fn removal_kind_label(kind: RemovalKind) -> &'static str {
+    match kind {
+        RemovalKind::Keep => "Keep aside",
+        RemovalKind::Forget => "Forget",
+        RemovalKind::Leave => "Leave",
+    }
 }
 
 pub fn cause_label(cause: Cause) -> &'static str {
@@ -203,6 +241,8 @@ mod tests {
             sources: Vec::new(),
             reason: None,
             existing: None,
+            keepable: false,
+            keep: None,
             adoptable: false,
         }
     }
@@ -304,12 +344,14 @@ mod tests {
         let choices = PlanChoices {
             resolved_only: true,
             adopt: vec!["Pong.zip".into()],
+            keep_aside: vec!["Combat.zip".into()],
         };
 
         let both = with_adopt(&choices, "Combat.zip", true);
         let left = with_adopt(&both, "Pong.zip", false);
 
         assert_eq!(both.adopt, ["Combat.zip", "Pong.zip"]);
+        assert!(both.keep_aside.is_empty());
         assert_eq!(left.adopt, ["Combat.zip"]);
         assert!(left.resolved_only);
     }

@@ -8,8 +8,9 @@ use leptos_router::hooks::use_params_map;
 use leptos_struct_table::ColumnSort;
 use title_select_api::build::{
     AddManagedFolder, ApprovePlan, BlockerKind, BuildDetail, BuildItem, BuildSummary, BuiltFile,
-    ChangeManagedFolder, FileOutcome, FolderCheck, Incomplete, ItemKind, ManagedFolder, Plan,
-    PlanBuild, PlanChoices, PlanItem, PlanSummary,
+    ChangeManagedFolder, FileOutcome, FolderCheck, Incomplete, ItemKind, KeepReason, KeptDeletion,
+    KeptFile, ManagedFolder, Plan, PlanBuild, PlanChoices, PlanItem, PlanKeptDeletion, PlanSummary,
+    RETENTION,
 };
 use title_select_api::{
     Dat, Job, PathTemplateDefaults, ProfileRecord, Root, SelectionRecord, SourceSetRecord,
@@ -20,7 +21,8 @@ use crate::app::{Loading, Problem, navigator};
 use crate::build_model::{
     blocker_label, build_state_label, by_kind, cause_label, drift_kind_label, file_outcome_label,
     folders_for, group_href, incomplete_counts, incomplete_reason_label, item_kind_label,
-    item_kind_note, item_state_label, unfinished_label, with_adopt,
+    item_kind_note, item_state_label, keep_reason_label, removal_kind_label, unfinished_label,
+    with_adopt, with_keep_aside,
 };
 use crate::events::use_live;
 use crate::model::{short_sha, when};
@@ -498,6 +500,7 @@ fn FolderView(folder: ManagedFolder, refresh: RwSignal<u64>) -> impl IntoView {
         <ChangeBinding folder=folder.clone() refresh />
         <Builds folder=id />
         <BuiltFiles folder=id />
+        <KeptFiles folder=id busy=active_job.is_some() refresh />
     }
 }
 
@@ -792,6 +795,8 @@ fn summary_view(s: &PlanSummary) -> AnyView {
         ("Repack", s.repack, "count verified"),
         ("Adopt", s.adopt, "count verified"),
         ("Unchanged", s.unchanged, "count"),
+        ("Kept aside", s.keep, "count review"),
+        ("No longer selected", s.remove, "count review"),
         ("No source", s.no_source, "count review"),
         ("Conflict", s.conflict, "count review"),
         ("Unresolved", s.unresolved, "count review"),
@@ -827,8 +832,16 @@ enum ItemCol {
 struct ItemRow(PlanItem);
 
 fn item_detail(item: &PlanItem) -> String {
+    let kept = item.keep.as_ref().map(|k| {
+        format!(
+            "{} is kept aside first ({}); ",
+            k.name,
+            keep_reason_label(k.reason)
+        )
+    });
+    let kept = kept.unwrap_or_default();
     if let Some(reason) = &item.reason {
-        return reason.clone();
+        return format!("{kept}{reason}");
     }
     let mut paths: Vec<String> = item
         .sources
@@ -839,7 +852,7 @@ fn item_detail(item: &PlanItem) -> String {
         })
         .collect();
     paths.dedup();
-    paths.join(", ")
+    format!("{kept}{}", paths.join(", "))
 }
 
 impl Grid for ItemRow {
@@ -1027,6 +1040,88 @@ fn PlanView(plan: Plan, refresh: RwSignal<u64>) -> impl IntoView {
         }
     });
 
+    let keepable: Vec<PlanItem> = plan
+        .content
+        .items
+        .iter()
+        .filter(|i| {
+            i.keepable && i.kind != ItemKind::Adopt
+                || i.keep
+                    .as_ref()
+                    .is_some_and(|k| k.reason == KeepReason::Conflict)
+        })
+        .cloned()
+        .collect();
+    let keep_choices = (open && !keepable.is_empty()).then(|| {
+        let choices = plan.content.choices.clone();
+        view! {
+            <h3>"Conflicts you can keep aside"</h3>
+            <p class="note small">
+                "Keep a file aside, and it is moved into the folder's retention area, never deleted, and the game is \
+                built in its place. You can delete kept files later, from this folder's kept files."
+            </p>
+            <ul class="plain">
+                {keepable
+                    .into_iter()
+                    .map(|i| {
+                        let chosen = choices.keep_aside.contains(&i.target);
+                        let next = with_keep_aside(&choices, &i.target, !chosen);
+                        let (now, label) = if chosen {
+                            ("kept aside and rebuilt", "Leave it")
+                        } else {
+                            ("left as it is", "Keep it aside and rebuild")
+                        };
+                        view! {
+                            <li>
+                                <code>{i.target.clone()}</code>
+                                {format!(": {now} ")}
+                                <button type="button" disabled=busy on:click=move |_| replan(next.clone())>{label}</button>
+                            </li>
+                        }
+                    })
+                    .collect_view()}
+            </ul>
+        }
+    });
+    let removals = (!plan.content.removals.is_empty()).then(|| {
+        view! {
+            <h3>"Built files no longer selected"</h3>
+            <p class="note small">
+                {format!(
+                    "Each file kept aside is moved into {RETENTION}, never deleted; you delete kept files only by \
+                     approving that separately."
+                )}
+            </p>
+            <ul class="plain">
+                {plan
+                    .content
+                    .removals
+                    .iter()
+                    .map(|r| {
+                        view! {
+                            <li>
+                                <strong>{removal_kind_label(r.kind)}</strong>
+                                " "
+                                <code>{r.target.clone()}</code>
+                                {format!(": {}", r.reason)}
+                            </li>
+                        }
+                    })
+                    .collect_view()}
+            </ul>
+        }
+    });
+    let removes = plan
+        .content
+        .removals
+        .iter()
+        .filter(|r| r.kind == title_select_api::build::RemovalKind::Keep)
+        .count();
+    let approve_label = match removes {
+        0 => format!("Approve and build {writes} files"),
+        n => format!("Approve and build {writes} files, keeping {n} aside"),
+    };
+
     view! {
         <section aria-labelledby="latest-plan-title">
             <h2 id="latest-plan-title">{format!("Plan #{id}")}</h2>
@@ -1097,12 +1192,14 @@ fn PlanView(plan: Plan, refresh: RwSignal<u64>) -> impl IntoView {
                 })}
             {partial}
             {adopt_choices}
+            {keep_choices}
+            {removals}
             {approvable
                 .then(|| {
                     view! {
                         <div class="form">
                             <button type="button" class="primary" disabled=busy on:click=approve>
-                                {format!("Approve and build {writes} files")}
+                                {approve_label.clone()}
                             </button>
                         </div>
                     }
@@ -1555,5 +1652,208 @@ pub fn PlanABuild(selection: SelectionRecord) -> impl IntoView {
             .into_any()
         }}
         {move || problem.get().map(|message| view! { <Problem message /> })}
+    }
+}
+
+/// The files builds kept aside in the folder's retention area, by generation, and deleting the ones you pick by
+/// approving a plan that lists them.
+#[component]
+fn KeptFiles(folder: i64, busy: bool, refresh: RwSignal<u64>) -> impl IntoView {
+    let live = use_live();
+    let files = LocalResource::new(move || {
+        live.settled.track();
+        refresh.track();
+        async move { api::get::<Vec<KeptFile>>(&format!("/managed-folders/{folder}/kept-files")).await }
+    });
+    let picked = RwSignal::new(Vec::<i64>::new());
+    let plan = RwSignal::new(None::<KeptDeletion>);
+    let problem = RwSignal::new(None::<String>);
+    let working = RwSignal::new(false);
+    let request = move |all: bool| {
+        working.set(true);
+        let body = PlanKeptDeletion {
+            ids: if all {
+                Vec::new()
+            } else {
+                picked.get_untracked()
+            },
+            all,
+        };
+        leptos::task::spawn_local(async move {
+            let planned = api::post::<_, KeptDeletion>(
+                &format!("/managed-folders/{folder}/kept-deletions"),
+                &body,
+            )
+            .await;
+            working.set(false);
+            match planned {
+                Ok(p) => {
+                    problem.set(None);
+                    plan.set(Some(p));
+                }
+                Err(message) => problem.set(Some(message)),
+            }
+        });
+    };
+    let approve = move |_| {
+        let Some(p) = plan.get_untracked() else {
+            return;
+        };
+        working.set(true);
+        let body = ApprovePlan {
+            digest: p.digest.clone(),
+        };
+        leptos::task::spawn_local(async move {
+            let done =
+                api::post::<_, KeptDeletion>(&format!("/kept-deletions/{}/approval", p.id), &body)
+                    .await;
+            working.set(false);
+            match done {
+                Ok(p) => {
+                    picked.set(Vec::new());
+                    plan.set(Some(p));
+                    refresh.update(|n| *n += 1);
+                }
+                Err(message) => problem.set(Some(message)),
+            }
+        });
+    };
+    let list = move || match files.get() {
+        None => view! { <Loading what="the kept files" /> }.into_any(),
+        Some(Err(message)) => view! { <Problem message /> }.into_any(),
+        Some(Ok(files)) if files.is_empty() => {
+            view! { <p class="note">"No files are kept aside."</p> }.into_any()
+        }
+        Some(Ok(files)) => {
+            let mut generations: Vec<(u64, Vec<KeptFile>)> = Vec::new();
+            for f in files {
+                match generations.last_mut() {
+                    Some((g, list)) if *g == f.generation => list.push(f),
+                    _ => generations.push((f.generation, vec![f])),
+                }
+            }
+            view! {
+                {generations
+                    .into_iter()
+                    .map(|(generation, files)| {
+                        view! {
+                            <h3>{format!("Kept by generation {generation}")}</h3>
+                            <ul class="plain">
+                                {files
+                                    .into_iter()
+                                    .map(|f| {
+                                        let id = f.id;
+                                        let checked = move || picked.with(|p| p.contains(&id));
+                                        view! {
+                                            <li>
+                                                <label>
+                                                    <input
+                                                        type="checkbox"
+                                                        prop:checked=checked
+                                                        on:change=move |_| {
+                                                            picked.update(|p| {
+                                                                if let Some(at) = p.iter().position(|x| *x == id) {
+                                                                    p.remove(at);
+                                                                } else {
+                                                                    p.push(id);
+                                                                }
+                                                            })
+                                                        }
+                                                    />
+                                                    " "
+                                                    <code>{f.name.clone()}</code>
+                                                </label>
+                                                {format!(
+                                                    " as {RETENTION}/{}/{}: {}, {} bytes",
+                                                    f.generation,
+                                                    f.kept_name,
+                                                    keep_reason_label(f.reason),
+                                                    f.file.size,
+                                                )}
+                                                {f.game.clone().map(|g| format!(", {g}"))}
+                                            </li>
+                                        }
+                                    })
+                                    .collect_view()}
+                            </ul>
+                        }
+                    })
+                    .collect_view()}
+                <div class="form">
+                    <button
+                        type="button"
+                        disabled=move || busy || working.get() || picked.with(Vec::is_empty)
+                        on:click=move |_| request(false)
+                    >
+                        "Plan deleting the files you picked"
+                    </button>
+                    <button type="button" disabled=move || busy || working.get() on:click=move |_| request(true)>
+                        "Plan deleting every kept file"
+                    </button>
+                </div>
+            }
+            .into_any()
+        }
+    };
+    let review = move || {
+        plan.get().map(|p| {
+            let open = p.approval.is_none();
+            view! {
+                <h3>{format!("Deleting kept files, plan #{}", p.id)}</h3>
+                <p>
+                    "Digest " <code class="hash">{p.digest.clone()}</code>
+                </p>
+                <ul class="plain">
+                    {p
+                        .content
+                        .files
+                        .iter()
+                        .map(|f| {
+                            let outcome = p.outcomes.iter().find(|o| o.id == f.id).map(|o| match (
+                                o.deleted,
+                                &o.detail,
+                            ) {
+                                (true, _) => ": deleted".to_string(),
+                                (false, Some(d)) => format!(": {d}"),
+                                (false, None) => ": left as it is".to_string(),
+                            });
+                            view! {
+                                <li>
+                                    <code>{format!("{RETENTION}/{}/{}", f.generation, f.kept_name)}</code>
+                                    {outcome}
+                                </li>
+                            }
+                        })
+                        .collect_view()}
+                </ul>
+                {open
+                    .then(|| {
+                        view! {
+                            <div class="form">
+                                <button
+                                    type="button"
+                                    class="primary"
+                                    disabled=move || busy || working.get()
+                                    on:click=approve
+                                >
+                                    {format!("Approve and delete {} kept files", p.content.files.len())}
+                                </button>
+                            </div>
+                        }
+                    })}
+            }
+        })
+    };
+    view! {
+        <section aria-labelledby="kept-title">
+            <h2 id="kept-title">"Kept files"</h2>
+            <p class="lede">
+                "Files builds moved aside instead of deleting: removed, replaced, or conflicts you chose to keep aside. \
+                Nothing here is deleted until you approve it."
+            </p>
+            {list}
+            {review}
+            {move || problem.get().map(|message| view! { <Problem message /> })}
+        </section>
     }
 }

@@ -10,8 +10,8 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use sha2::{Digest, Sha256};
 use title_select_api::build::{
     Approval, Blocker, BlockerKind, Cause, CheckSummary, ExpectedRom, FileOutcome, FileStat,
-    FolderCheck, ItemKind, Plan, PlanBuild, PlanChange, PlanChoices, PlanContent, PlanItem,
-    PlanSource, STAGING, invalid_name,
+    FolderCheck, ItemKind, KeepAside, KeepReason, Plan, PlanBuild, PlanChange, PlanChoices,
+    PlanContent, PlanItem, PlanRemoval, PlanSource, RETENTION, RemovalKind, STAGING, invalid_name,
 };
 use title_select_api::report::{Entry, EvidenceLevel, Finding};
 use title_select_api::selection::{ReleaseRow, Role, Selection, diff_rows};
@@ -22,11 +22,12 @@ use title_select_engine::dat::Dat;
 use super::audits::{ENTRY_COLUMNS, entry_from_row};
 use super::checks::{Scan, ScanInput, Seen, read_probes, scan, store_check};
 use super::dats::revision_by_id;
-use super::folder_dir::{FolderDir, file_stat};
+use super::folder_dir::{FolderDir, Identity, file_stat};
 use super::folders::{
     FolderRow, MARKER_NEW, folder_by_id, is_own, marker_problem, open_folder, store_id,
 };
 use super::jobs::{build_hold, job_by_id};
+use super::kept::{deletion_active, folder_dirs, is_dir_temp};
 use super::selections::{read_rows, read_selection, record_by_id};
 use super::sets::{resolve, set_by_id};
 use super::{Error, Result, Store, now};
@@ -139,6 +140,8 @@ struct Inputs {
     selected: HashMap<String, String>,
     /// What earlier checks of the folder read, by name.
     cached: HashMap<String, (Seen, Probe)>,
+    /// The directories Builds created in the folder that outlive them, such as the retention area, by name.
+    dirs: HashMap<String, Identity>,
 }
 
 fn load(
@@ -239,6 +242,7 @@ fn load(
         choices: choices.clone(),
         selected,
         cached: read_probes(c, folder.id)?,
+        dirs: folder_dirs(c, folder.id)?,
         store: store_id(c)?,
         built: read_built(c, folder.id)?,
         folder,
@@ -278,8 +282,17 @@ fn blocker(kind: BlockerKind, message: impl Into<String>) -> Blocker {
     }
 }
 
-/// The files in a Managed Folder, other than its own, by lowercased name: the name as it is, and its stat.
-type Files = HashMap<String, (String, FileStat)>;
+/// An entry in a Managed Folder, as `lstat` found it.
+struct Found {
+    /// Its name as it is.
+    name: String,
+    file: FileStat,
+    identity: Identity,
+    regular: bool,
+}
+
+/// The entries in a Managed Folder, other than its own, by lowercased name.
+type Files = HashMap<String, Found>;
 
 /// The folder as a plan found it.
 struct Folder {
@@ -329,7 +342,10 @@ fn check_folder(
     let mut leftovers = Vec::new();
     for (name, _) in &listing {
         if is_own(name) {
-            if name == STAGING || name == MARKER_NEW {
+            // A folder Title Select was creating that was never renamed into place is recorded, and left.
+            let recorded_leftover = || matches!(dir.stat(name), Ok(Some(st)) if inputs.dirs.get(name) == Some(&Identity::of(&st)));
+            if name == STAGING || name == MARKER_NEW || (is_dir_temp(name) && !recorded_leftover())
+            {
                 leftovers.push(name.clone());
             }
             continue;
@@ -337,9 +353,18 @@ fn check_folder(
         let Ok(Some(st)) = dir.stat(name) else {
             continue;
         };
-        files.insert(name.to_lowercase(), (name.clone(), file_stat(&st)));
+        files.insert(
+            name.to_lowercase(),
+            Found {
+                name: name.clone(),
+                file: file_stat(&st),
+                identity: Identity::of(&st),
+                regular: FolderDir::kind(&st) == rustix::fs::FileType::RegularFile,
+            },
+        );
     }
     check_recovery(inputs, &dir, &leftovers, blockers);
+    check_retention(inputs, &dir, blockers);
     let problem = marker_problem(
         &dir,
         &inputs.store,
@@ -410,6 +435,127 @@ fn check_recovery(
             ),
         ));
     }
+}
+
+/// Blocks on a retention area that no Build of this store created: anything at its name that is not the directory
+/// a Build recorded creating there.
+fn check_retention(inputs: &Inputs, dir: &FolderDir, blockers: &mut Vec<Blocker>) {
+    let found = match dir.stat(RETENTION) {
+        Ok(found) => found,
+        Err(e) => {
+            blockers.push(blocker(BlockerKind::Recovery, e.to_string()));
+            return;
+        }
+    };
+    let Some(st) = found else {
+        return;
+    };
+    let ours = FolderDir::kind(&st) == rustix::fs::FileType::Directory
+        && inputs.dirs.get(RETENTION) == Some(&Identity::of(&st));
+    if !ours {
+        blockers.push(blocker(
+            BlockerKind::Recovery,
+            format!(
+                "{} holds {RETENTION}, which no build of this store created; move it out of the folder to build here",
+                dir.path().display()
+            ),
+        ));
+    }
+}
+
+/// The file `found` to keep aside for `reason`, with its SHA-256: what the plan's check read of it while it is the
+/// same file, or else `recorded`, what the store recorded of the file a Build wrote there.
+fn keep_of(
+    reason: KeepReason,
+    found: &Found,
+    scan: Option<&Scan>,
+    recorded: Option<&String>,
+) -> KeepAside {
+    let probed = scan
+        .and_then(|s| s.probes.get(&found.name))
+        .filter(|(seen, _)| seen.identity == found.identity && seen.file == found.file)
+        .map(|(_, probe)| probe.sha256.clone());
+    KeepAside {
+        reason,
+        name: found.name.clone(),
+        file: found.file.clone(),
+        identity: found.identity.into(),
+        sha256: probed.or_else(|| recorded.cloned()),
+    }
+}
+
+/// What the plan does with each file built into the folder whose game is no longer selected: one the check found
+/// as built is kept aside, one gone is forgotten, and one changed since is left as it is. Files of `untouched`
+/// releases are skipped.
+fn removals(
+    inputs: &Inputs,
+    folder: &Folder,
+    items: &[PlanItem],
+    untouched: &BTreeSet<String>,
+) -> Vec<PlanRemoval> {
+    let Some(scan) = &folder.scan else {
+        return Vec::new();
+    };
+    let targets: HashSet<&str> = items.iter().map(|i| i.target.as_str()).collect();
+    let lowered: HashSet<String> = items.iter().map(|i| i.target.to_lowercase()).collect();
+    let mut out = Vec::new();
+    for (target, built) in &inputs.built {
+        if targets.contains(target.as_str()) || untouched.contains(target) {
+            continue;
+        }
+        let lower = target.to_lowercase();
+        let checked = scan.files.iter().find(|f| f.target == *target);
+        let found = folder.files.get(&lower);
+        let mut removal = PlanRemoval {
+            target: target.clone(),
+            game: built.game.clone(),
+            kind: RemovalKind::Leave,
+            reason: String::new(),
+            keep: None,
+        };
+        let outcome = checked.map(|c| c.outcome);
+        if lowered.contains(&lower) {
+            removal.reason = format!(
+                "{target} differs from a selected game's file only in case; it is left as it is"
+            );
+        } else if outcome == Some(FileOutcome::Missing) {
+            removal.kind = RemovalKind::Forget;
+            removal.reason = format!(
+                "{} is no longer selected, and {target} is gone already; its record is dropped",
+                built.game
+            );
+        } else if let Some(found) = found.filter(|f| {
+            f.regular
+                && f.name == *target
+                && matches!(
+                    outcome,
+                    Some(FileOutcome::Unchanged | FileOutcome::Refreshed | FileOutcome::Repacked)
+                )
+        }) {
+            removal.kind = RemovalKind::Keep;
+            removal.reason = format!(
+                "{} is no longer selected; {target} is kept aside in the folder's retention area",
+                built.game
+            );
+            removal.keep = Some(keep_of(
+                KeepReason::Removal,
+                found,
+                Some(scan),
+                built.sha256.as_ref(),
+            ));
+        } else {
+            removal.reason = format!(
+                "{} is no longer selected, but {target} changed since it was built{}; it is left as it is",
+                built.game,
+                checked
+                    .and_then(|c| c.detail.as_deref())
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default()
+            );
+        }
+        out.push(removal);
+    }
+    out
 }
 
 /// One Entry that holds a ROM's payload.
@@ -628,30 +774,12 @@ fn compute(config: &Config, inputs: &Inputs, dat: Option<&Dat>) -> Planned {
 
     let mut items = Vec::new();
     if let (Some(dat), Some(_)) = (dat, usable_audit) {
-        items = plan_items(
-            config,
-            inputs,
-            dat,
-            folder.as_ref(),
-            &unresolved,
-            &mut blockers,
-        );
+        items = plan_items(config, inputs, dat, folder.as_ref(), &unresolved);
     }
-    let targets: BTreeSet<&str> = items.iter().map(|i: &PlanItem| i.target.as_str()).collect();
-    if usable_audit.is_some() {
-        for target in inputs.built.keys() {
-            if !targets.contains(target.as_str()) && !untouched.contains(target) {
-                blockers.push(Blocker {
-                    kind: BlockerKind::Removal,
-                    message: format!(
-                        "{target} was built here but is no longer selected; removing it needs a later build step"
-                    ),
-                    group: None,
-                    target: Some(target.clone()),
-                });
-            }
-        }
-    }
+    let removals = match (&folder, dat, usable_audit) {
+        (Some(folder), Some(_), Some(_)) => removals(inputs, folder, &items, &untouched),
+        _ => Vec::new(),
+    };
     let (previous, changes) = match &inputs.previous {
         Some(previous) => (Some(previous.selection), changes(inputs, previous)),
         None => (None, Vec::new()),
@@ -689,6 +817,7 @@ fn compute(config: &Config, inputs: &Inputs, dat: Option<&Dat>) -> Planned {
             dat_revision: inputs.revision.sha256.clone(),
             choices: inputs.choices.clone(),
             items,
+            removals,
             blockers,
         },
         previous,
@@ -737,7 +866,6 @@ fn plan_items(
     dat: &Dat,
     folder: Option<&Folder>,
     unresolved: &BTreeSet<&str>,
-    blockers: &mut Vec<Blocker>,
 ) -> Vec<PlanItem> {
     let files = folder.map(|f| &f.files);
     let scan = folder.and_then(|f| f.scan.as_ref());
@@ -790,8 +918,10 @@ fn plan_items(
             roms,
             sources: Vec::new(),
             reason: None,
-            existing: existing.map(|(_, file)| file.clone()),
+            existing: existing.map(|found| found.file.clone()),
             adoptable: false,
+            keepable: false,
+            keep: None,
         };
         if unresolved.contains(group) {
             item.kind = ItemKind::Unresolved;
@@ -833,21 +963,8 @@ fn plan_items(
             items.push(item);
             continue;
         }
+        let keep_chosen = inputs.choices.keep_aside.contains(&target);
         if let Some(built) = built {
-            if built.game != item.game || built.roms != item.roms {
-                let reason = format!(
-                    "{target} is built here from other ROMs; replacing it needs a later build step"
-                );
-                blockers.push(Blocker {
-                    kind: BlockerKind::Replacement,
-                    message: reason.clone(),
-                    group: Some(item.group.clone()),
-                    target: Some(target.clone()),
-                });
-                item.reason = Some(reason);
-                items.push(item);
-                continue;
-            }
             // The check read a file whose size or modification time changed: it is as built while it is still the
             // file the build wrote, or holds the same ROMs.
             let as_built = |file: &FileStat| match scan
@@ -859,31 +976,41 @@ fn plan_items(
                 ),
                 None => *file == built.file,
             };
+            let replacing = built.game != item.game || built.roms != item.roms;
             match existing {
-                Some((name, file)) if *name == target && as_built(file) => {
-                    item.kind = ItemKind::Unchanged;
-                    items.push(item);
-                    continue;
-                }
-                Some(_) => {
-                    item.kind = ItemKind::Conflict;
-                    item.reason = Some(format!(
-                        "{target} changed since it was built; it is never overwritten"
+                Some(found) if found.name == target && as_built(&found.file) => {
+                    if !replacing {
+                        item.kind = ItemKind::Unchanged;
+                        items.push(item);
+                        continue;
+                    }
+                    // Built from other ROMs: kept aside, then written again.
+                    item.keep = Some(keep_of(
+                        KeepReason::Replacement,
+                        found,
+                        scan,
+                        built.sha256.as_ref(),
                     ));
-                    items.push(item);
-                    continue;
+                }
+                Some(found) => {
+                    let changed = format!("{target} changed since it was built");
+                    if !conflict(&mut item, found, keep_chosen, scan, &changed) {
+                        items.push(item);
+                        continue;
+                    }
                 }
                 // A built file that is gone is written again.
                 None => {}
             }
-        } else if let Some((name, _)) = existing {
-            item.adoptable = *name == target
+        } else if let Some(found) = existing {
+            item.adoptable = found.name == target
                 && !item.roms.is_empty()
                 && scan
-                    .and_then(|s| s.probes.get(name))
+                    .and_then(|s| s.probes.get(&found.name))
                     .is_some_and(|(at, probe)| {
                         Some(&at.file) == item.existing.as_ref() && holds(probe, &item.roms)
                     });
+            let name = &found.name;
             let chosen = inputs.choices.adopt.contains(&target);
             if item.adoptable && chosen {
                 item.kind = ItemKind::Adopt;
@@ -891,30 +1018,30 @@ fn plan_items(
                     "you adopt {name}: it holds the ROMs the DAT expects there, so it is recorded as built and \
                      nothing is written"
                 ));
-            } else {
-                item.kind = ItemKind::Conflict;
-                item.reason = Some(if chosen {
-                    format!(
-                        "you chose to adopt {name}, but it does not hold exactly the ROMs the DAT expects there; it \
-                         is left as it is"
-                    )
-                } else if item.adoptable {
-                    format!(
-                        "{name} is in the folder and was not built by Title Select, but holds the ROMs the DAT \
-                         expects there; leave it, or adopt it as built"
-                    )
-                } else {
-                    format!(
-                        "{name} is in the folder and was not built by Title Select; it is never overwritten"
-                    )
-                });
+                items.push(item);
+                continue;
             }
-            items.push(item);
-            continue;
+            let why = if chosen {
+                format!(
+                    "you chose to adopt {name}, but it does not hold exactly the ROMs the DAT expects there"
+                )
+            } else if item.adoptable {
+                format!(
+                    "{name} is in the folder and was not built by Title Select, but holds the ROMs the DAT expects \
+                     there; leave it, adopt it as built, or keep it aside and rebuild"
+                )
+            } else {
+                format!("{name} is in the folder and was not built by Title Select")
+            };
+            if !conflict(&mut item, found, keep_chosen && !chosen, scan, &why) {
+                items.push(item);
+                continue;
+            }
         }
         if item.roms.is_empty() {
             item.kind = ItemKind::NoSource;
             item.reason = Some("the DAT lists no ROMs for it".into());
+            unkeep(&mut item);
             items.push(item);
             continue;
         }
@@ -925,6 +1052,7 @@ fn plan_items(
                     "the latest audit found no source for {}",
                     missing.join(", ")
                 ));
+                unkeep(&mut item);
             }
             Ok(chosen) => {
                 let first = &chosen[0];
@@ -954,6 +1082,55 @@ fn plan_items(
         items.push(item);
     }
     items
+}
+
+/// Makes `item` a conflict with `found` at its target, `why`, unless you chose to `keep` it aside and it can be:
+/// then the item is built with `found` kept aside first, and this returns true.
+fn conflict(
+    item: &mut PlanItem,
+    found: &Found,
+    keep: bool,
+    scan: Option<&Scan>,
+    why: &str,
+) -> bool {
+    item.kind = ItemKind::Conflict;
+    item.keepable = found.regular;
+    if keep && found.regular {
+        item.keep = Some(keep_of(KeepReason::Conflict, found, scan, None));
+        return true;
+    }
+    item.reason = Some(if keep {
+        format!(
+            "{why}; you chose to keep it aside, but it is not a regular file, so it is never moved. It is left as it is"
+        )
+    } else {
+        format!("{why}; it is never overwritten")
+    });
+    false
+}
+
+/// Undoes keeping aside the file at `item`'s target when there is nothing to build in its place: a replacement's
+/// file stays as it is, and a conflict you chose to keep aside stays a conflict.
+fn unkeep(item: &mut PlanItem) {
+    let Some(keep) = item.keep.take() else {
+        return;
+    };
+    let why = item.reason.take().unwrap_or_default();
+    match keep.reason {
+        KeepReason::Conflict => {
+            item.kind = ItemKind::Conflict;
+            item.reason = Some(format!(
+                "you chose to keep {} aside and rebuild, but there is nothing to build it from ({why}); it is left \
+                 as it is",
+                keep.name
+            ));
+        }
+        _ => {
+            item.reason = Some(format!(
+                "{why}; the file built there from other ROMs is left as it is"
+            ));
+        }
+    }
 }
 
 /// What changes from the folder's current Build, and why: releases that become or stop being winners.
@@ -1101,6 +1278,17 @@ impl Store {
         let mut choices = request.choices.clone();
         choices.adopt.sort();
         choices.adopt.dedup();
+        choices.keep_aside.sort();
+        choices.keep_aside.dedup();
+        if let Some(both) = choices
+            .keep_aside
+            .iter()
+            .find(|t| choices.adopt.contains(t))
+        {
+            return Err(Error::Refused(format!(
+                "you chose both to adopt {both} and to keep it aside; choose one"
+            )));
+        }
         let planned = self.compute_plan(config, folder, request.selection, &choices)?;
         self.write(|tx| {
             let active = folder_by_id(tx, folder)?.active_job;
@@ -1170,6 +1358,9 @@ impl Store {
                     content.folder
                 )));
             }
+            if let Some(busy) = deletion_active(tx, content.folder)? {
+                return Err(Error::Conflict(busy));
+            }
             let folder = folder_by_id(tx, content.folder)?;
             let revision_id: i64 = tx.query_row(
                 "SELECT dat_revision_id FROM selections WHERE id = ?1",
@@ -1217,6 +1408,26 @@ impl Store {
                 tx.execute(
                     "INSERT INTO audit_citations (audit_id, cited_by) VALUES (?1, ?2)",
                     params![audit, hold],
+                )?;
+            }
+            // So are those of each built file the plan keeps aside, which its kept file's record cites once kept.
+            let kept = content
+                .items
+                .iter()
+                .filter_map(|i| i.keep.as_ref())
+                .chain(content.removals.iter().filter_map(|r| r.keep.as_ref()));
+            for keep in kept {
+                tx.execute(
+                    "INSERT OR IGNORE INTO selection_citations (selection_id, cited_by)
+                     SELECT f.selection_id, ?3 FROM built_files f JOIN selections s ON s.id = f.selection_id
+                     WHERE f.folder_id = ?1 AND f.target = ?2 AND s.pruned_at IS NULL",
+                    params![content.folder, keep.name, hold],
+                )?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO audit_citations (audit_id, cited_by)
+                     SELECT f.audit_id, ?3 FROM built_files f JOIN audits a ON a.id = f.audit_id
+                     WHERE f.folder_id = ?1 AND f.target = ?2 AND a.pruned_at IS NULL",
+                    params![content.folder, keep.name, hold],
                 )?;
             }
             job_by_id(tx, job)

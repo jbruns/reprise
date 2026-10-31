@@ -9,6 +9,7 @@ mod dats;
 mod folder_dir;
 mod folders;
 mod jobs;
+mod kept;
 mod migrations;
 mod plans;
 mod profiles;
@@ -105,6 +106,33 @@ pub enum Fault {
     BeforePublish(i64),
     /// After the file of the item with this sequence number is renamed into place, before the store records it.
     AfterPublish(i64),
+    /// After the intent to keep aside the file of the item with this sequence number is committed, before it is
+    /// moved.
+    BeforeKeep(i64),
+    /// After the file of the item with this sequence number is moved into the retention area, before the store
+    /// records it kept.
+    AfterKeep(i64),
+    /// After a folder Title Select is creating in a Managed Folder is made under its temporary name, before it is
+    /// opened and checked.
+    MadeDir,
+    /// After a folder Title Select is creating in a Managed Folder is made and recorded under its temporary name,
+    /// before it is renamed into place.
+    BeforePublishDir,
+    /// After the intent to delete the kept file with this id is committed and it is found to be the kept file, before
+    /// it is moved into the private folder it is deleted from.
+    BeforeDeleteMove(i64),
+    /// After the kept file with this id is moved into the private folder it is deleted from, before it is checked.
+    AfterDeleteMove(i64),
+    /// After what was moved aside to delete the kept file with this id, not being that file, is recorded, before it is
+    /// moved back.
+    Quarantined(i64),
+    /// After what was held aside for the kept file with this id is moved back, before either folder is synced.
+    MovedBack(i64),
+    /// After what was held aside for the kept file with this id is moved back and both folders are synced, before the
+    /// store records it kept again.
+    MoveBackSynced(i64),
+    /// After the kept file with this id is deleted, before the store records it deleted.
+    AfterUnlink(i64),
     /// After the store commits the folder's next generation, before the marker advances to it.
     AfterFinalize,
     /// After the marker advances, before the store records the Build finished.

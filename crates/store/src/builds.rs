@@ -7,6 +7,9 @@
 //! if the target is then that file. The store commits the folder's next generation before the marker advances, and
 //! recovery moves a marker that did not follow forward, never back. Recovery changes a folder only for a Build the
 //! store records as unfinished, only in a writable Root, and only once the folder's marker shows it is that folder.
+//! A file the plan keeps aside (a removal, a replacement, or a conflict you chose to keep aside) is moved into the
+//! folder's retention area by one rename that never replaces anything, with its intent recorded first (see
+//! [`super::kept`]); a file is written over a kept-aside one only once it is recorded kept.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -18,7 +21,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 use title_select_api::build::{
     BuildDetail, BuildItem, BuildSummary, BuiltFile, ExpectedRom, FileStat, IncompleteReason,
-    ItemKind, ItemState, Marker, PlanItem, STAGING,
+    ItemKind, ItemState, Marker, PlanItem, PlanRemoval, RemovalKind, STAGING,
 };
 use title_select_api::{Job, JobKind, JobState};
 use title_select_engine::Progress;
@@ -30,6 +33,7 @@ use super::folders::{
     open_writable_folder, read_marker, store_id, write_marker,
 };
 use super::jobs::finish_running;
+use super::kept::{Keep, Retention, open_retention, settle_dir_temps};
 use super::plans::{digest, json, to_json};
 use super::{Error, Fault, Result, Store, now};
 use crate::config::Config;
@@ -64,7 +68,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The SHA-256 and size of `file`, read from its start.
-fn sha256_of(mut file: &File) -> io::Result<(String, u64)> {
+pub(super) fn sha256_of(mut file: &File) -> io::Result<(String, u64)> {
     file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0; 1 << 16];
@@ -205,7 +209,7 @@ fn staged_temp(name: &str) -> String {
 }
 
 /// The entries Builds and recovery created in Managed Folder `folder`, by name.
-fn temps(c: &Connection, folder: i64) -> Result<HashMap<String, Identity>> {
+pub(super) fn temps(c: &Connection, folder: i64) -> Result<HashMap<String, Identity>> {
     let mut stmt = c.prepare("SELECT name, dev, ino FROM folder_temps WHERE folder_id = ?1")?;
     let rows = stmt.query_map([folder], |r| {
         Ok((r.get(0)?, Identity::from_sql(r.get(1)?, r.get(2)?)))
@@ -214,7 +218,7 @@ fn temps(c: &Connection, folder: i64) -> Result<HashMap<String, Identity>> {
 }
 
 /// Records, and commits, that the entry `name` in Managed Folder `folder` was created as `id`.
-fn record_temp(store: &Store, folder: i64, name: &str, id: Identity) -> Result<()> {
+pub(super) fn record_temp(store: &Store, folder: i64, name: &str, id: Identity) -> Result<()> {
     let (dev, ino) = id.to_sql();
     store.write(|tx| {
         tx.execute(
@@ -444,7 +448,8 @@ struct Unfinished {
 impl Store {
     /// Carries out the approved plan of the Running Build Job `id`, calling `progress` as files are written. The plan
     /// is computed again first and must still have the approved digest; when it does not, the new plan is stored and
-    /// the Job Failed. Files are added only: nothing in the folder is replaced or removed. A file whose sources fail
+    /// the Job Failed. Nothing in the folder is replaced or deleted: a file the plan removes or writes over is kept
+    /// aside in the folder's retention area, and only while it is the file the plan found. A file whose sources fail
     /// their re-hash, or whose output fails validation, is skipped and the rest go on; anything wrong with the folder
     /// itself, its marker included, stops the Build, which then fails without advancing the marker. Returns the Job
     /// as it ends.
@@ -557,6 +562,14 @@ impl Store {
             })
             .collect();
         let (work, adopts) = all.split_at(all.iter().take_while(|w| w.item.kind.writes()).count());
+        // Then the built files no longer selected: each kept aside, or forgotten when it is gone already.
+        let removals: Vec<(i64, &PlanRemoval)> = content
+            .removals
+            .iter()
+            .filter(|r| r.kind != RemovalKind::Leave)
+            .enumerate()
+            .map(|(i, r)| ((all.len() + i) as i64, r))
+            .collect();
         let generation = content.generation + 1;
         let id = self.write(|tx| {
             let revision: i64 = tx.query_row(
@@ -587,6 +600,13 @@ impl Store {
                     params![id, w.seq, w.item.target, w.item.game, w.item.kind.as_str()],
                 )?;
             }
+            for (seq, r) in &removals {
+                tx.execute(
+                    "INSERT INTO build_items (build_id, seq, target, game, kind, state)
+                     VALUES (?1, ?2, ?3, ?4, 'remove', 'pending')",
+                    params![id, seq, r.target, r.game],
+                )?;
+            }
             Ok(id)
         })?;
         *build_id = Some(id);
@@ -599,7 +619,19 @@ impl Store {
         record_temp(self, folder, STAGING, staging_id)?;
         let mut staged_ids = HashMap::new();
         let built_at = SystemTime::now();
-        let total = all.len();
+        let total = all.len() + removals.len();
+        // The retention area is created the first time a file is kept aside.
+        let mut retention: Option<Retention> = None;
+        let open_area = |retention: &mut Option<Retention>| -> Result<()> {
+            if retention.is_none() {
+                *retention = Some(
+                    open_retention(self, folder, &dir, generation, true)?
+                        .map_err(Error::Refused)?
+                        .ok_or_else(|| Error::Io("the retention area was not created".into()))?,
+                );
+            }
+            Ok(())
+        };
         if let Some(progress) = progress {
             progress(Progress {
                 files_done: 0,
@@ -646,7 +678,28 @@ impl Store {
                     fail(ItemState::Failed, &error)?;
                     return Err(Error::Io(error));
                 }
-                Ok(staged) => {
+                Ok(staged) => 'publish: {
+                    if let Some(keep) = &w.item.keep {
+                        check_marker(&dir, &expected).map_err(Error::Refused)?;
+                        open_area(&mut retention)?;
+                        let k = Keep {
+                            folder,
+                            build: id,
+                            seq: w.seq,
+                            generation,
+                            keep,
+                        };
+                        let area = retention.as_ref().expect("opened above");
+                        if let Err(error) = self.keep_aside(&dir, area, &k)? {
+                            drop(file);
+                            if let Err(e) = remove_staged(&staging, &name, file_id) {
+                                fail(ItemState::Failed, &error)?;
+                                return Err(Error::Refused(e));
+                            }
+                            fail(ItemState::Failed, &error)?;
+                            break 'publish;
+                        }
+                    }
                     let (dev, ino) = file_id.to_sql();
                     self.write(|tx| {
                         tx.execute(
@@ -739,6 +792,52 @@ impl Store {
                 });
             }
         }
+        for (done, (seq, removal)) in removals.iter().enumerate() {
+            check_marker(&dir, &expected).map_err(Error::Refused)?;
+            let seq = *seq;
+            let outcome = match (&removal.kind, &removal.keep) {
+                (RemovalKind::Keep, Some(keep)) => {
+                    open_area(&mut retention)?;
+                    let k = Keep {
+                        folder,
+                        build: id,
+                        seq,
+                        generation,
+                        keep,
+                    };
+                    let area = retention.as_ref().expect("opened above");
+                    self.keep_aside(&dir, area, &k)?.map(|_| ())
+                }
+                (RemovalKind::Forget, _) => match dir.stat(&removal.target).map_err(folder_io)? {
+                    None => self.write(|tx| {
+                        tx.execute(
+                            "DELETE FROM built_files WHERE folder_id = ?1 AND target = ?2",
+                            params![folder, removal.target],
+                        )?;
+                        tx.execute(
+                            "UPDATE build_items SET state = 'applied' WHERE build_id = ?1 AND seq = ?2",
+                            params![id, seq],
+                        )?;
+                        Ok(Ok(()))
+                    })?,
+                    Some(_) => Err(format!(
+                        "{} is back in the folder since you approved the plan; it was left as it is",
+                        removal.target
+                    )),
+                },
+                _ => Err(format!("{} has nothing to remove", removal.target)),
+            };
+            if let Err(error) = outcome {
+                self.write(|tx| set_item(tx, id, seq, ItemState::Failed, &error))?;
+            }
+            if let Some(progress) = progress {
+                progress(Progress {
+                    files_done: all.len() + done + 1,
+                    files_total: total,
+                });
+            }
+        }
+        drop(retention);
 
         // The store decides the next generation first, and the marker follows it; recovery moves a marker that did
         // not follow forward, and never back.
@@ -900,6 +999,13 @@ impl Store {
             )));
         };
         let temps = self.read(|c| temps(c, folder.id))?;
+
+        if let Err(reason) = settle_dir_temps(self, folder.id, &dir)? {
+            return Ok(Err(reason));
+        }
+        if let Err(reason) = self.settle_keeping(&dir, folder.id, build)? {
+            return Ok(Err(reason));
+        }
 
         match dir.stat(MARKER_NEW) {
             Ok(None) => {}

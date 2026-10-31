@@ -16,7 +16,8 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use title_select_api::build::{
     AddManagedFolder, ApprovePlan, BuildDetail, BuildSummary, BuiltFile, ChangeManagedFolder,
-    FolderCheck, Incomplete, ManagedFolder, Plan, PlanBuild,
+    FolderCheck, Incomplete, KeptDeletion, KeptFile, ManagedFolder, Plan, PlanBuild,
+    PlanKeptDeletion,
 };
 use title_select_api::selection::{Role, SelectionProfile, diff_rows};
 use title_select_api::{
@@ -113,6 +114,13 @@ pub fn router(state: AppState, auth: Arc<Auth>, ui: Option<&std::path::Path>) ->
         .route("/managed-folders/{id}/checks", post(start_check))
         .route("/managed-folders/{id}/check", get(latest_check))
         .route("/managed-folders/{id}/incomplete", get(incomplete))
+        .route("/managed-folders/{id}/kept-files", get(kept_files))
+        .route(
+            "/managed-folders/{id}/kept-deletions",
+            post(plan_kept_deletion),
+        )
+        .route("/kept-deletions/{id}", get(kept_deletion))
+        .route("/kept-deletions/{id}/approval", post(approve_kept_deletion))
         .route("/plans/{id}", get(plan))
         .route("/plans/{id}/approval", post(approve_plan))
         .route("/builds/{id}", get(build))
@@ -520,6 +528,56 @@ async fn approve_plan(
     .await?;
     state.jobs.changed(job.clone());
     Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+async fn kept_files(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Json<Vec<KeptFile>>> {
+    let Path(id) = id?;
+    Ok(Json(
+        blocking(&state, move |store| store.kept_files(id)).await?,
+    ))
+}
+
+/// Plans deleting kept files of the folder; nothing is deleted until the plan is approved.
+async fn plan_kept_deletion(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<PlanKeptDeletion>, JsonRejection>,
+) -> ApiResult<(StatusCode, Json<KeptDeletion>)> {
+    let Path(id) = id?;
+    let Json(request) = body?;
+    let plan = blocking(&state, move |store| store.plan_kept_deletion(id, &request)).await?;
+    Ok((StatusCode::CREATED, Json(plan)))
+}
+
+async fn kept_deletion(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Json<KeptDeletion>> {
+    let Path(id) = id?;
+    Ok(Json(
+        blocking(&state, move |store| store.kept_deletion(id)).await?,
+    ))
+}
+
+/// Approves deleting kept files with the digest you reviewed, and deletes them before it answers.
+async fn approve_kept_deletion(
+    State(state): State<AppState>,
+    Extension(Actor(actor)): Extension<Actor>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<ApprovePlan>, JsonRejection>,
+) -> ApiResult<Json<KeptDeletion>> {
+    let Path(id) = id?;
+    let Json(approve) = body?;
+    let config = state.config.clone();
+    Ok(Json(
+        blocking(&state, move |store| {
+            store.approve_kept_deletion(&config, id, &approve.digest, &actor)
+        })
+        .await?,
+    ))
 }
 
 async fn build(
