@@ -9,9 +9,9 @@ use std::time::{Duration, SystemTime};
 
 use common::*;
 use title_select_api::build::{
-    AddManagedFolder, BlockerKind, BuildState, Cause, DriftKind, FileOutcome, FolderCheck,
-    IncompleteReason, ItemKind, ItemState, KeepReason, ManagedFolder, Plan, PlanBuild, PlanChoices,
-    PlanKeptDeletion, RemovalKind,
+    AddManagedFolder, BlockerKind, BuildState, Cause, CleanupAction, DriftKind, FileOutcome,
+    FolderCheck, IncompleteReason, ItemKind, ItemState, KeepReason, ManagedFolder, Plan, PlanBuild,
+    PlanChoices, PlanCleanup, PlanKeptDeletion, RemovalKind, RestoreKind,
 };
 use title_select_api::selection::{
     Alternative, CoverageDrift, Exclusion, Rule, Selection, SelectionGroup, SelectionPins,
@@ -3287,5 +3287,643 @@ fn a_build_stopped_after_it_advanced_the_generation_is_still_badged() {
         assert_eq!(env.build(&next).state, JobState::Succeeded);
         let done = env.store.managed_folder(&env.config, folder.id).unwrap();
         assert_eq!(done.unfinished, None, "{fault:?}");
+    }
+}
+
+/// Pong and Combat built from their sources; Missing selected, with no source, so the folder is incomplete.
+fn cleaned() -> (Env, ManagedFolder, PathBuf) {
+    let env = Env::new();
+    env.audit();
+    let id = titles(&env, &["Pong (USA)", "Combat (USA)", "Missing (USA)"]);
+    let folder = env.folder("atari2600");
+    assert_eq!(env.build(&env.plan(&folder, id)).state, JobState::Succeeded);
+    let folder = env.store.managed_folder(&env.config, folder.id).unwrap();
+    assert_eq!(folder.incomplete.as_ref().map(|i| i.no_source), Some(1));
+    let dir = env.play().join("atari2600");
+    (env, folder, dir)
+}
+
+fn cleanup(env: &Env, folder: &ManagedFolder, request: PlanCleanup) -> Plan {
+    env.store
+        .plan_cleanup(&env.config, folder.id, &request)
+        .unwrap()
+}
+
+fn choose(entries: &[(&str, CleanupAction)]) -> PlanCleanup {
+    PlanCleanup {
+        entries: entries.iter().map(|(n, a)| (n.to_string(), *a)).collect(),
+        ..PlanCleanup::default()
+    }
+}
+
+fn restore(ids: &[i64]) -> PlanCleanup {
+    PlanCleanup {
+        restore: ids.to_vec(),
+        ..PlanCleanup::default()
+    }
+}
+
+/// The targets of the plan's cleanup blockers.
+fn refused(plan: &Plan) -> BTreeSet<String> {
+    assert!(!plan.approvable());
+    plan.content
+        .blockers
+        .iter()
+        .filter(|b| b.kind == BlockerKind::Cleanup)
+        .filter_map(|b| b.target.clone())
+        .collect()
+}
+
+fn kept_named(env: &Env, folder: &ManagedFolder, name: &str) -> title_select_api::build::KeptFile {
+    env.store
+        .kept_files(folder.id)
+        .unwrap()
+        .into_iter()
+        .find(|k| k.name == name)
+        .unwrap_or_else(|| panic!("{name} is not kept"))
+}
+
+fn kept_path(dir: &Path, k: &title_select_api::build::KeptFile) -> PathBuf {
+    dir.join(RETAINED)
+        .join(k.generation.to_string())
+        .join(&k.kept_name)
+}
+
+/// Replaces `path` with a new file of `bytes`, by a rename, so that it is another file at the same name.
+fn substitute(path: &Path, bytes: &[u8]) {
+    let new = path.with_extension("substitute");
+    std::fs::write(&new, bytes).unwrap();
+    std::fs::rename(&new, path).unwrap();
+}
+
+fn items(env: &Env, folder: &ManagedFolder) -> Vec<title_select_api::build::BuildItem> {
+    let latest = env.store.builds(folder.id).unwrap()[0].id;
+    env.store.build(latest).unwrap().items
+}
+
+fn missing_zip(path: &Path) {
+    torrentzip_file(path, &[("Missing (USA).a26", b"missing")]);
+}
+
+#[test]
+fn drift_is_kept_aside_whole_or_acknowledged_until_it_changes() {
+    let (env, folder, dir) = cleaned();
+    write_file(&dir.join("notes.txt"), b"mine");
+    std::fs::create_dir(dir.join("Disc Game")).unwrap();
+    write_file(&dir.join("Disc Game/disc1.bin"), b"one");
+    write_file(&dir.join("Disc Game/disc2.bin"), b"two");
+    write_file(&dir.join("readme.txt"), b"leave me");
+    write_file(&dir.join("untouched.txt"), b"not chosen");
+
+    let plan = cleanup(
+        &env,
+        &folder,
+        choose(&[
+            ("notes.txt", CleanupAction::KeepAside),
+            ("Disc Game", CleanupAction::KeepAside),
+            ("readme.txt", CleanupAction::Acknowledge),
+        ]),
+    );
+    assert!(plan.approvable(), "{:?}", plan.content.blockers);
+    let cleanup_of = plan.content.cleanup.as_ref().unwrap();
+    assert_eq!(
+        cleanup_of.entries.len(),
+        4,
+        "every entry is bound by the plan"
+    );
+    assert_eq!(
+        cleanup_of
+            .entries
+            .iter()
+            .find(|e| e.name == "untouched.txt")
+            .unwrap()
+            .action,
+        None
+    );
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+
+    assert_eq!(
+        names(&dir),
+        BTreeSet::from(
+            [
+                ".title-select",
+                RETAINED,
+                "Pong (USA).zip",
+                "Combat (USA).zip",
+                "readme.txt",
+                "untouched.txt"
+            ]
+            .map(String::from)
+        )
+    );
+    let notes = kept_named(&env, &folder, "notes.txt");
+    assert_eq!(
+        (notes.reason, notes.directory, notes.generation),
+        (KeepReason::Drift, false, 2)
+    );
+    assert!(notes.sha256.is_some());
+    assert_eq!(std::fs::read(kept_path(&dir, &notes)).unwrap(), b"mine");
+    let disc = kept_named(&env, &folder, "Disc Game");
+    assert_eq!((disc.reason, disc.directory), (KeepReason::Drift, true));
+    assert_eq!(disc.sha256, None);
+    assert_eq!(
+        std::fs::read(kept_path(&dir, &disc).join("disc2.bin")).unwrap(),
+        b"two"
+    );
+    let folder = env.store.managed_folder(&env.config, folder.id).unwrap();
+    assert_eq!(folder.generation, 2);
+    assert_eq!(marker(&dir)["generation"], 2);
+
+    let checked = check(&env, &folder);
+    let drift: Vec<&str> = checked.drift.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(drift, ["untouched.txt"]);
+    let acknowledged: Vec<&str> = checked
+        .acknowledged
+        .iter()
+        .map(|d| d.name.as_str())
+        .collect();
+    assert_eq!(acknowledged, ["readme.txt"]);
+    assert_eq!(checked.summary.acknowledged, 1);
+
+    // A kept folder is not deleted in this way.
+    let deletion = env.store.plan_kept_deletion(
+        folder.id,
+        &PlanKeptDeletion {
+            ids: vec![disc.id],
+            all: false,
+        },
+    );
+    assert!(matches!(deletion, Err(Error::Refused(_))), "{deletion:?}");
+
+    // Changed, it is drift again.
+    write_file(&dir.join("readme.txt"), b"changed by you");
+    let checked = check(&env, &folder);
+    let drift: BTreeSet<&str> = checked.drift.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(drift, BTreeSet::from(["readme.txt", "untouched.txt"]));
+    assert!(checked.acknowledged.is_empty());
+}
+
+#[test]
+fn acknowledging_alone_writes_nothing_to_the_folder() {
+    let (env, folder, dir) = cleaned();
+    write_file(&dir.join("readme.txt"), b"leave me");
+    let before = snapshot(&dir);
+    let plan = cleanup(
+        &env,
+        &folder,
+        choose(&[("readme.txt", CleanupAction::Acknowledge)]),
+    );
+    assert_eq!(plan.summary.acknowledge, 1);
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+    assert_eq!(snapshot(&dir), before);
+    let after = env.store.managed_folder(&env.config, folder.id).unwrap();
+    assert_eq!(after.generation, folder.generation);
+    assert_eq!(after.incomplete, folder.incomplete);
+    assert_eq!(items(&env, &folder)[0].state, ItemState::Applied);
+    let checked = check(&env, &after);
+    assert!(checked.drift.is_empty(), "{:?}", checked.drift);
+    assert_eq!(checked.acknowledged.len(), 1);
+
+    // Replaced by another file of the same size and time, it is drift again.
+    let meta = std::fs::metadata(dir.join("readme.txt")).unwrap();
+    substitute(&dir.join("readme.txt"), b"swapped!");
+    std::fs::File::options()
+        .write(true)
+        .open(dir.join("readme.txt"))
+        .unwrap()
+        .set_modified(meta.modified().unwrap())
+        .unwrap();
+    let checked = check(&env, &after);
+    assert_eq!(checked.drift.len(), 1);
+    assert!(checked.acknowledged.is_empty());
+}
+
+#[test]
+fn a_file_holding_a_selected_game_is_adopted_under_its_name_and_never_over_anything() {
+    for name in ["missing copy.zip", "Missing (USA).zip"] {
+        let (env, folder, dir) = cleaned();
+        missing_zip(&dir.join(name));
+        let bytes = std::fs::read(dir.join(name)).unwrap();
+        // An unselected game's file is never adopted.
+        torrentzip_file(
+            &dir.join("Ōkami (Japan).zip"),
+            &[("Ōkami (Japan).a26", b"cafe")],
+        );
+        let unselected = cleanup(
+            &env,
+            &folder,
+            choose(&[("Ōkami (Japan).zip", CleanupAction::Adopt)]),
+        );
+        assert_eq!(
+            refused(&unselected),
+            BTreeSet::from(["Ōkami (Japan).zip".to_string()])
+        );
+
+        let plan = cleanup(&env, &folder, choose(&[(name, CleanupAction::Adopt)]));
+        assert!(plan.approvable(), "{name}: {:?}", plan.content.blockers);
+        let entry = plan.content.cleanup.as_ref().unwrap().entries.iter();
+        let entry = entry.clone().find(|e| e.name == name).unwrap();
+        assert_eq!(entry.target.as_deref(), Some("Missing (USA).zip"));
+        assert_eq!(env.build(&plan).state, JobState::Succeeded);
+
+        assert_eq!(std::fs::read(dir.join("Missing (USA).zip")).unwrap(), bytes);
+        assert!(!dir.join("missing copy.zip").exists());
+        let built = env.store.built_files(folder.id).unwrap();
+        let missing = built.iter().find(|f| f.game == "Missing (USA)").unwrap();
+        assert_eq!(
+            (missing.kind, missing.torrentzip),
+            (ItemKind::Adopt, true),
+            "{name}"
+        );
+        let after = env.store.managed_folder(&env.config, folder.id).unwrap();
+        assert_eq!(
+            (after.generation, after.incomplete.clone()),
+            (2, None),
+            "{name}"
+        );
+        let checked = check(&env, &after);
+        let drift: Vec<&str> = checked.drift.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(drift, ["Ōkami (Japan).zip"], "{name}");
+        let adopted = checked
+            .files
+            .iter()
+            .find(|f| f.game == "Missing (USA)")
+            .unwrap();
+        assert_eq!(
+            (adopted.outcome, adopted.hashed),
+            (FileOutcome::Unchanged, false)
+        );
+    }
+
+    // A file at its game's file name is never replaced: adopting the copy waits until it is kept aside.
+    let (env, folder, dir) = cleaned();
+    missing_zip(&dir.join("missing copy.zip"));
+    write_file(&dir.join("Missing (USA).zip"), b"not a zip");
+    let collides = cleanup(
+        &env,
+        &folder,
+        choose(&[("missing copy.zip", CleanupAction::Adopt)]),
+    );
+    assert_eq!(
+        refused(&collides),
+        BTreeSet::from(["missing copy.zip".to_string()])
+    );
+    let plan = cleanup(
+        &env,
+        &folder,
+        choose(&[
+            ("missing copy.zip", CleanupAction::Adopt),
+            ("Missing (USA).zip", CleanupAction::KeepAside),
+        ]),
+    );
+    assert!(plan.approvable(), "{:?}", plan.content.blockers);
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+    let kept = kept_named(&env, &folder, "Missing (USA).zip");
+    assert_eq!(std::fs::read(kept_path(&dir, &kept)).unwrap(), b"not a zip");
+    validate(&dir.join("Missing (USA).zip"));
+    assert!(
+        env.store
+            .managed_folder(&env.config, folder.id)
+            .unwrap()
+            .incomplete
+            .is_none()
+    );
+}
+
+#[test]
+fn a_kept_file_is_put_back_or_adopted_and_refused_when_its_name_is_taken() {
+    let (env, folder, dir) = cleaned();
+    missing_zip(&dir.join("Missing (USA).zip"));
+    missing_zip(&dir.join("missing copy.zip"));
+    write_file(&dir.join("notes.txt"), b"mine");
+    std::fs::create_dir(dir.join("Disc Game")).unwrap();
+    write_file(&dir.join("Disc Game/disc1.bin"), b"one");
+    let plan = cleanup(
+        &env,
+        &folder,
+        choose(&[
+            ("Missing (USA).zip", CleanupAction::KeepAside),
+            ("missing copy.zip", CleanupAction::KeepAside),
+            ("notes.txt", CleanupAction::KeepAside),
+            ("Disc Game", CleanupAction::KeepAside),
+        ]),
+    );
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+    let missing = kept_named(&env, &folder, "Missing (USA).zip");
+    let copy = kept_named(&env, &folder, "missing copy.zip");
+    let notes = kept_named(&env, &folder, "notes.txt");
+    let disc = kept_named(&env, &folder, "Disc Game");
+
+    // Its name taken, a kept file is not put back.
+    write_file(&dir.join("notes.txt"), b"new notes");
+    let taken = cleanup(&env, &folder, restore(&[notes.id]));
+    assert_eq!(refused(&taken), BTreeSet::from(["notes.txt".to_string()]));
+    std::fs::remove_file(dir.join("notes.txt")).unwrap();
+
+    // The copy holds Missing under another name, so it is adopted under Missing's file name.
+    let plan = cleanup(&env, &folder, restore(&[copy.id, notes.id, disc.id]));
+    assert!(plan.approvable(), "{:?}", plan.content.blockers);
+    let restores: BTreeMap<&str, (RestoreKind, &str)> = plan
+        .content
+        .cleanup
+        .as_ref()
+        .unwrap()
+        .restores
+        .iter()
+        .map(|r| (r.kept.name.as_str(), (r.kind, r.target.as_str())))
+        .collect();
+    assert_eq!(
+        restores,
+        BTreeMap::from([
+            ("Disc Game", (RestoreKind::PutBack, "Disc Game")),
+            (
+                "missing copy.zip",
+                (RestoreKind::Adopt, "Missing (USA).zip")
+            ),
+            ("notes.txt", (RestoreKind::PutBack, "notes.txt")),
+        ])
+    );
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+    assert_eq!(std::fs::read(dir.join("notes.txt")).unwrap(), b"mine");
+    assert_eq!(
+        std::fs::read(dir.join("Disc Game/disc1.bin")).unwrap(),
+        b"one"
+    );
+    validate(&dir.join("Missing (USA).zip"));
+    assert!(!kept_path(&dir, &copy).exists());
+    let built = env.store.built_files(folder.id).unwrap();
+    assert!(built.iter().any(|f| f.target == "Missing (USA).zip"));
+    let after = env.store.managed_folder(&env.config, folder.id).unwrap();
+    assert_eq!((after.generation, after.incomplete.clone()), (3, None));
+    let still: Vec<i64> = env
+        .store
+        .kept_files(folder.id)
+        .unwrap()
+        .iter()
+        .map(|k| k.id)
+        .collect();
+    assert_eq!(still, [missing.id]);
+
+    // Missing's file name is taken now, by the adopted copy.
+    let taken = cleanup(&env, &folder, restore(&[missing.id]));
+    assert_eq!(
+        refused(&taken),
+        BTreeSet::from(["Missing (USA).zip".to_string()])
+    );
+
+    // Freed, the kept file goes back under its own name, which is its game's.
+    std::fs::remove_file(dir.join("Missing (USA).zip")).unwrap();
+    let plan = cleanup(&env, &folder, restore(&[missing.id]));
+    assert_eq!(
+        plan.content.cleanup.as_ref().unwrap().restores[0].kind,
+        RestoreKind::Restore
+    );
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+    validate(&dir.join("Missing (USA).zip"));
+    assert!(env.store.kept_files(folder.id).unwrap().is_empty());
+    let checked = check(&env, &after);
+    assert!(
+        checked
+            .files
+            .iter()
+            .all(|f| f.outcome == FileOutcome::Unchanged),
+        "{:?}",
+        checked.files
+    );
+}
+
+#[test]
+fn a_built_file_that_is_not_torrentzip_is_repacked_from_its_contents_with_the_old_copy_kept() {
+    let (env, folder, dir) = cleaned();
+    write_stored_zip(
+        &dir.join("Combat (USA).zip"),
+        &[("Combat (USA).a26", b"combat")],
+    );
+    let old = std::fs::read(dir.join("Combat (USA).zip")).unwrap();
+    let repack = |target: &str| PlanCleanup {
+        repack: vec![target.into()],
+        ..PlanCleanup::default()
+    };
+    let already = cleanup(&env, &folder, repack("Pong (USA).zip"));
+    assert_eq!(
+        refused(&already),
+        BTreeSet::from(["Pong (USA).zip".to_string()])
+    );
+
+    let plan = cleanup(&env, &folder, repack("Combat (USA).zip"));
+    assert!(plan.approvable(), "{:?}", plan.content.blockers);
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+
+    let members = validate(&dir.join("Combat (USA).zip"));
+    assert_eq!(members.len(), 1);
+    let kept = kept_named(&env, &folder, "Combat (USA).zip");
+    assert_eq!(kept.reason, KeepReason::Repack);
+    assert_eq!(std::fs::read(kept_path(&dir, &kept)).unwrap(), old);
+    let built = env.store.built_files(folder.id).unwrap();
+    let combat = built.iter().find(|f| f.game == "Combat (USA)").unwrap();
+    assert_eq!((combat.kind, combat.torrentzip), (ItemKind::Repack, true));
+    assert!(!dir.join(".title-select-staging").exists());
+    let checked = check(&env, &folder);
+    assert!(checked.drift.is_empty(), "{:?}", checked.drift);
+    let combat = checked
+        .files
+        .iter()
+        .find(|f| f.game == "Combat (USA)")
+        .unwrap();
+    assert_eq!(
+        (combat.outcome, combat.torrentzip),
+        (FileOutcome::Unchanged, true)
+    );
+}
+
+#[test]
+fn a_substituted_entry_is_never_touched_and_a_stale_cleanup_is_refused() {
+    let (env, folder, dir) = cleaned();
+    write_file(&dir.join("notes.txt"), b"mine");
+    missing_zip(&dir.join("missing copy.zip"));
+
+    // Substituted between planning and approval.
+    let plan = cleanup(
+        &env,
+        &folder,
+        choose(&[("notes.txt", CleanupAction::KeepAside)]),
+    );
+    substitute(&dir.join("notes.txt"), b"mine");
+    let stale = env
+        .store
+        .approve_plan(&env.config, plan.id, &plan.digest, "Operator", WORKERS);
+    assert!(matches!(stale, Err(Error::Conflict(_))), "{stale:?}");
+
+    // Something new in the folder since planning makes it stale too.
+    let plan = cleanup(
+        &env,
+        &folder,
+        choose(&[("notes.txt", CleanupAction::KeepAside)]),
+    );
+    write_file(&dir.join("late.txt"), b"late");
+    let stale = env
+        .store
+        .approve_plan(&env.config, plan.id, &plan.digest, "Operator", WORKERS);
+    assert!(matches!(stale, Err(Error::Conflict(_))), "{stale:?}");
+    assert!(env.store.kept_files(folder.id).unwrap().is_empty());
+
+    // Substituted after every check, just before it is moved.
+    for (name, action, fault) in [
+        ("notes.txt", CleanupAction::KeepAside, Fault::BeforeKeep(0)),
+        (
+            "missing copy.zip",
+            CleanupAction::Adopt,
+            Fault::BeforeMove(0),
+        ),
+    ] {
+        let plan = cleanup(&env, &folder, choose(&[(name, action)]));
+        assert!(plan.approvable(), "{name}: {:?}", plan.content.blockers);
+        let at = dir.join(name);
+        env.store.hook_faults(Some(std::sync::Arc::new(move |f| {
+            if f == fault {
+                substitute(&at, b"someone else's");
+            }
+        })));
+        let job = env.build(&plan);
+        env.store.hook_faults(None);
+        assert_eq!(job.state, JobState::Succeeded, "{name}: {:?}", job.error);
+        let item = &items(&env, &folder)[0];
+        assert_eq!(item.state, ItemState::Failed, "{name}: {item:?}");
+        assert_eq!(
+            std::fs::read(dir.join(name)).unwrap(),
+            b"someone else's",
+            "{name}"
+        );
+    }
+    assert!(env.store.kept_files(folder.id).unwrap().is_empty());
+    assert!(!dir.join("Missing (USA).zip").exists());
+    assert!(
+        env.store
+            .built_files(folder.id)
+            .unwrap()
+            .iter()
+            .all(|f| f.game != "Missing (USA)")
+    );
+}
+
+#[test]
+fn a_crash_at_each_step_of_a_move_recovers_without_losing_or_untracking_anything() {
+    for fault in [
+        Fault::BeforeMove(0),
+        Fault::AfterMove(0),
+        Fault::MoveSynced(0),
+    ] {
+        // Adopting a file under its game's file name.
+        let (env, folder, dir) = cleaned();
+        missing_zip(&dir.join("missing copy.zip"));
+        let plan = cleanup(
+            &env,
+            &folder,
+            choose(&[("missing copy.zip", CleanupAction::Adopt)]),
+        );
+        env.crash(&plan, fault);
+        let (env, blocked) = env.restart();
+        assert!(blocked.is_empty(), "{fault:?}: {blocked:?}");
+        let built = env
+            .store
+            .built_files(folder.id)
+            .unwrap()
+            .into_iter()
+            .any(|f| f.target == "Missing (USA).zip");
+        let item = &items(&env, &folder)[0];
+        if fault == Fault::BeforeMove(0) {
+            assert!(dir.join("missing copy.zip").exists(), "{fault:?}");
+            assert!(!dir.join("Missing (USA).zip").exists(), "{fault:?}");
+            assert!(!built, "{fault:?}");
+            assert_eq!(item.state, ItemState::Failed, "{fault:?}");
+        } else {
+            validate(&dir.join("Missing (USA).zip"));
+            assert!(!dir.join("missing copy.zip").exists(), "{fault:?}");
+            assert!(built, "{fault:?}");
+            assert_eq!(item.state, ItemState::Applied, "{fault:?}");
+        }
+        let next = cleanup(
+            &env,
+            &folder,
+            choose(&[(
+                if built {
+                    "Missing (USA).zip"
+                } else {
+                    "missing copy.zip"
+                },
+                CleanupAction::KeepAside,
+            )]),
+        );
+        let next_ok = if built {
+            // Built, it is no longer drift.
+            !next.approvable()
+        } else {
+            next.approvable()
+        };
+        assert!(next_ok, "{fault:?}: {:?}", next.content.blockers);
+
+        // Putting a kept file back.
+        let (env, folder, dir) = cleaned();
+        missing_zip(&dir.join("Missing (USA).zip"));
+        let keep = cleanup(
+            &env,
+            &folder,
+            choose(&[("Missing (USA).zip", CleanupAction::KeepAside)]),
+        );
+        assert_eq!(env.build(&keep).state, JobState::Succeeded);
+        let kept = kept_named(&env, &folder, "Missing (USA).zip");
+        let plan = cleanup(&env, &folder, restore(&[kept.id]));
+        env.crash(&plan, fault);
+        let (env, blocked) = env.restart();
+        assert!(blocked.is_empty(), "{fault:?}: {blocked:?}");
+        let listed = env.store.kept_files(folder.id).unwrap();
+        if fault == Fault::BeforeMove(0) {
+            assert!(kept_path(&dir, &kept).exists(), "{fault:?}");
+            assert_eq!(listed, vec![kept.clone()], "{fault:?}");
+            assert!(!dir.join("Missing (USA).zip").exists());
+        } else {
+            assert!(!kept_path(&dir, &kept).exists(), "{fault:?}");
+            assert!(listed.is_empty(), "{fault:?}");
+            validate(&dir.join("Missing (USA).zip"));
+            assert!(
+                env.store
+                    .built_files(folder.id)
+                    .unwrap()
+                    .iter()
+                    .any(|f| f.target == "Missing (USA).zip"),
+                "{fault:?}"
+            );
+        }
+    }
+
+    // Keeping aside, a file or a folder.
+    for fault in [
+        Fault::BeforeKeep(0),
+        Fault::KeptUnsynced(0),
+        Fault::AfterKeep(0),
+    ] {
+        for name in ["notes.txt", "Disc Game"] {
+            let (env, folder, dir) = cleaned();
+            if name == "Disc Game" {
+                std::fs::create_dir(dir.join(name)).unwrap();
+                write_file(&dir.join("Disc Game/disc1.bin"), b"one");
+            } else {
+                write_file(&dir.join(name), b"mine");
+            }
+            let plan = cleanup(&env, &folder, choose(&[(name, CleanupAction::KeepAside)]));
+            env.crash(&plan, fault);
+            let (env, blocked) = env.restart();
+            assert!(blocked.is_empty(), "{fault:?} {name}: {blocked:?}");
+            let listed = env.store.kept_files(folder.id).unwrap();
+            if fault == Fault::BeforeKeep(0) {
+                assert!(dir.join(name).exists(), "{fault:?} {name}");
+                assert!(listed.is_empty(), "{fault:?} {name}");
+            } else {
+                assert!(!dir.join(name).exists(), "{fault:?} {name}");
+                assert_eq!(listed.len(), 1, "{fault:?} {name}");
+                assert_eq!(listed[0].directory, name == "Disc Game");
+                assert!(kept_path(&dir, &listed[0]).exists(), "{fault:?} {name}");
+            }
+        }
     }
 }

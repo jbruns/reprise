@@ -134,10 +134,11 @@ source, failed, or is in conflict. Title Select shows why and how many.
 
 **Drift**:
 Any difference between a Managed Folder and its current Build: a built file changed or missing, or an entry Title
-Select did not build. Drift is reported, never silently corrected; only an approved Change Plan acts on it.
+Select did not build. Drift is reported, never silently corrected; only an approved Change Plan acts on it. An entry
+the Operator acknowledges is not reported again until it changes.
 _Avoid_: Corruption (when meaning any difference)
 
 **Kept File**:
-A file removed from a Managed Folder by a Build or a cleanup, set aside in that folder's retention area so that no
+A file or folder removed from a Managed Folder by a Build or a cleanup, set aside in that folder's retention area so that no
 tool scans it, until the Operator approves deleting or restoring it.
 _Avoid_: Trash, backup

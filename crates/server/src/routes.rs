@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use title_select_api::build::{
     AddManagedFolder, ApprovePlan, BuildDetail, BuildSummary, BuiltFile, ChangeManagedFolder,
-    FolderCheck, Incomplete, KeptDeletion, KeptFile, ManagedFolder, Plan, PlanBuild,
+    FolderCheck, Incomplete, KeptDeletion, KeptFile, ManagedFolder, Plan, PlanBuild, PlanCleanup,
     PlanKeptDeletion,
 };
 use title_select_api::selection::{Role, SelectionProfile, diff_rows};
@@ -111,6 +111,7 @@ pub fn router(state: AppState, auth: Arc<Auth>, ui: Option<&std::path::Path>) ->
         .route("/managed-folders/{id}/builds", get(folder_builds))
         .route("/managed-folders/{id}/files", get(built_files))
         .route("/managed-folders/{id}/plans", post(plan_build))
+        .route("/managed-folders/{id}/cleanups", post(plan_cleanup))
         .route("/managed-folders/{id}/checks", post(start_check))
         .route("/managed-folders/{id}/check", get(latest_check))
         .route("/managed-folders/{id}/incomplete", get(incomplete))
@@ -499,6 +500,23 @@ async fn plan_build(
     let config = state.config.clone();
     let plan = blocking(&state, move |store| {
         store.plan_build_with(&config, id, &request)
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(plan)))
+}
+
+/// Plans a cleanup of the folder's drift, kept files and files that are not TorrentZip; nothing changes until you
+/// approve it.
+async fn plan_cleanup(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<PlanCleanup>, JsonRejection>,
+) -> ApiResult<(StatusCode, Json<Plan>)> {
+    let Path(id) = id?;
+    let Json(request) = body?;
+    let config = state.config.clone();
+    let plan = blocking(&state, move |store| {
+        store.plan_cleanup(&config, id, &request)
     })
     .await?;
     Ok((StatusCode::CREATED, Json(plan)))

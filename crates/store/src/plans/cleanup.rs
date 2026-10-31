@@ -79,9 +79,8 @@ fn selected_game(
 
 /// The names in the folder a cleanup may put an entry at, and those it claims as it is planned.
 struct Names<'a> {
+    /// The folder as it is now: a built file it no longer holds leaves its name free, and its record is replaced.
     folder: &'a Folder,
-    /// Lowercased names of built files.
-    built: HashSet<String>,
     /// Lowercased names of entries the cleanup keeps aside, which are free once they are.
     freed: HashSet<String>,
     claimed: HashSet<String>,
@@ -100,9 +99,7 @@ impl Names<'_> {
                 "another of the cleanup's actions puts a file at {name}"
             ));
         }
-        if self.built.contains(&lower)
-            || (self.folder.files.contains_key(&lower) && !self.freed.contains(&lower))
-        {
+        if self.folder.files.contains_key(&lower) && !self.freed.contains(&lower) {
             return Err(format!("{name} is taken in the folder"));
         }
         self.claimed.insert(lower);
@@ -223,7 +220,6 @@ impl Store {
             Some((folder_found, scan)) => {
                 let mut names = Names {
                     folder: folder_found,
-                    built: inputs.built.keys().map(|t| t.to_lowercase()).collect(),
                     freed: scan
                         .drift
                         .iter()

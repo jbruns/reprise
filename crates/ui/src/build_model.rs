@@ -3,9 +3,9 @@
 
 use title_select_api::SelectionRecord;
 use title_select_api::build::{
-    BlockerKind, BuildState, Cause, DriftKind, FileOutcome, IncompleteCounts, IncompleteReason,
-    ItemKind, ItemState, KeepReason, ManagedFolder, PlanChoices, PlanItem, RemovalKind,
-    UnfinishedBuild,
+    BlockerKind, BuildState, Cause, CleanupAction, DriftEntry, DriftKind, FileOutcome,
+    IncompleteCounts, IncompleteReason, ItemKind, ItemState, KeepReason, ManagedFolder,
+    PlanChoices, PlanItem, RemovalKind, RestoreKind, UnfinishedBuild,
 };
 
 pub fn item_kind_label(kind: ItemKind) -> &'static str {
@@ -110,6 +110,35 @@ pub fn drift_kind_label(kind: DriftKind) -> &'static str {
         DriftKind::Unknown => "Unknown file",
         DriftKind::Directory => "Directory, never opened",
     }
+}
+
+pub fn cleanup_action_label(action: CleanupAction) -> &'static str {
+    match action {
+        CleanupAction::KeepAside => "Keep aside",
+        CleanupAction::Adopt => "Adopt",
+        CleanupAction::Acknowledge => "Acknowledge",
+    }
+}
+
+pub fn restore_kind_label(kind: RestoreKind) -> &'static str {
+    match kind {
+        RestoreKind::Restore => "Put back and record as built",
+        RestoreKind::Adopt => "Adopt under its game's file name",
+        RestoreKind::PutBack => "Put back as it was",
+    }
+}
+
+/// What a cleanup can do with drift entry `d`: keep it aside, always; adopt it, only a file that names a selected
+/// title or holds a known one under another name; acknowledge it, unless it is at a selected game's file name.
+pub fn cleanup_actions(d: &DriftEntry) -> Vec<CleanupAction> {
+    let mut actions = vec![CleanupAction::KeepAside];
+    if d.game.is_some() && matches!(d.kind, DriftKind::Selected | DriftKind::Renamed) {
+        actions.push(CleanupAction::Adopt);
+    }
+    if !d.conflict {
+        actions.push(CleanupAction::Acknowledge);
+    }
+    actions
 }
 
 /// The choices of a plan made again with `adopt` for `target` set to `on`, keeping the rest.
@@ -239,6 +268,39 @@ mod tests {
     use super::*;
     use title_select_api::ProfileVersionRef;
     use title_select_api::selection::{SelectionPins, SelectionSummary};
+
+    fn drift(kind: DriftKind, game: Option<&str>, conflict: bool) -> DriftEntry {
+        DriftEntry {
+            name: "x.zip".into(),
+            kind,
+            game: game.map(Into::into),
+            conflict,
+            hashed: false,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn a_cleanup_offers_adopting_only_selected_or_renamed_titles_and_never_acknowledges_a_conflict()
+    {
+        use CleanupAction::*;
+        assert_eq!(
+            cleanup_actions(&drift(DriftKind::Selected, Some("Pong"), true)),
+            [KeepAside, Adopt]
+        );
+        assert_eq!(
+            cleanup_actions(&drift(DriftKind::Renamed, Some("Pong"), false)),
+            [KeepAside, Adopt, Acknowledge]
+        );
+        assert_eq!(
+            cleanup_actions(&drift(DriftKind::Unselected, Some("Pong"), false)),
+            [KeepAside, Acknowledge]
+        );
+        assert_eq!(
+            cleanup_actions(&drift(DriftKind::Directory, None, false)),
+            [KeepAside, Acknowledge]
+        );
+    }
 
     fn item(game: &str, kind: ItemKind) -> PlanItem {
         PlanItem {
