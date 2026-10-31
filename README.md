@@ -418,6 +418,25 @@ unknown file, or a directory, which is never opened. Symlinks and special files 
 Select's own entries are never drift. Drift is a warning: only a conflict at a selected game's file makes the folder
 incomplete.
 
+A cleanup acts on what a check found, only as you choose, entry by entry (`POST /managed-folders/{id}/cleanups`):
+keep an entry aside, a file or a whole folder, into the retention area as a kept file; adopt a file that holds exactly
+a selected game's ROMs under the current DAT revision, renamed to that game's file name when it is not already, and
+recorded as built; or acknowledge an entry, which writes nothing to the folder and stops reporting it until its
+identity, size or modification time changes. A cleanup also puts kept files back, under their own name when it is
+free and, for a file holding a selected game, that game's file name; a kept file holding a selected game under
+another name is adopted under that game's file name instead, and one whose name is taken is refused. It repacks a
+built file flagged not TorrentZip from its own contents, in one read, keeping the file as it was aside; if the
+service stops after the old file is kept aside and before the new one is in place, a selected game is reported failed, so
+the folder shows as incomplete until you put the kept copy back or build again. A kept folder is put back
+as it was, never adopted or deleted by Title Select. Every entry the cleanup found is part of its digest, chosen or
+not, along with the built files, acknowledged entries and kept files as they were: if anything in the folder changes
+before you approve, or before the cleanup starts, it is refused and you review the new plan.
+Every move is one rename that never replaces anything, made only while the entry is still the one the plan found,
+and recorded before it is made, so that a cleanup the service stopped during is settled when it next starts. A
+cleanup needs a current build, whose selection and DAT revision it uses; only one that moves or writes something
+advances the folder's generation. A cleanup never counts as a build: a build that stopped stays reported until a
+build finishes.
+
 A folder is incomplete when its current build lacks some of its selection: unresolved groups left out, games with no
 source, files that failed, conflicts and blocked games, or built files a check found missing. The store records this
 for each build, with counts and items by reason; it is never written to the marker. A build cut off by a stop or a
@@ -498,8 +517,9 @@ Every body is JSON, and every error is `{"error": "...", "job": <id, when one is
 | `GET /api/v1/managed-folders/{id}/builds`          | its builds, newest first                                     |
 | `GET /api/v1/managed-folders/{id}/files`           | the files built into it, with their provenance               |
 | `POST /api/v1/managed-folders/{id}/plans`          | plan building a selection into it: `{"selection", "resolved_only"?, "adopt"?: [target], "keep_aside"?: [target]}`; `201` |
+| `POST /api/v1/managed-folders/{id}/cleanups`       | plan a cleanup: `{"entries"?: {name: "keep_aside" \| "adopt" \| "acknowledge"}, "restore"?: [kept id], "repack"?: [target]}`; `201`, approved as a plan |
 | `POST /api/v1/managed-folders/{id}/checks`         | check it; `202` with the check job                           |
-| `GET /api/v1/managed-folders/{id}/check`           | its latest check: each built file and the drift; `404` when never checked |
+| `GET /api/v1/managed-folders/{id}/check`           | its latest check: each built file, the drift and the acknowledged entries; `404` when never checked |
 | `GET /api/v1/managed-folders/{id}/incomplete`      | what its current build lacks, by reason                      |
 | `GET /api/v1/managed-folders/{id}/kept-files`      | the files builds kept aside in it, newest generation first   |
 | `POST /api/v1/managed-folders/{id}/kept-deletions` | plan deleting kept files: `{"ids"?: [id], "all"?}`; `201`     |
@@ -620,7 +640,8 @@ The workbench is your browser interface to the Service: a Leptos app compiled to
   resolved groups only, each conflict you can adopt has a choice to leave or adopt it, and each conflict you can keep
   aside has a choice to keep it aside and rebuild. The plan lists the built files no longer selected and what
   happens to each. The folder lists its kept files by generation, where you pick some or all and approve deleting
-  them. The folder shows badges
+  them. It plans a cleanup of what the latest check found: an action for each entry not built here, kept files to
+  put back and built files to repack as TorrentZip, reviewed and approved as a plan. The folder shows badges
   for an incomplete folder and an interrupted build, what the folder lacks, and its latest check, which you can run
   again. Each build shows every file it wrote or failed to write.
 - **Jobs** lists the latest jobs with their kind, state, progress and result, live: it follows `/api/v1/events`, applies `state`

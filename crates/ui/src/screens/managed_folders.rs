@@ -8,9 +8,9 @@ use leptos_router::hooks::use_params_map;
 use leptos_struct_table::ColumnSort;
 use title_select_api::build::{
     AddManagedFolder, ApprovePlan, BlockerKind, BuildDetail, BuildItem, BuildSummary, BuiltFile,
-    ChangeManagedFolder, FileOutcome, FolderCheck, Incomplete, ItemKind, KeepReason, KeptDeletion,
-    KeptFile, ManagedFolder, Plan, PlanBuild, PlanChoices, PlanItem, PlanKeptDeletion, PlanSummary,
-    RETENTION,
+    ChangeManagedFolder, Cleanup, CleanupAction, FileOutcome, FolderCheck, Incomplete, ItemKind,
+    KeepReason, KeptDeletion, KeptFile, ManagedFolder, Plan, PlanBuild, PlanChoices, PlanCleanup,
+    PlanItem, PlanKeptDeletion, PlanSummary, RETENTION,
 };
 use title_select_api::{
     Dat, Job, PathTemplateDefaults, ProfileRecord, Root, SelectionRecord, SourceSetRecord,
@@ -19,10 +19,10 @@ use title_select_api::{
 use crate::api;
 use crate::app::{Loading, Problem, navigator};
 use crate::build_model::{
-    blocker_label, build_state_label, by_kind, cause_label, drift_kind_label, file_outcome_label,
-    folders_for, group_href, incomplete_counts, incomplete_reason_label, item_kind_label,
-    item_kind_note, item_state_label, keep_reason_label, removal_kind_label, unfinished_label,
-    with_adopt, with_keep_aside,
+    blocker_label, build_state_label, by_kind, cause_label, cleanup_action_label, cleanup_actions,
+    drift_kind_label, file_outcome_label, folders_for, group_href, incomplete_counts,
+    incomplete_reason_label, item_kind_label, item_kind_note, item_state_label, keep_reason_label,
+    removal_kind_label, restore_kind_label, unfinished_label, with_adopt, with_keep_aside,
 };
 use crate::events::use_live;
 use crate::model::{short_sha, when};
@@ -495,6 +495,7 @@ fn FolderView(folder: ManagedFolder, refresh: RwSignal<u64>) -> impl IntoView {
         {active_job.map(|job| view! { <BuildProgress job /> })}
         {folder.incomplete.is_some().then(|| view! { <IncompleteItems folder=id /> })}
         <CheckPanel folder=id busy=active_job.is_some() refresh />
+        <CleanupForm folder=id busy=active_job.is_some() refresh />
         <PlanForm folder=folder.clone() refresh />
         {folder.latest_plan.map(|plan| view! { <PlanPanel plan refresh /> })}
         <ChangeBinding folder=folder.clone() refresh />
@@ -667,7 +668,307 @@ fn check_view(check: FolderCheck) -> impl IntoView {
                     .collect_view()}
             </ul>
         })}
+        {(!check.acknowledged.is_empty()).then(|| view! {
+            <h3>"Acknowledged"</h3>
+            <p class="note small">
+                "Entries you acknowledged. They are not reported as drift again until they change."
+            </p>
+            <ul class="plain">
+                {check
+                    .acknowledged
+                    .into_iter()
+                    .map(|d| view! {
+                        <li>
+                            <code>{d.name}</code>
+                            {format!(": {}", drift_kind_label(d.kind))}
+                        </li>
+                    })
+                    .collect_view()}
+            </ul>
+        })}
     }
+}
+
+/// Plans a cleanup of what the latest check found: what to do with each entry Title Select did not build that you
+/// choose, the kept files to put back, and the built files to repack as TorrentZip. Nothing changes until you
+/// approve the plan.
+#[component]
+fn CleanupForm(folder: i64, busy: bool, refresh: RwSignal<u64>) -> impl IntoView {
+    let live = use_live();
+    let loaded = LocalResource::new(move || {
+        live.settled.track();
+        refresh.track();
+        async move {
+            let check = api::get::<FolderCheck>(&format!("/managed-folders/{folder}/check"))
+                .await
+                .ok();
+            let kept = api::get::<Vec<KeptFile>>(&format!("/managed-folders/{folder}/kept-files"))
+                .await
+                .unwrap_or_default();
+            (check, kept)
+        }
+    });
+    let request = RwSignal::new(PlanCleanup::default());
+    let problem = RwSignal::new(None::<String>);
+    let working = RwSignal::new(false);
+    let plan = move |_| {
+        working.set(true);
+        let body = request.get_untracked();
+        leptos::task::spawn_local(async move {
+            let planned =
+                api::post::<_, Plan>(&format!("/managed-folders/{folder}/cleanups"), &body).await;
+            working.set(false);
+            match planned {
+                Ok(_) => {
+                    problem.set(None);
+                    request.set(PlanCleanup::default());
+                    refresh.update(|n| *n += 1);
+                }
+                Err(message) => problem.set(Some(message)),
+            }
+        });
+    };
+    let toggle = |list: &mut Vec<String>, name: &str| match list.iter().position(|x| x == name) {
+        Some(at) => {
+            list.remove(at);
+        }
+        None => list.push(name.to_string()),
+    };
+    let form = move || {
+        loaded.get().map(|(check, kept)| {
+            let drift = check.as_ref().map(|c| c.drift.clone()).unwrap_or_default();
+            let repackable: Vec<String> = check
+                .map(|c| {
+                    c.files
+                        .into_iter()
+                        .filter(|f| {
+                            !f.torrentzip
+                                && matches!(
+                                    f.outcome,
+                                    FileOutcome::Unchanged | FileOutcome::Refreshed | FileOutcome::Repacked
+                                )
+                        })
+                        .map(|f| f.target)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if drift.is_empty() && repackable.is_empty() && kept.is_empty() {
+                return view! {
+                    <p class="note">
+                        "Nothing to clean up: the latest check found nothing Title Select did not build, every built \
+                        file is TorrentZip, and no files are kept aside."
+                    </p>
+                }
+                .into_any();
+            }
+            view! {
+                {(!drift.is_empty()).then(|| view! {
+                    <h3>"Not built here"</h3>
+                    <ul class="plain">
+                        {drift
+                            .into_iter()
+                            .map(|d| {
+                                let name = StoredValue::new(d.name.clone());
+                                let current = move || {
+                                    request.with(|r| {
+                                        name.with_value(|n| r.entries.get(n).map(|a| a.as_str()).unwrap_or(""))
+                                            .to_string()
+                                    })
+                                };
+                                let choose = move |ev| {
+                                    let value = event_target_value(&ev);
+                                    let action = cleanup_actions_all().into_iter().find(|a| a.as_str() == value);
+                                    request.update(|r| {
+                                        let n = name.get_value();
+                                        match action {
+                                            Some(a) => {
+                                                r.entries.insert(n, a);
+                                            }
+                                            None => {
+                                                r.entries.remove(&n);
+                                            }
+                                        }
+                                    });
+                                };
+                                view! {
+                                    <li>
+                                        <label>
+                                            <code>{d.name.clone()}</code>
+                                            {format!(": {} ", drift_kind_label(d.kind))}
+                                            <select prop:value=current on:change=choose>
+                                                <option value="">"Leave it"</option>
+                                                {cleanup_actions(&d)
+                                                    .into_iter()
+                                                    .map(|a| view! { <option value=a.as_str()>{cleanup_action_label(a)}</option> })
+                                                    .collect_view()}
+                                            </select>
+                                        </label>
+                                    </li>
+                                }
+                            })
+                            .collect_view()}
+                    </ul>
+                })}
+                {(!repackable.is_empty()).then(|| view! {
+                    <h3>"Built files that are not TorrentZip"</h3>
+                    <ul class="plain">
+                        {repackable
+                            .into_iter()
+                            .map(|target| {
+                                let t = StoredValue::new(target.clone());
+                                view! {
+                                    <li>
+                                        <label>
+                                            <input
+                                                type="checkbox"
+                                                prop:checked=move || request.with(|r| t.with_value(|t| r.repack.contains(t)))
+                                                on:change=move |_| request.update(|r| t.with_value(|t| toggle(&mut r.repack, t)))
+                                            />
+                                            " Repack "
+                                            <code>{target}</code>
+                                            " as TorrentZip, keeping the file as it is aside"
+                                        </label>
+                                    </li>
+                                }
+                            })
+                            .collect_view()}
+                    </ul>
+                })}
+                {(!kept.is_empty()).then(|| view! {
+                    <h3>"Kept files"</h3>
+                    <ul class="plain">
+                        {kept
+                            .into_iter()
+                            .map(|k| {
+                                let id = k.id;
+                                let what = if k.directory { "folder" } else { "file" };
+                                view! {
+                                    <li>
+                                        <label>
+                                            <input
+                                                type="checkbox"
+                                                prop:checked=move || request.with(|r| r.restore.contains(&id))
+                                                on:change=move |_| request.update(|r| match r.restore.iter().position(|x| *x == id) {
+                                                    Some(at) => {
+                                                        r.restore.remove(at);
+                                                    }
+                                                    None => r.restore.push(id),
+                                                })
+                                            />
+                                            {format!(" Put back the kept {what} ")}
+                                            <code>{k.name.clone()}</code>
+                                        </label>
+                                    </li>
+                                }
+                            })
+                            .collect_view()}
+                    </ul>
+                })}
+                <div class="form">
+                    <button
+                        type="button"
+                        disabled=move || busy || working.get() || request.with(PlanCleanup::is_empty)
+                        on:click=plan
+                    >
+                        "Plan the cleanup"
+                    </button>
+                </div>
+            }
+            .into_any()
+        })
+    };
+    view! {
+        <section aria-labelledby="cleanup-title">
+            <h2 id="cleanup-title">"Clean up the folder"</h2>
+            <p class="lede">
+                {format!(
+                    "Choose what to do with what the latest check found. Keep an entry aside, and it is moved, whole, \
+                     into {RETENTION}; adopt a file that holds a selected game, and it is recorded as built under that \
+                     game's file name; acknowledge an entry, and it is no longer reported until it changes. Anything \
+                     you do not choose is left as it is, and nothing changes until you approve the plan."
+                )}
+            </p>
+            {form}
+            {move || problem.get().map(|message| view! { <Problem message /> })}
+        </section>
+    }
+}
+
+fn cleanup_actions_all() -> [CleanupAction; 3] {
+    [
+        CleanupAction::KeepAside,
+        CleanupAction::Adopt,
+        CleanupAction::Acknowledge,
+    ]
+}
+
+/// What an approved cleanup does: each entry you chose, each kept file put back and each file repacked.
+fn cleanup_view(cleanup: &Cleanup) -> AnyView {
+    let chosen: Vec<_> = cleanup
+        .entries
+        .iter()
+        .filter_map(|e| e.action.map(|a| (a, e)))
+        .map(|(a, e)| {
+            let to = e
+                .target
+                .as_ref()
+                .filter(|t| **t != e.name)
+                .map(|t| view! { " as " <code>{t.clone()}</code> });
+            view! {
+                <li>
+                    <strong>{cleanup_action_label(a)}</strong>
+                    " "
+                    <code>{e.name.clone()}</code>
+                    {to}
+                </li>
+            }
+        })
+        .collect();
+    let left = cleanup
+        .entries
+        .iter()
+        .filter(|e| e.action.is_none())
+        .count();
+    view! {
+        <h3>"What the cleanup does"</h3>
+        <ul class="plain">
+            {chosen}
+            {cleanup
+                .restores
+                .iter()
+                .map(|r| view! {
+                    <li>
+                        <strong>{restore_kind_label(r.kind)}</strong>
+                        " "
+                        <code>{format!("{RETENTION}/{}/{}", r.kept.generation, r.kept.kept_name)}</code>
+                        " as "
+                        <code>{r.target.clone()}</code>
+                    </li>
+                })
+                .collect_view()}
+            {cleanup
+                .repacks
+                .iter()
+                .map(|r| view! {
+                    <li>
+                        <strong>"Repack as TorrentZip"</strong>
+                        " "
+                        <code>{r.target.clone()}</code>
+                        ", keeping the file as it is aside"
+                    </li>
+                })
+                .collect_view()}
+        </ul>
+        {(left > 0).then(|| view! {
+            <p class="note small">
+                {format!(
+                    "{left} other entries are left as they are. The plan holds the folder as it found it: if anything \
+                     in it changes before you approve, you are asked to plan again."
+                )}
+            </p>
+        })}
+    }
+    .into_any()
 }
 
 /// A job's progress on the folder, live.
@@ -801,6 +1102,8 @@ fn summary_view(s: &PlanSummary) -> AnyView {
         ("Conflict", s.conflict, "count review"),
         ("Unresolved", s.unresolved, "count review"),
         ("Blocked", s.blocked, "count review"),
+        ("Put back", s.restore, "count"),
+        ("Acknowledged", s.acknowledge, "count"),
     ];
     view! {
         <ul class="counts">
@@ -1117,14 +1420,22 @@ fn PlanView(plan: Plan, refresh: RwSignal<u64>) -> impl IntoView {
         .iter()
         .filter(|r| r.kind == title_select_api::build::RemovalKind::Keep)
         .count();
-    let approve_label = match removes {
-        0 => format!("Approve and build {writes} files"),
-        n => format!("Approve and build {writes} files, keeping {n} aside"),
+    let cleanup = plan.content.cleanup.as_ref().map(cleanup_view);
+    let is_cleanup = cleanup.is_some();
+    let approve_label = match (is_cleanup, removes) {
+        (true, _) => "Approve the cleanup".to_string(),
+        (false, 0) => format!("Approve and build {writes} files"),
+        (false, n) => format!("Approve and build {writes} files, keeping {n} aside"),
+    };
+    let heading = if is_cleanup {
+        format!("Cleanup plan #{id}")
+    } else {
+        format!("Plan #{id}")
     };
 
     view! {
         <section aria-labelledby="latest-plan-title">
-            <h2 id="latest-plan-title">{format!("Plan #{id}")}</h2>
+            <h2 id="latest-plan-title">{heading}</h2>
             <dl class="facts">
                 <dt>"Selection"</dt>
                 <dd>
@@ -1190,6 +1501,7 @@ fn PlanView(plan: Plan, refresh: RwSignal<u64>) -> impl IntoView {
                         </div>
                     }
                 })}
+            {cleanup}
             {partial}
             {adopt_choices}
             {keep_choices}
@@ -1236,6 +1548,7 @@ fn PlanView(plan: Plan, refresh: RwSignal<u64>) -> impl IntoView {
                         </ul>
                     }
                 })}
+            {(!is_cleanup).then(|| view! {
             <h3>"Files"</h3>
             <ul class="plain small">
                 {kinds
@@ -1264,6 +1577,7 @@ fn PlanView(plan: Plan, refresh: RwSignal<u64>) -> impl IntoView {
                 on_open=Callback::new(|_: ItemRow| {})
                 empty="The plan has no files.".to_string()
             />
+            })}
         </section>
     }
 }

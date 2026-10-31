@@ -6,6 +6,7 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use title_select_api::build::ExpectedRom;
 
 use crate::dat::Dat;
@@ -78,6 +79,90 @@ pub fn repack(dest: &File, roms: &[(&ExpectedRom, Source)]) -> Result<(), String
     let out = writer.finish().map_err(|e| e.to_string())?;
     let file = out.into_inner().map_err(|e| e.error().to_string())?;
     file.sync_all().map_err(|e| e.to_string())
+}
+
+/// A reader of a file that hashes it whole as it is read: each byte read in order from the start of the file is
+/// hashed the first time it is read, and [`Hashing::finish`] reads only what was never read in order. A ZIP reader
+/// that reads its central directory and then its members in order thus reads the file about once.
+struct Hashing<'a> {
+    file: &'a File,
+    pos: u64,
+    hashed: u64,
+    sha256: Sha256,
+}
+
+impl<'a> Hashing<'a> {
+    fn new(file: &'a File) -> io::Result<Self> {
+        let mut file_ref = file;
+        file_ref.seek(SeekFrom::Start(0))?;
+        Ok(Hashing {
+            file,
+            pos: 0,
+            hashed: 0,
+            sha256: Sha256::new(),
+        })
+    }
+
+    /// The file's SHA-256, reading what was not read in order, and its size.
+    fn finish(mut self) -> io::Result<(String, u64)> {
+        self.seek(SeekFrom::Start(self.hashed))?;
+        let mut buf = vec![0; CHUNK];
+        while self.read(&mut buf)? > 0 {}
+        Ok((crate::hex(&self.sha256.finalize()), self.hashed))
+    }
+}
+
+impl Read for Hashing<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut file = self.file;
+        let n = file.read(buf)?;
+        let end = self.pos + n as u64;
+        if self.pos <= self.hashed && end > self.hashed {
+            self.sha256
+                .update(&buf[(self.hashed - self.pos) as usize..n]);
+            self.hashed = end;
+        }
+        self.pos = end;
+        Ok(n)
+    }
+}
+
+impl Seek for Hashing<'_> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let mut file = self.file;
+        self.pos = file.seek(to)?;
+        Ok(self.pos)
+    }
+}
+
+/// Writes `roms` to `dest` as a TorrentZip, each read from the member of the same name in the ZIP `source`, an open
+/// file read from its start. Returns the SHA-256 and size of `source`, hashed as it was read.
+pub fn repack_from(
+    dest: &File,
+    roms: &[ExpectedRom],
+    source: &File,
+) -> Result<(String, u64), String> {
+    let mut order: Vec<_> = roms.iter().collect();
+    order.sort_by(|a, b| compare_names(&a.name, &b.name));
+    let reader = BufReader::new(Hashing::new(source).map_err(|e| e.to_string())?);
+    let mut archive = zip::ZipArchive::new(reader).map_err(|e| e.to_string())?;
+    let mut writer = Writer::new(BufWriter::new(dest)).map_err(|e| e.to_string())?;
+    for rom in order {
+        let mut payload = archive
+            .by_name(&rom.name)
+            .map_err(|e| format!("{}: {e}", rom.name))?;
+        writer
+            .add(&rom.name, rom.size, &mut payload)
+            .map_err(|e| format!("{}: {e}", rom.name))?;
+    }
+    let out = writer.finish().map_err(|e| e.to_string())?;
+    let file = out.into_inner().map_err(|e| e.error().to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    archive
+        .into_inner()
+        .into_inner()
+        .finish()
+        .map_err(|e| e.to_string())
 }
 
 /// Checks that `file`, read from its start, is valid TorrentZip whose members are exactly `roms`, under their names,
@@ -305,5 +390,30 @@ impl<'a> GameIndex<'a> {
                 }
             })
             .map(|game| self.dat.games[game].as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_read_out_of_order_is_still_hashed_whole_and_once_in_order() {
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let mut file = tempfile::tempfile().unwrap();
+        io::Write::write_all(&mut file, &bytes).unwrap();
+        let mut reader = Hashing::new(&file).unwrap();
+        let mut buf = vec![0; 1000];
+        // The end first, as a ZIP reader reads its central directory, then the start, then a skip ahead.
+        reader.seek(SeekFrom::End(-1000)).unwrap();
+        reader.read_exact(&mut buf).unwrap();
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_exact(&mut buf).unwrap();
+        reader.seek(SeekFrom::Start(5000)).unwrap();
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(reader.hashed, 1000);
+        let (sha256, size) = reader.finish().unwrap();
+        assert_eq!(size, bytes.len() as u64);
+        assert_eq!(sha256, crate::hex(&Sha256::digest(&bytes)));
     }
 }

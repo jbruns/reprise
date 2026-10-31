@@ -104,20 +104,41 @@ pub type FaultHook = std::sync::Arc<dyn Fn(Fault) + Send + Sync>;
 pub enum Fault {
     /// After the publish intent of the item with this sequence number is committed, before its file is renamed.
     BeforePublish(i64),
-    /// After the file of the item with this sequence number is renamed into place, before the store records it.
+    /// After the file of the item with this sequence number is renamed into place, before either folder is synced.
+    PublishedUnsynced(i64),
+    /// After the file of the item with this sequence number is renamed into place and both folders are synced, before
+    /// the store records it.
     AfterPublish(i64),
     /// After the intent to keep aside the file of the item with this sequence number is committed, before it is
     /// moved.
     BeforeKeep(i64),
+    /// Before the file the item with this sequence number keeps aside is read whole, to be hashed: not reached when
+    /// the hash its Build read while repacking it is trusted.
+    KeepRead(i64),
     /// After the file of the item with this sequence number is moved into the retention area, before the store
     /// records it kept.
     AfterKeep(i64),
+    /// After the file of the item with this sequence number is moved into the retention area, before either folder is
+    /// synced.
+    KeptUnsynced(i64),
+    /// After the intent to move the entry of a cleanup's item with this sequence number is committed, before it is
+    /// renamed.
+    BeforeMove(i64),
+    /// After the entry of a cleanup's item with this sequence number is renamed, before either folder is synced.
+    AfterMove(i64),
+    /// After the entry of a cleanup's item with this sequence number is renamed and both folders are synced, before
+    /// the store records it moved.
+    MoveSynced(i64),
     /// After a folder Title Select is creating in a Managed Folder is made under its temporary name, before it is
     /// opened and checked.
     MadeDir,
     /// After a folder Title Select is creating in a Managed Folder is made and recorded under its temporary name,
     /// before it is renamed into place.
     BeforePublishDir,
+    /// As [`Fault::MadeDir`], for a Build's staging directory.
+    MadeStaging,
+    /// As [`Fault::BeforePublishDir`], for a Build's staging directory.
+    BeforePublishStaging,
     /// After the intent to delete the kept file with this id is committed and it is found to be the kept file, before
     /// it is moved into the private folder it is deleted from.
     BeforeDeleteMove(i64),
@@ -133,6 +154,8 @@ pub enum Fault {
     MoveBackSynced(i64),
     /// After the kept file with this id is deleted, before the store records it deleted.
     AfterUnlink(i64),
+    /// After a cleanup is planned from what its folder holds, before the plan and the folder's check are stored.
+    Scanned,
     /// After the store commits the folder's next generation, before the marker advances to it.
     AfterFinalize,
     /// After the marker advances, before the store records the Build finished.

@@ -1282,5 +1282,35 @@ mod selections {
             [title_select_api::build::IncompleteReason::NoSource],
             "drift alone leaves the folder as complete as its build"
         );
+
+        // A cleanup keeps the drift aside once you approve it.
+        let (status, body) = send(
+            client.post(&format!("/managed-folders/{}/cleanups", folder.id)),
+            json!({}),
+        );
+        assert_eq!(status, 400, "a cleanup that chooses nothing: {body}");
+        let (status, plan) = send(
+            client.post(&format!("/managed-folders/{}/cleanups", folder.id)),
+            json!({"entries": {"notes.txt": "keep_aside"}}),
+        );
+        assert_eq!(status, 201, "{plan}");
+        let plan: Plan = serde_json::from_value(plan).unwrap();
+        assert!(plan.approvable(), "{:?}", plan.content.blockers);
+        assert!(
+            play.join("test/notes.txt").exists(),
+            "planning moves nothing"
+        );
+        let (status, job) = send(
+            client.post(&format!("/plans/{}/approval", plan.id)),
+            json!({"digest": plan.digest}),
+        );
+        assert_eq!(status, 202, "{job}");
+        let job: Job = serde_json::from_value(job).unwrap();
+        assert_eq!(client.follow(job.id).1.state, JobState::Succeeded);
+        assert!(!play.join("test/notes.txt").exists());
+        let kept: Vec<title_select_api::build::KeptFile> =
+            client.json(&format!("/managed-folders/{}/kept-files", folder.id));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "notes.txt");
     }
 }
