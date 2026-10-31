@@ -426,7 +426,7 @@ identity, size or modification time changes. A cleanup also puts kept files back
 free and, for a file holding a selected game, that game's file name; a kept file holding a selected game under
 another name is adopted under that game's file name instead, and one whose name is taken is refused. It repacks a
 built file flagged not TorrentZip from its own contents, in one read, keeping the file as it was aside; if the
-service stops after the old file is kept aside and before the new one is in place, the game is reported failed, so
+service stops after the old file is kept aside and before the new one is in place, a selected game is reported failed, so
 the folder shows as incomplete until you put the kept copy back or build again. A kept folder is put back
 as it was, never adopted or deleted by Title Select. Every entry the cleanup found is part of its digest, chosen or
 not, along with the built files, acknowledged entries and kept files as they were: if anything in the folder changes

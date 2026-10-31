@@ -4315,3 +4315,66 @@ fn a_repack_keeps_the_old_copy_aside_by_the_hash_it_read_while_rewriting_it() {
         validate(&dir.join("Combat (USA).zip"));
     }
 }
+
+#[test]
+fn an_interrupted_repack_of_a_file_no_longer_selected_leaves_the_folder_lacking_nothing() {
+    let (env, folder, dir, old) = complete_with_a_stored_zip();
+    // Combat's group becomes unresolved, with Yars its winner; building the resolved groups only leaves Combat's
+    // built file in place, built but no longer selected.
+    let mut unresolved = group("Combat (USA)");
+    unresolved.unresolved = true;
+    unresolved.winners[0].title = "Yars (USA)".into();
+    unresolved.alternatives = vec![Alternative {
+        title: "Combat (USA)".into(),
+        clone_of: "Yars (USA)".into(),
+        rule: rule("Region"),
+    }];
+    let id = env.record(&selection(
+        &env.sha256,
+        vec![group("Pong (USA)"), unresolved],
+    ));
+    let partial = plan_with(
+        &env,
+        &folder,
+        id,
+        PlanChoices {
+            resolved_only: true,
+            adopt: vec![],
+            keep_aside: vec![],
+        },
+    );
+    assert!(partial.approvable(), "{:?}", partial.content.blockers);
+    assert_eq!(env.build(&partial).state, JobState::Succeeded);
+    let combat = dir.join("Combat (USA).zip");
+    assert_eq!(std::fs::read(&combat).unwrap(), old);
+    let lacking = |env: &Env| {
+        let folder = env.store.managed_folder(&env.config, folder.id).unwrap();
+        let counts = folder.incomplete.clone().unwrap();
+        (counts.unresolved, counts.failed, counts.missing)
+    };
+    assert_eq!(lacking(&env), (1, 0, 0), "only Yars, unresolved");
+
+    let folder = env.store.managed_folder(&env.config, folder.id).unwrap();
+    let plan = cleanup(&env, &folder, repack("Combat (USA).zip"));
+    assert!(plan.approvable(), "{:?}", plan.content.blockers);
+    env.crash(&plan, Fault::BeforePublish(0));
+    let (env, blocked) = env.restart();
+    assert!(blocked.is_empty(), "{blocked:?}");
+    assert!(!combat.exists());
+    let kept = env.store.kept_files(folder.id).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(std::fs::read(kept_path(&dir, &kept[0])).unwrap(), old);
+
+    // Combat is not selected, so the folder lacks nothing more for it, before or after a check.
+    assert_eq!(lacking(&env), (1, 0, 0));
+    check(&env, &folder);
+    assert_eq!(lacking(&env), (1, 0, 0));
+    let incomplete = env.store.incomplete(folder.id).unwrap();
+    assert!(
+        incomplete
+            .items
+            .iter()
+            .all(|i| i.target != "Combat (USA).zip"),
+        "{incomplete:?}"
+    );
+}

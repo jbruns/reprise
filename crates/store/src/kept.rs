@@ -552,8 +552,9 @@ pub(super) fn settle_kept(tx: &Transaction, id: i64) -> Result<()> {
          WHERE build_id = ?1 AND seq = ?2 AND kind IN ('remove', 'keep_aside')",
         params![build, seq],
     )?;
-    // A file kept aside to be repacked is a selected game's file the folder lacks until its repacked copy is put in
-    // place: recorded so, in the group the cleanup's plan selects it in, until it is.
+    // A file kept aside to be repacked is, when its game is selected by the folder's current build, a selected
+    // game's file the folder lacks until its repacked copy is put in place: recorded so, in the group the cleanup's
+    // plan selects it in, until it is. A built file no selected game's is not something the folder lacks.
     tx.execute(
         "INSERT INTO build_incomplete (build_id, seq, reason, grp, game, target, detail)
          SELECT m.current_build_id,
@@ -566,6 +567,9 @@ pub(super) fn settle_kept(tx: &Transaction, id: i64) -> Result<()> {
                 k.game, k.name, ?2
          FROM kept_files k JOIN managed_folders m ON m.id = k.folder_id
          WHERE k.id = ?1 AND k.reason = 'repack' AND k.game IS NOT NULL AND m.current_build_id IS NOT NULL
+           AND EXISTS (SELECT 1 FROM builds c JOIN selection_releases r ON r.selection_id = c.selection_id
+                       WHERE c.id = m.current_build_id AND r.role = 'winner'
+                         AND lower(r.title || '.zip') = lower(k.name))
            AND NOT EXISTS (SELECT 1 FROM build_incomplete i WHERE i.build_id = m.current_build_id
                            AND lower(i.target) = lower(k.name) AND i.reason = 'failed' AND i.detail = ?2)",
         params![id, REPACK_UNPUBLISHED],
