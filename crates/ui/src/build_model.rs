@@ -19,6 +19,9 @@ pub fn item_kind_label(kind: ItemKind) -> &'static str {
         ItemKind::Adopt => "Adopt",
         ItemKind::Unresolved => "Unresolved",
         ItemKind::Remove => "Remove",
+        ItemKind::KeepAside => "Keep aside",
+        ItemKind::Acknowledge => "Acknowledge",
+        ItemKind::Restore => "Restore",
     }
 }
 
@@ -45,6 +48,9 @@ pub fn item_kind_note(kind: ItemKind) -> &'static str {
         ItemKind::Remove => {
             "Built files no longer selected: each is kept aside, or forgotten if it is gone."
         }
+        ItemKind::KeepAside => "Moved, whole, into the retention area as kept files.",
+        ItemKind::Acknowledge => "Left as they are, and no longer reported until they change.",
+        ItemKind::Restore => "Kept files put back into the folder.",
     }
 }
 
@@ -135,6 +141,8 @@ pub fn keep_reason_label(reason: KeepReason) -> &'static str {
         KeepReason::Removal => "no longer selected",
         KeepReason::Replacement => "replaced",
         KeepReason::Conflict => "conflict kept aside",
+        KeepReason::Drift => "not built here, kept aside",
+        KeepReason::Repack => "before repacking",
     }
 }
 
@@ -165,6 +173,7 @@ pub fn blocker_label(kind: BlockerKind) -> &'static str {
         BlockerKind::Replacement => "Replacement",
         BlockerKind::Removal => "Removal",
         BlockerKind::Recovery => "Recovery",
+        BlockerKind::Cleanup => "Cleanup",
     }
 }
 

@@ -55,10 +55,38 @@ impl Seen {
     }
 }
 
+/// An entry Title Select did not build that you acknowledged, as it was then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Ack {
+    pub identity: Identity,
+    pub file: FileStat,
+}
+
+/// The acknowledged entries of Managed Folder `folder`, by name.
+pub(super) fn read_acks(c: &Connection, folder: i64) -> Result<HashMap<String, Ack>> {
+    let mut stmt =
+        c.prepare("SELECT name, dev, ino, size, mtime_ns FROM drift_acks WHERE folder_id = ?1")?;
+    let rows = stmt.query_map([folder], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            Ack {
+                identity: Identity::from_sql(r.get(1)?, r.get(2)?),
+                file: FileStat {
+                    size: r.get::<_, i64>(3)? as u64,
+                    mtime_ns: r.get::<_, i64>(4)? as i128,
+                },
+            },
+        ))
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// What a check found, before it is stored.
 pub(super) struct Scan {
     pub files: Vec<CheckedFile>,
     pub drift: Vec<DriftEntry>,
+    /// Entries you acknowledged, found as they were then: neither read nor reported as drift.
+    pub acknowledged: Vec<DriftEntry>,
     updates: Vec<Update>,
     /// What was read of each entry, by name, with the file as it was when read.
     pub probes: HashMap<String, (Seen, Probe)>,
@@ -72,6 +100,8 @@ pub(super) struct ScanInput<'a> {
     pub dat: Option<&'a Dat>,
     /// What earlier checks read, by name.
     pub cached: &'a HashMap<String, (Seen, Probe)>,
+    /// The entries you acknowledged, by name.
+    pub acks: &'a HashMap<String, Ack>,
 }
 
 /// The names in a folder other than Title Select's own entries, sorted.
@@ -118,7 +148,7 @@ fn still(dir: &FolderDir, name: &str, file: &File, seen: &Stat) -> std::result::
 /// Reuses `cached`, what an earlier check read of `name`, only when the file found by `lstat` as `seen` is the one
 /// it was read from: the same identity, size, modification time and status change time, through the folder's handle
 /// as well as by name. Otherwise reads it again.
-fn reuse(
+pub(super) fn reuse(
     dir: &FolderDir,
     name: &str,
     seen: &Stat,
@@ -144,6 +174,7 @@ pub(super) fn scan(
     let mut out = Scan {
         files: Vec::new(),
         drift: Vec::new(),
+        acknowledged: Vec::new(),
         updates: Vec::new(),
         probes: HashMap::new(),
     };
@@ -280,6 +311,19 @@ pub(super) fn scan(
                 tick();
                 continue;
             }
+            // Acknowledged and unchanged since, by identity, size and modification time: not read again.
+            Ok(Some(st))
+                if input.acks.get(name).is_some_and(|ack| {
+                    ack.identity == Identity::of(&st) && ack.file == file_stat(&st)
+                }) =>
+            {
+                if FolderDir::kind(&st) == FileType::Directory {
+                    entry.kind = DriftKind::Directory;
+                }
+                out.acknowledged.push(entry);
+                tick();
+                continue;
+            }
             Err(e) => entry.detail = Some(e.to_string()),
             Ok(Some(st)) => match FolderDir::kind(&st) {
                 FileType::Directory => entry.kind = DriftKind::Directory,
@@ -340,6 +384,7 @@ impl Scan {
             s.hashed += d.hashed as u64;
         }
         s.drift = self.drift.len() as u64;
+        s.acknowledged = self.acknowledged.len() as u64;
         s
     }
 }
@@ -409,6 +454,20 @@ pub(super) fn store_check(
             )?;
         }
         tx.execute("DELETE FROM folder_probes WHERE folder_id = ?1", [folder])?;
+        // An acknowledgement lasts only while its entry is as it was: one the check found changed, or gone, is
+        // dropped, and the entry is drift again.
+        let kept: HashSet<&str> = scan.acknowledged.iter().map(|d| d.name.as_str()).collect();
+        let acks: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT name FROM drift_acks WHERE folder_id = ?1")?;
+            let rows = stmt.query_map([folder], |r| r.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        for name in acks.iter().filter(|n| !kept.contains(n.as_str())) {
+            tx.execute(
+                "DELETE FROM drift_acks WHERE folder_id = ?1 AND name = ?2",
+                params![folder, name],
+            )?;
+        }
         for (name, (at, probe)) in &scan.probes {
             let (dev, ino) = at.identity.to_sql();
             tx.execute(
@@ -477,6 +536,7 @@ struct CheckInputs {
     selected: HashMap<String, String>,
     revision: (String, bool),
     cached: HashMap<String, (Seen, Probe)>,
+    acks: HashMap<String, Ack>,
 }
 
 impl Store {
@@ -576,6 +636,7 @@ impl Store {
                 store: store_id(&tx)?,
                 built: read_built(&tx, folder.id)?,
                 cached: read_probes(&tx, folder.id)?,
+                acks: read_acks(&tx, folder.id)?,
                 folder,
                 selection,
                 selected,
@@ -597,6 +658,7 @@ impl Store {
             dat_revision: Some(inputs.revision.0.clone()),
             files: Vec::new(),
             drift: Vec::new(),
+            acknowledged: Vec::new(),
         };
         let problem = marker_problem(
             &dir,
@@ -619,12 +681,14 @@ impl Store {
                         selected: &inputs.selected,
                         dat: dat.as_ref(),
                         cached: &inputs.cached,
+                        acks: &inputs.acks,
                     },
                     progress,
                 );
                 check.summary = scan.summary();
                 check.files = scan.files.clone();
                 check.drift = scan.drift.clone();
+                check.acknowledged = scan.acknowledged.clone();
                 Some(scan)
             }
         };

@@ -39,6 +39,8 @@ use super::{Error, Fault, Result, Store, now};
 use crate::config::Config;
 use rustix::fs::Stat;
 
+mod cleanup;
+
 /// What a Managed Folder's current Build cites, in `audit_citations` and `selection_citations`.
 fn cited_by(folder: i64) -> String {
     format!("managed-folder:{folder}")
@@ -435,6 +437,12 @@ struct Publishing {
     target: String,
     sha256: Option<String>,
     size: Option<i64>,
+    kind: String,
+    /// For a cleanup's move within the folder: where the entry is moved from, its identity, and the kept file it is.
+    origin: Option<String>,
+    dev: Option<i64>,
+    ino: Option<i64>,
+    kept_id: Option<i64>,
 }
 
 /// What recovery reads about an unfinished Build.
@@ -511,14 +519,18 @@ impl Store {
             .as_ref()
             .ok_or_else(|| Error::Io(format!("plan {plan_id} is not approved")))?;
         let content = &plan.content;
-        let again =
-            self.compute_plan(config, content.folder, content.selection, &content.choices)?;
+        let again = self.recompute(config, content)?;
         if digest(&again.content) != approved.digest {
             let newer = self.write(|tx| super::plans::insert_plan(tx, &again, None))?;
             return Err(Error::Conflict(format!(
                 "the plan changed since you approved it; nothing was written. Review plan {} instead",
                 newer.id
             )));
+        }
+        if let Some(cleanup) = &content.cleanup {
+            return self.carry_out_cleanup(
+                config, job, plan_id, content, cleanup, &again, build_id, progress,
+            );
         }
         let audit = content
             .audit
@@ -907,7 +919,7 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
             let mut stmt = c.prepare(
-                "SELECT seq, target, sha256, size FROM build_items
+                "SELECT seq, target, sha256, size, kind, origin, dev, ino, kept_id FROM build_items
                  WHERE build_id = ?1 AND state = 'publishing' ORDER BY seq",
             )?;
             let publishing = stmt
@@ -917,6 +929,11 @@ impl Store {
                         target: r.get(1)?,
                         sha256: r.get(2)?,
                         size: r.get(3)?,
+                        kind: r.get(4)?,
+                        origin: r.get(5)?,
+                        dev: r.get(6)?,
+                        ino: r.get(7)?,
+                        kept_id: r.get(8)?,
                     })
                 })?
                 .collect::<Result<_, _>>()?;
@@ -1021,8 +1038,21 @@ impl Store {
         }
 
         if !unfinished.publishing.is_empty() {
-            let items = self.plan(unfinished.plan)?.content.items;
+            let content = self.plan(unfinished.plan)?.content;
+            let items = match &content.cleanup {
+                Some(c) => cleanup::written_items(c),
+                None => content.items,
+            };
             for p in &unfinished.publishing {
+                if let (Some(_), Some(c)) = (&p.origin, &content.cleanup) {
+                    if let Err(reason) = check_marker(&dir, &marker) {
+                        return Ok(Err(reason));
+                    }
+                    if let Err(reason) = self.settle_move(&dir, build, folder.id, p, c)? {
+                        return Ok(Err(reason));
+                    }
+                    continue;
+                }
                 let item = items
                     .iter()
                     .find(|i| i.kind.writes() && i.target == p.target)

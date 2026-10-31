@@ -20,7 +20,7 @@ use title_select_engine::build::{Probe, holds, is_torrentzip};
 use title_select_engine::dat::Dat;
 
 use super::audits::{ENTRY_COLUMNS, entry_from_row};
-use super::checks::{Scan, ScanInput, Seen, read_probes, scan, store_check};
+use super::checks::{Ack, Scan, ScanInput, Seen, read_acks, read_probes, scan, store_check};
 use super::dats::revision_by_id;
 use super::folder_dir::{FolderDir, Identity, file_stat};
 use super::folders::{
@@ -31,6 +31,8 @@ use super::kept::{deletion_active, folder_dirs, is_dir_temp};
 use super::selections::{read_rows, read_selection, record_by_id};
 use super::sets::{resolve, set_by_id};
 use super::{Error, Result, Store, now};
+
+mod cleanup;
 use crate::config::Config;
 
 /// A file a Build wrote into a Managed Folder, as the store recorded it.
@@ -142,6 +144,8 @@ struct Inputs {
     cached: HashMap<String, (Seen, Probe)>,
     /// The directories Builds created in the folder that outlive them, such as the retention area, by name.
     dirs: HashMap<String, Identity>,
+    /// The entries Title Select did not build that you acknowledged, by name.
+    acks: HashMap<String, Ack>,
 }
 
 fn load(
@@ -242,6 +246,7 @@ fn load(
         choices: choices.clone(),
         selected,
         cached: read_probes(c, folder.id)?,
+        acks: read_acks(c, folder.id)?,
         dirs: folder_dirs(c, folder.id)?,
         store: store_id(c)?,
         built: read_built(c, folder.id)?,
@@ -270,7 +275,7 @@ pub(super) struct Planned {
     /// The targets of unresolved items whose earlier built file the check found still holds the ROMs the DAT
     /// revision now expects for the item's game.
     pub retained: HashSet<String>,
-    scan: Option<Scan>,
+    pub scan: Option<Scan>,
 }
 
 fn blocker(kind: BlockerKind, message: impl Into<String>) -> Blocker {
@@ -392,6 +397,7 @@ fn check_folder(
                     selected: &inputs.selected,
                     dat,
                     cached: &inputs.cached,
+                    acks: &inputs.acks,
                 },
                 None,
             ))
@@ -481,6 +487,7 @@ fn keep_of(
         file: found.file.clone(),
         identity: found.identity.into(),
         sha256: probed.or_else(|| recorded.cloned()),
+        directory: false,
     }
 }
 
@@ -797,11 +804,13 @@ fn compute(config: &Config, inputs: &Inputs, dat: Option<&Dat>) -> Planned {
                 dat_revision: Some(inputs.revision.sha256.clone()),
                 files: Vec::new(),
                 drift: Vec::new(),
+                acknowledged: Vec::new(),
             };
             if let Some(scan) = &folder.scan {
                 check.summary = scan.summary();
                 check.files = scan.files.clone();
                 check.drift = scan.drift.clone();
+                check.acknowledged = scan.acknowledged.clone();
             }
             (Some(check), folder.scan)
         }
@@ -819,6 +828,7 @@ fn compute(config: &Config, inputs: &Inputs, dat: Option<&Dat>) -> Planned {
             items,
             removals,
             blockers,
+            cleanup: None,
         },
         previous,
         changes,
@@ -1261,6 +1271,14 @@ impl Store {
         Ok(planned)
     }
 
+    /// Computes again the plan whose content is `content`, a cleanup or a build, as it would be now.
+    pub(super) fn recompute(&self, config: &Config, content: &PlanContent) -> Result<Planned> {
+        match &content.cleanup {
+            Some(cleanup) => self.compute_cleanup(config, content.folder, &cleanup.choices),
+            None => self.compute_plan(config, content.folder, content.selection, &content.choices),
+        }
+    }
+
     /// Plans building `selection` into Managed Folder `folder`, and stores the plan for review.
     pub fn plan_build(&self, config: &Config, folder: i64, selection: i64) -> Result<Plan> {
         self.plan_build_with(config, folder, &PlanBuild::new(selection))
@@ -1334,8 +1352,7 @@ impl Store {
             )));
         }
         let content = &plan.content;
-        let again =
-            self.compute_plan(config, content.folder, content.selection, &content.choices)?;
+        let again = self.recompute(config, content)?;
         if digest(&again.content) != plan.digest {
             let newer = self.write(|tx| insert_plan(tx, &again, None))?;
             return Err(Error::Conflict(format!(
@@ -1414,20 +1431,21 @@ impl Store {
             let kept = content
                 .items
                 .iter()
-                .filter_map(|i| i.keep.as_ref())
-                .chain(content.removals.iter().filter_map(|r| r.keep.as_ref()));
-            for keep in kept {
+                .filter_map(|i| i.keep.as_ref().map(|k| &k.name))
+                .chain(content.removals.iter().filter_map(|r| r.keep.as_ref().map(|k| &k.name)))
+                .chain(content.cleanup.iter().flat_map(|c| c.repacks.iter().map(|r| &r.target)));
+            for name in kept {
                 tx.execute(
                     "INSERT OR IGNORE INTO selection_citations (selection_id, cited_by)
                      SELECT f.selection_id, ?3 FROM built_files f JOIN selections s ON s.id = f.selection_id
                      WHERE f.folder_id = ?1 AND f.target = ?2 AND s.pruned_at IS NULL",
-                    params![content.folder, keep.name, hold],
+                    params![content.folder, name, hold],
                 )?;
                 tx.execute(
                     "INSERT OR IGNORE INTO audit_citations (audit_id, cited_by)
                      SELECT f.audit_id, ?3 FROM built_files f JOIN audits a ON a.id = f.audit_id
                      WHERE f.folder_id = ?1 AND f.target = ?2 AND a.pruned_at IS NULL",
-                    params![content.folder, keep.name, hold],
+                    params![content.folder, name, hold],
                 )?;
             }
             job_by_id(tx, job)

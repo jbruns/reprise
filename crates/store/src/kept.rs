@@ -389,9 +389,26 @@ pub(super) fn open_retention(
 /// Whether `name` in `dir` is, without following a symlink, the regular file `id` with `file`'s size and
 /// modification time.
 fn is_kept_file(dir: &FolderDir, name: &str, id: Identity, file: Option<&FileStat>) -> bool {
+    is_kept_entry(dir, name, id, file, false)
+}
+
+/// Whether `name` in `dir` is, without following a symlink, the regular file, or with `directory` the directory,
+/// `id` with `file`'s size and modification time.
+pub(super) fn is_kept_entry(
+    dir: &FolderDir,
+    name: &str,
+    id: Identity,
+    file: Option<&FileStat>,
+    directory: bool,
+) -> bool {
+    let kind = if directory {
+        FileType::Directory
+    } else {
+        FileType::RegularFile
+    };
     matches!(
         dir.stat(name),
-        Ok(Some(st)) if FolderDir::kind(&st) == FileType::RegularFile
+        Ok(Some(st)) if FolderDir::kind(&st) == kind
             && Identity::of(&st) == id
             && file.is_none_or(|f| *f == file_stat(&st))
     )
@@ -436,7 +453,8 @@ pub(super) fn settle_kept(tx: &Transaction, id: i64) -> Result<()> {
         params![folder, name],
     )?;
     tx.execute(
-        "UPDATE build_items SET state = 'applied', error = NULL WHERE build_id = ?1 AND seq = ?2 AND kind = 'remove'",
+        "UPDATE build_items SET state = 'applied', error = NULL
+         WHERE build_id = ?1 AND seq = ?2 AND kind IN ('remove', 'keep_aside')",
         params![build, seq],
     )?;
     Ok(())
@@ -455,39 +473,48 @@ impl Store {
     ) -> Result<std::result::Result<i64, String>> {
         let name = k.keep.name.as_str();
         let id = Identity::from(k.keep.identity);
+        let directory = k.keep.directory;
         let left = |why: &str| {
             Ok(Err(format!(
                 "{name} was not kept aside: {why}; it was left as it is"
             )))
         };
-        if !is_kept_file(dir, name, id, Some(&k.keep.file)) {
+        if !is_kept_entry(dir, name, id, Some(&k.keep.file), directory) {
             return left("it changed since you approved the plan");
         }
-        let file = match dir.open_file(name) {
-            Ok(file) => file,
-            Err(e) => return left(&e.to_string()),
+        // A directory is moved whole, by identity, and never read.
+        let sha256 = if directory {
+            None
+        } else {
+            let file = match dir.open_file(name) {
+                Ok(file) => file,
+                Err(e) => return left(&e.to_string()),
+            };
+            let same =
+                |st: &rustix::fs::Stat| Identity::of(st) == id && file_stat(st) == k.keep.file;
+            match rustix::fs::fstat(&file) {
+                Ok(st) if same(&st) => {}
+                _ => return left("it changed while it was read"),
+            }
+            let (sha256, _) = match sha256_of(&file) {
+                Ok(read) => read,
+                Err(e) => return left(&e.to_string()),
+            };
+            match rustix::fs::fstat(&file) {
+                Ok(st) if same(&st) && is_kept_file(dir, name, id, Some(&k.keep.file)) => {}
+                _ => return left("it changed while it was read"),
+            }
+            drop(file);
+            if k.keep.sha256.as_ref().is_some_and(|s| *s != sha256) {
+                return left("it is not the file the plan was made with");
+            }
+            Some(sha256)
         };
-        let same = |st: &rustix::fs::Stat| Identity::of(st) == id && file_stat(st) == k.keep.file;
-        match rustix::fs::fstat(&file) {
-            Ok(st) if same(&st) => {}
-            _ => return left("it changed while it was read"),
-        }
-        let (sha256, size) = match sha256_of(&file) {
-            Ok(read) => read,
-            Err(e) => return left(&e.to_string()),
-        };
-        match rustix::fs::fstat(&file) {
-            Ok(st) if same(&st) && is_kept_file(dir, name, id, Some(&k.keep.file)) => {}
-            _ => return left("it changed while it was read"),
-        }
-        drop(file);
-        if k.keep.sha256.as_ref().is_some_and(|s| *s != sha256) {
-            return left("it is not the file the plan was made with");
-        }
+        let size = k.keep.file.size;
         let taken: BTreeSet<String> = self.read(|c| {
             let mut stmt = c.prepare(
                 "SELECT kept_name FROM kept_files WHERE folder_id = ?1 AND generation = ?2
-                 AND state IN ('keeping', 'kept', 'deleting')",
+                 AND state IN ('keeping', 'kept', 'deleting', 'restoring')",
             )?;
             let rows = stmt.query_map(params![k.folder, k.generation as i64], |r| r.get(0))?;
             Ok(rows.collect::<Result<_, _>>()?)
@@ -506,10 +533,11 @@ impl Store {
             tx.execute(
                 "INSERT INTO kept_files (folder_id, build_id, seq, generation, name, kept_name, reason, built_by, game,
                                          roms, selection_id, audit_id, dat_revision_id, sha256, size, mtime_ns, dev,
-                                         ino, state, created_at)
+                                         ino, state, created_at, directory)
                  SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, f.build_id, f.game, f.roms, f.selection_id, f.audit_id,
-                        f.dat_revision_id, ?8, ?9, ?10, ?11, ?12, 'keeping', ?13
-                 FROM (SELECT 1) LEFT JOIN built_files f ON f.folder_id = ?1 AND f.target = ?5 AND ?7 <> 'conflict'",
+                        f.dat_revision_id, ?8, ?9, ?10, ?11, ?12, 'keeping', ?13, ?14
+                 FROM (SELECT 1) LEFT JOIN built_files f ON f.folder_id = ?1 AND f.target = ?5
+                     AND ?7 IN ('removal', 'replacement', 'repack')",
                 params![
                     k.folder,
                     k.build,
@@ -523,7 +551,8 @@ impl Store {
                     k.keep.file.mtime_ns as i64,
                     dev,
                     ino,
-                    now()
+                    now(),
+                    directory
                 ],
             )?;
             Ok(tx.last_insert_rowid())
@@ -536,7 +565,7 @@ impl Store {
             })?;
             Ok(Err(why))
         };
-        if !is_kept_file(dir, name, id, Some(&k.keep.file)) {
+        if !is_kept_entry(dir, name, id, Some(&k.keep.file), directory) {
             return forget(format!(
                 "{name} was not kept aside: it changed while it was read; it was left as it is"
             ));
@@ -552,13 +581,14 @@ impl Store {
                 }
             };
         }
+        self.fault_point(Fault::KeptUnsynced(k.seq));
         retention
             .generation
             .sync()
             .and_then(|()| dir.sync())
             .map_err(|e| Error::Io(e.to_string()))?;
         self.fault_point(Fault::AfterKeep(k.seq));
-        if !is_kept_file(&retention.generation, &kept, id, None) {
+        if !is_kept_entry(&retention.generation, &kept, id, None, directory) {
             let error = format!(
                 "{}/{kept} is not the file moved there; it was left as it is",
                 retention.generation.path().display()
@@ -585,10 +615,10 @@ impl Store {
         folder: i64,
         build: i64,
     ) -> Result<std::result::Result<(), String>> {
-        type Row = (i64, i64, u64, String, String, Identity);
+        type Row = (i64, i64, u64, String, String, Identity, bool);
         let keeping: Vec<Row> = self.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, seq, generation, name, kept_name, dev, ino FROM kept_files
+                "SELECT id, seq, generation, name, kept_name, dev, ino, directory FROM kept_files
                  WHERE build_id = ?1 AND state = 'keeping' ORDER BY id",
             )?;
             let rows = stmt.query_map([build], |r| {
@@ -599,19 +629,26 @@ impl Store {
                     r.get(3)?,
                     r.get(4)?,
                     Identity::from_sql(r.get(5)?, r.get(6)?),
+                    r.get(7)?,
                 ))
             })?;
             Ok(rows.collect::<Result<_, _>>()?)
         })?;
-        for (id, seq, generation, name, kept, identity) in keeping {
+        for (id, seq, generation, name, kept, identity, directory) in keeping {
             let retention = match open_retention(self, folder, dir, generation, false)? {
                 Ok(retention) => retention,
                 Err(reason) => return Ok(Err(reason)),
             };
             let moved = retention
                 .as_ref()
-                .is_some_and(|r| is_kept_file(&r.generation, &kept, identity, None));
-            let in_place = is_kept_file(dir, &name, identity, None);
+                .is_some_and(|r| is_kept_entry(&r.generation, &kept, identity, None, directory));
+            let in_place = is_kept_entry(dir, &name, identity, None, directory);
+            // The move is recorded only once it is durable: the build may have stopped before it synced either folder.
+            if let (true, Some(r)) = (moved, &retention)
+                && let Err(e) = r.generation.sync().and_then(|()| dir.sync())
+            {
+                return Ok(Err(e.to_string()));
+            }
             self.write(|tx| {
                 let note = |state: &str, error: String| {
                     tx.execute(
@@ -681,12 +718,21 @@ impl Store {
         self.write(|tx| {
             folder_by_id(tx, folder)?;
             let kept = kept_where(tx, "k.folder_id = ?1 AND k.state = 'kept'", [folder])?;
+            // A kept directory is never deleted: what is in it was never read, so nothing could show it is still
+            // what was kept.
             let files: Vec<KeptFile> = if request.all {
-                kept
+                kept.into_iter().filter(|k| !k.directory).collect()
             } else {
                 let mut files = Vec::new();
                 for id in request.ids.iter().collect::<BTreeSet<_>>() {
                     match kept.iter().find(|k| k.id == *id) {
+                        Some(k) if k.directory => {
+                            return Err(Error::Refused(format!(
+                                "kept file {id} ({}) is a folder, which Title Select does not delete; put it back with \
+                                 a cleanup and remove it yourself if you no longer want it",
+                                k.name
+                            )));
+                        }
                         Some(k) => files.push(k.clone()),
                         None => {
                             return Err(Error::Refused(format!(
@@ -1370,7 +1416,7 @@ fn deleted(tx: &Transaction, id: i64) -> Result<()> {
 }
 
 /// Drops what kept file `id` cited, so that pruning no longer holds it.
-fn drop_citations(tx: &Transaction, id: i64) -> Result<()> {
+pub(super) fn drop_citations(tx: &Transaction, id: i64) -> Result<()> {
     let key = cited_by(id);
     tx.execute(
         "DELETE FROM selection_citations WHERE cited_by = ?1",
@@ -1407,17 +1453,18 @@ fn kept_from_row(r: &Row) -> rusqlite::Result<KeptFile> {
         },
         identity: Identity::from_sql(r.get(12)?, r.get(13)?).into(),
         kept_at: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
+        directory: r.get(15)?,
     })
 }
 
-fn kept_where(
+pub(super) fn kept_where(
     c: &Connection,
     condition: &str,
     params: impl rusqlite::Params,
 ) -> Result<Vec<KeptFile>> {
     let mut stmt = c.prepare(&format!(
         "SELECT k.id, k.folder_id, k.generation, k.name, k.kept_name, k.reason, k.build_id, k.built_by, k.game,
-                k.sha256, k.size, k.mtime_ns, k.dev, k.ino, k.kept_at
+                k.sha256, k.size, k.mtime_ns, k.dev, k.ino, k.kept_at, k.directory
          FROM kept_files k WHERE {condition} ORDER BY k.generation DESC, k.id"
     ))?;
     let rows = stmt.query_map(params, kept_from_row)?;

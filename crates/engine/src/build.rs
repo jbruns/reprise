@@ -80,6 +80,28 @@ pub fn repack(dest: &File, roms: &[(&ExpectedRom, Source)]) -> Result<(), String
     file.sync_all().map_err(|e| e.to_string())
 }
 
+/// Writes `roms` to `dest` as a TorrentZip, each read from the member of the same name in the ZIP `source`, an open
+/// file read from its start.
+pub fn repack_from(dest: &File, roms: &[ExpectedRom], source: &File) -> Result<(), String> {
+    let mut order: Vec<_> = roms.iter().collect();
+    order.sort_by(|a, b| compare_names(&a.name, &b.name));
+    let mut reader = BufReader::new(source);
+    reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(reader).map_err(|e| e.to_string())?;
+    let mut writer = Writer::new(BufWriter::new(dest)).map_err(|e| e.to_string())?;
+    for rom in order {
+        let mut payload = archive
+            .by_name(&rom.name)
+            .map_err(|e| format!("{}: {e}", rom.name))?;
+        writer
+            .add(&rom.name, rom.size, &mut payload)
+            .map_err(|e| format!("{}: {e}", rom.name))?;
+    }
+    let out = writer.finish().map_err(|e| e.to_string())?;
+    let file = out.into_inner().map_err(|e| e.error().to_string())?;
+    file.sync_all().map_err(|e| e.to_string())
+}
+
 /// Checks that `file`, read from its start, is valid TorrentZip whose members are exactly `roms`, under their names,
 /// and that each member's payload, decompressed and hashed again, is the one its ROM expects.
 pub fn verify(file: &File, roms: &[ExpectedRom]) -> Result<(), String> {

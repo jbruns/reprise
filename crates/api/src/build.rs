@@ -1,5 +1,7 @@
 //! Managed Folders, the Change Plans that build a Selection into one, and the Builds that carry them out.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::report::{EvidenceLevel, Finding};
@@ -180,10 +182,16 @@ pub enum ItemKind {
     /// Never a plan item: a Build's item that removes a built file whose game is no longer selected, one of the
     /// plan's removals.
     Remove,
+    /// Never a plan item: a cleanup's item that keeps aside an entry Title Select did not build.
+    KeepAside,
+    /// Never a plan item: a cleanup's item that acknowledges an entry Title Select did not build, leaving it.
+    Acknowledge,
+    /// Never a plan item: a cleanup's item that puts a kept file back in the folder.
+    Restore,
 }
 
 impl ItemKind {
-    pub const ALL: [ItemKind; 9] = [
+    pub const ALL: [ItemKind; 12] = [
         ItemKind::Copy,
         ItemKind::Repack,
         ItemKind::Adopt,
@@ -193,6 +201,9 @@ impl ItemKind {
         ItemKind::Unresolved,
         ItemKind::Blocked,
         ItemKind::Remove,
+        ItemKind::KeepAside,
+        ItemKind::Acknowledge,
+        ItemKind::Restore,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -206,6 +217,9 @@ impl ItemKind {
             ItemKind::Adopt => "adopt",
             ItemKind::Unresolved => "unresolved",
             ItemKind::Remove => "remove",
+            ItemKind::KeepAside => "keep_aside",
+            ItemKind::Acknowledge => "acknowledge",
+            ItemKind::Restore => "restore",
         }
     }
 
@@ -251,6 +265,10 @@ pub enum KeepReason {
     Replacement,
     /// A file in conflict at a selected game's target that you chose to keep aside and rebuild.
     Conflict,
+    /// An entry Title Select did not build that you chose to keep aside in a cleanup.
+    Drift,
+    /// A built file that was not TorrentZip, kept as it was when a cleanup repacked it.
+    Repack,
 }
 
 impl KeepReason {
@@ -259,6 +277,8 @@ impl KeepReason {
             KeepReason::Removal => "removal",
             KeepReason::Replacement => "replacement",
             KeepReason::Conflict => "conflict",
+            KeepReason::Drift => "drift",
+            KeepReason::Repack => "repack",
         }
     }
 
@@ -267,6 +287,8 @@ impl KeepReason {
             KeepReason::Removal,
             KeepReason::Replacement,
             KeepReason::Conflict,
+            KeepReason::Drift,
+            KeepReason::Repack,
         ]
         .into_iter()
         .find(|k| k.as_str() == s)
@@ -285,6 +307,9 @@ pub struct KeepAside {
     /// Its SHA-256, when the store recorded it or the plan's check read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// Whether it is a directory, moved whole and never read.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub directory: bool,
 }
 
 /// What a plan does with a built file whose game is no longer selected.
@@ -389,6 +414,8 @@ pub enum BlockerKind {
     /// An earlier build stopped and its folder has not been cleaned up since, or the folder holds leftovers no
     /// build of this store accounts for.
     Recovery,
+    /// A cleanup action you chose cannot be carried out as the folder is now.
+    Cleanup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -422,6 +449,9 @@ pub struct PlanContent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removals: Vec<PlanRemoval>,
     pub blockers: Vec<Blocker>,
+    /// For a cleanup of the folder's drift, rather than a build: what it does. A cleanup has no items or removals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<Cleanup>,
 }
 
 impl PlanChoices {
@@ -472,6 +502,12 @@ pub struct PlanSummary {
     /// Built files no longer selected, whether kept aside, forgotten or left.
     #[serde(default)]
     pub remove: u64,
+    /// A cleanup's entries acknowledged.
+    #[serde(default)]
+    pub acknowledge: u64,
+    /// A cleanup's kept files put back.
+    #[serde(default)]
+    pub restore: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -521,6 +557,9 @@ impl PlanContent {
                 ItemKind::Adopt => &mut s.adopt,
                 ItemKind::Unresolved => &mut s.unresolved,
                 ItemKind::Remove => &mut s.remove,
+                ItemKind::KeepAside => &mut s.keep,
+                ItemKind::Acknowledge => &mut s.acknowledge,
+                ItemKind::Restore => &mut s.restore,
             } += 1;
             if item.keep.is_some() {
                 s.keep += 1;
@@ -532,6 +571,24 @@ impl PlanContent {
             .iter()
             .filter(|r| r.kind == RemovalKind::Keep)
             .count() as u64;
+        if let Some(cleanup) = &self.cleanup {
+            for entry in &cleanup.entries {
+                match entry.action {
+                    Some(CleanupAction::KeepAside) => s.keep += 1,
+                    Some(CleanupAction::Adopt) => s.adopt += 1,
+                    Some(CleanupAction::Acknowledge) => s.acknowledge += 1,
+                    None => {}
+                }
+            }
+            for restore in &cleanup.restores {
+                match restore.kind {
+                    RestoreKind::Adopt => s.adopt += 1,
+                    RestoreKind::Restore | RestoreKind::PutBack => s.restore += 1,
+                }
+            }
+            s.repack += cleanup.repacks.len() as u64;
+            s.keep += cleanup.repacks.len() as u64;
+        }
         s
     }
 }
@@ -906,6 +963,9 @@ pub struct CheckSummary {
     pub hashed: u64,
     /// Entries Title Select did not build.
     pub drift: u64,
+    /// Entries Title Select did not build that you acknowledged, unchanged since; not counted as drift.
+    #[serde(default)]
+    pub acknowledged: u64,
 }
 
 /// A read-only check of a Managed Folder against the store's record of it.
@@ -923,6 +983,9 @@ pub struct FolderCheck {
     pub dat_revision: Option<String>,
     pub files: Vec<CheckedFile>,
     pub drift: Vec<DriftEntry>,
+    /// The entries you acknowledged, unchanged since, which are not drift.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acknowledged: Vec<DriftEntry>,
 }
 
 /// A kept file: a file a Build moved out of its Managed Folder into the folder's retention area.
@@ -945,10 +1008,153 @@ pub struct KeptFile {
     /// The DAT's game it was built for, when Title Select built it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub game: Option<String>,
-    pub sha256: String,
+    /// Its SHA-256; none for a directory, which is never read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     pub file: FileStat,
     pub identity: FileIdentity,
     pub kept_at: String,
+    /// Whether it is a directory, kept aside whole.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub directory: bool,
+}
+
+/// What a cleanup does with an entry Title Select did not build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupAction {
+    /// Move it, whole, into the folder's retention area as a kept file.
+    KeepAside,
+    /// Record it as built: only a file that holds exactly a selected game's ROMs, renamed to that game's file name
+    /// when it is not already, and never over anything.
+    Adopt,
+    /// Leave it, and stop reporting it as drift until it changes.
+    Acknowledge,
+}
+
+impl CleanupAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CleanupAction::KeepAside => "keep_aside",
+            CleanupAction::Adopt => "adopt",
+            CleanupAction::Acknowledge => "acknowledge",
+        }
+    }
+}
+
+/// The request to plan a cleanup of a Managed Folder's drift: an action for each entry you chose, the kept files to
+/// put back, and the built files to repack as TorrentZip. Anything not named is left as it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanCleanup {
+    /// Entries Title Select did not build, by name, and what to do with each.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub entries: BTreeMap<String, CleanupAction>,
+    /// Kept files to put back, by id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restore: Vec<i64>,
+    /// Built files that are not TorrentZip to repack, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repack: Vec<String>,
+}
+
+impl PlanCleanup {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.restore.is_empty() && self.repack.is_empty()
+    }
+}
+
+/// An entry Title Select did not build, as a cleanup found it, and what it does with it. A cleanup lists every such
+/// entry, chosen or not, so that its digest binds the folder as it was planned against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupEntry {
+    pub name: String,
+    pub kind: DriftKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game: Option<String>,
+    pub file: FileStat,
+    pub identity: FileIdentity,
+    /// Its SHA-256, when a check read it; never for a directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<CleanupAction>,
+    /// For an adoption: the name it is recorded under, the game's file name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// For an adoption: the ROMs the DAT expects in it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roms: Vec<ExpectedRom>,
+    /// Whether the check found it was not TorrentZip, for an adoption.
+    #[serde(default = "yes")]
+    pub torrentzip: bool,
+}
+
+/// How a cleanup puts a kept file back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreKind {
+    /// Back under its own name, which is a selected game's file name, recorded as built.
+    Restore,
+    /// Under the file name of the selected game it holds, recorded as built: its own name is taken, or is not that
+    /// game's.
+    Adopt,
+    /// Back under its own name, as an entry Title Select did not build: it holds no selected game.
+    PutBack,
+}
+
+/// A kept file a cleanup puts back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupRestore {
+    pub kept: KeptFile,
+    pub kind: RestoreKind,
+    /// The name it is put back under.
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roms: Vec<ExpectedRom>,
+    #[serde(default = "yes")]
+    pub torrentzip: bool,
+}
+
+/// A built file a cleanup rewrites as TorrentZip from its own contents, keeping the file as it was aside.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupRepack {
+    pub target: String,
+    pub game: String,
+    pub roms: Vec<ExpectedRom>,
+    /// Where the file was built from, which its record keeps once it is repacked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<PlanSource>,
+    pub file: FileStat,
+    pub identity: FileIdentity,
+    pub sha256: String,
+}
+
+/// What a cleanup of a Managed Folder's drift does, against the folder's current Build `build`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cleanup {
+    pub build: i64,
+    pub choices: PlanCleanup,
+    pub entries: Vec<CleanupEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restores: Vec<CleanupRestore>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repacks: Vec<CleanupRepack>,
+}
+
+impl Cleanup {
+    /// Whether it moves or writes anything in the folder, rather than only acknowledging entries.
+    pub fn changes_folder(&self) -> bool {
+        !self.restores.is_empty()
+            || !self.repacks.is_empty()
+            || self.entries.iter().any(|e| {
+                matches!(
+                    e.action,
+                    Some(CleanupAction::KeepAside | CleanupAction::Adopt)
+                )
+            })
+    }
 }
 
 /// The request to plan deleting kept files of a Managed Folder.

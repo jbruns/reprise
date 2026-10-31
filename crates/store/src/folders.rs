@@ -196,7 +196,7 @@ fn unfinished(c: &Connection, row: &FolderRow) -> Result<Option<UnfinishedBuild>
                 (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'applied'),
                 (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'uncertain'),
                 (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state IN ('pending', 'failed')),
-                (SELECT count(*) FROM kept_files k WHERE k.build_id = b.id AND k.state IN ('kept', 'deleting', 'quarantined', 'deleted', 'gone'))
+                (SELECT count(*) FROM kept_files k WHERE k.build_id = b.id AND k.state IN ('kept', 'deleting', 'quarantined', 'deleted', 'gone', 'restoring', 'restored'))
          FROM builds b
          WHERE b.folder_id = ?1 AND b.state IN ('failed', 'interrupted')
            AND NOT EXISTS (SELECT 1 FROM builds s WHERE s.folder_id = ?1 AND s.id > b.id AND s.state = 'succeeded')
@@ -215,6 +215,21 @@ fn unfinished(c: &Connection, row: &FolderRow) -> Result<Option<UnfinishedBuild>
         },
     )
     .optional()?)
+}
+
+/// The plan of Build `build` that built its files: its own, or, for a cleanup, that of the Build it cleaned up after.
+pub(super) fn build_plan(c: &Connection, mut build: i64) -> Result<PlanContent> {
+    loop {
+        let content: PlanContent = c.query_row(
+            "SELECT p.content FROM builds b JOIN plans p ON p.id = b.plan_id WHERE b.id = ?1",
+            [build],
+            |r| json(r, 0),
+        )?;
+        match &content.cleanup {
+            Some(cleanup) => build = cleanup.build,
+            None => return Ok(content),
+        }
+    }
 }
 
 /// What the folder lacks of its current Build's Selection: what the Build recorded, and the conflicts and missing
@@ -245,11 +260,7 @@ pub(super) fn incomplete(c: &Connection, row: &FolderRow) -> Result<Incomplete> 
     if let Some(check) = latest_check(c, row.id)?
         .filter(|check| check.generation == row.generation && check.summary.marker.is_none())
     {
-        let content: PlanContent = c.query_row(
-            "SELECT p.content FROM builds b JOIN plans p ON p.id = b.plan_id WHERE b.id = ?1",
-            [build],
-            |r| json(r, 0),
-        )?;
+        let content = build_plan(c, build)?;
         let group_of = |target: &str| {
             content
                 .items

@@ -112,6 +112,17 @@ pub enum Fault {
     /// After the file of the item with this sequence number is moved into the retention area, before the store
     /// records it kept.
     AfterKeep(i64),
+    /// After the file of the item with this sequence number is moved into the retention area, before either folder is
+    /// synced.
+    KeptUnsynced(i64),
+    /// After the intent to move the entry of a cleanup's item with this sequence number is committed, before it is
+    /// renamed.
+    BeforeMove(i64),
+    /// After the entry of a cleanup's item with this sequence number is renamed, before either folder is synced.
+    AfterMove(i64),
+    /// After the entry of a cleanup's item with this sequence number is renamed and both folders are synced, before
+    /// the store records it moved.
+    MoveSynced(i64),
     /// After a folder Title Select is creating in a Managed Folder is made under its temporary name, before it is
     /// opened and checked.
     MadeDir,
