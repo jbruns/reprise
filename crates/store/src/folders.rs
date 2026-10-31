@@ -1,18 +1,22 @@
 //! Managed Folders: folders in writable Roots that Builds write a Source Set's Selections into, each holding one
 //! marker that ties it to this store.
 
+use std::cmp::Ordering;
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use title_select_api::build::{
-    AddManagedFolder, BuildState, BuildSummary, ChangeManagedFolder, MARKER, ManagedFolder, Marker,
-    PlanContent, STAGING,
+    AddManagedFolder, BuildState, BuildSummary, ChangeManagedFolder, FileOutcome, Incomplete,
+    IncompleteItem, IncompleteReason, MARKER, ManagedFolder, Marker, PlanContent, RETENTION,
+    STAGING, UnfinishedBuild,
 };
 use title_select_api::paths::{PathTemplate, TokenValues, relative_path};
 
+use super::checks::{latest_check, latest_summary, selected_targets};
 use super::dats::split_dat;
 use super::folder_dir::{FolderDir, Identity};
+use super::plans::json;
 use super::profiles::profile_id;
 use super::sets::{resolve, set_by_id, set_by_name};
 use super::{Error, Result, Store, io_error, now};
@@ -39,11 +43,13 @@ pub(super) struct FolderRow {
     pub latest_plan: Option<i64>,
 }
 
-const FOLDER_QUERY: &str = "SELECT f.id, f.root, f.path, s.id, s.name, d.id, d.provider || '/' || d.name, p.id,
+const FOLDER_QUERY: &str =
+    "SELECT f.id, f.root, f.path, s.id, s.name, d.id, d.provider || '/' || d.name, p.id,
             p.name, f.generation, f.current_build_id, f.created_at,
             (SELECT count(*) FROM built_files b WHERE b.folder_id = f.id),
             (SELECT max(j.id) FROM jobs j
-             WHERE j.managed_folder_id = f.id AND j.kind = 'build' AND j.state IN ('queued', 'running')),
+             WHERE j.managed_folder_id = f.id AND j.kind IN ('build', 'check')
+               AND j.state IN ('queued', 'running')),
             (SELECT max(pl.id) FROM plans pl WHERE pl.folder_id = f.id)
      FROM managed_folders f
      JOIN source_sets s ON s.id = f.source_set_id
@@ -95,7 +101,8 @@ const BUILD_QUERY: &str =
             (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'applied'),
             (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'failed'),
             (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'pending'),
-            p.content
+            p.content,
+            (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'uncertain')
      FROM builds b
      JOIN dat_revisions r ON r.id = b.dat_revision_id
      JOIN plans p ON p.id = b.plan_id";
@@ -127,6 +134,7 @@ fn build_from_row(r: &Row) -> rusqlite::Result<BuildSummary> {
         applied: r.get::<_, i64>(11)? as u64,
         failed: r.get::<_, i64>(12)? as u64,
         pending: r.get::<_, i64>(13)? as u64,
+        uncertain: r.get::<_, i64>(15)? as u64,
         planned: content.summary(),
     })
 }
@@ -158,6 +166,8 @@ fn record(c: &Connection, config: &Config, row: FolderRow) -> Result<ManagedFold
         Some(id) => Some(build_by_id(c, id)?),
         None => None,
     };
+    let incomplete = Some(incomplete(c, &row)?.counts).filter(|counts| counts.total() > 0);
+    let unfinished = unfinished(c, &row)?;
     Ok(ManagedFolder {
         id: row.id,
         writable: config.root(&row.root).is_some_and(|r| r.writable),
@@ -172,7 +182,129 @@ fn record(c: &Connection, config: &Config, row: FolderRow) -> Result<ManagedFold
         files: row.files,
         active_job: row.active_job,
         latest_plan: row.latest_plan,
+        incomplete,
+        unfinished,
+        check: latest_summary(c, row.id)?,
     })
+}
+
+/// The folder's latest Build that stopped before it finished, unless a Build has succeeded since. Whether it is the
+/// folder's current Build does not matter: one stopped after it advanced the generation still did not finish.
+fn unfinished(c: &Connection, row: &FolderRow) -> Result<Option<UnfinishedBuild>> {
+    Ok(c.query_row(
+        "SELECT b.id, b.state,
+                (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'applied'),
+                (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'uncertain'),
+                (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state IN ('pending', 'failed'))
+         FROM builds b
+         WHERE b.folder_id = ?1 AND b.state IN ('failed', 'interrupted')
+           AND NOT EXISTS (SELECT 1 FROM builds s WHERE s.folder_id = ?1 AND s.id > b.id AND s.state = 'succeeded')
+         ORDER BY b.id DESC LIMIT 1",
+        params![row.id],
+        |r| {
+            let state: String = r.get(1)?;
+            Ok(UnfinishedBuild {
+                build: r.get(0)?,
+                state: BuildState::parse(&state).unwrap_or(BuildState::Interrupted),
+                applied: r.get::<_, i64>(2)? as u64,
+                uncertain: r.get::<_, i64>(3)? as u64,
+                not_written: r.get::<_, i64>(4)? as u64,
+            })
+        },
+    )
+    .optional()?)
+}
+
+/// What the folder lacks of its current Build's Selection: what the Build recorded, and the conflicts and missing
+/// files a check found since at that Selection's targets, each target once. Which targets are selected comes from
+/// the Build's Selection, never from the check, which may have been made for another Selection's plan.
+pub(super) fn incomplete(c: &Connection, row: &FolderRow) -> Result<Incomplete> {
+    let mut out = Incomplete {
+        build: row.current_build,
+        ..Incomplete::default()
+    };
+    let Some(build) = row.current_build else {
+        return Ok(out);
+    };
+    let mut stmt = c.prepare(
+        "SELECT reason, grp, game, target, detail FROM build_incomplete WHERE build_id = ?1 ORDER BY seq",
+    )?;
+    let rows = stmt.query_map([build], |r| {
+        let reason: String = r.get(0)?;
+        Ok(IncompleteItem {
+            reason: IncompleteReason::parse(&reason).unwrap_or(IncompleteReason::Failed),
+            group: r.get(1)?,
+            game: r.get(2)?,
+            target: r.get(3)?,
+            detail: r.get(4)?,
+        })
+    })?;
+    out.items = rows.collect::<Result<_, _>>()?;
+    if let Some(check) = latest_check(c, row.id)?
+        .filter(|check| check.generation == row.generation && check.summary.marker.is_none())
+    {
+        let content: PlanContent = c.query_row(
+            "SELECT p.content FROM builds b JOIN plans p ON p.id = b.plan_id WHERE b.id = ?1",
+            [build],
+            |r| json(r, 0),
+        )?;
+        let group_of = |target: &str| {
+            content
+                .items
+                .iter()
+                .find(|i| i.target.eq_ignore_ascii_case(target))
+                .map(|i| (i.group.clone(), i.game.clone()))
+        };
+        let selection: i64 = c.query_row(
+            "SELECT selection_id FROM builds WHERE id = ?1",
+            [build],
+            |r| r.get(0),
+        )?;
+        let selected = selected_targets(c, selection)?;
+        let is_selected = |target: &str| selected.contains_key(&target.to_lowercase());
+        let mut found = Vec::new();
+        for f in check.files.iter().filter(|f| is_selected(&f.target)) {
+            let reason = match f.outcome {
+                FileOutcome::Conflict | FileOutcome::Unreadable => IncompleteReason::Conflict,
+                FileOutcome::Missing => IncompleteReason::Missing,
+                _ => continue,
+            };
+            found.push((reason, f.target.clone(), f.detail.clone()));
+        }
+        for d in check.drift.iter().filter(|d| is_selected(&d.name)) {
+            found.push((
+                IncompleteReason::Conflict,
+                d.name.clone(),
+                Some(format!(
+                    "{} is in the folder and was not built by Title Select",
+                    d.name
+                )),
+            ));
+        }
+        for (reason, target, detail) in found {
+            if out
+                .items
+                .iter()
+                .any(|i| i.target.eq_ignore_ascii_case(&target))
+            {
+                continue;
+            }
+            let Some((group, game)) = group_of(&target) else {
+                continue;
+            };
+            out.items.push(IncompleteItem {
+                reason,
+                group,
+                game,
+                target,
+                detail,
+            });
+        }
+    }
+    for item in &out.items {
+        out.counts.add(item.reason);
+    }
+    Ok(out)
 }
 
 /// Opens the Managed Folder `rel` in the Root `root`, no component of `rel` followed if it is a symlink. The error
@@ -214,7 +346,7 @@ const MARKER_LIMIT: u64 = 64 << 10;
 
 /// Whether `name` is one of the files Title Select keeps in a Managed Folder for itself.
 pub(super) fn is_own(name: &str) -> bool {
-    name == MARKER || name == STAGING || name == MARKER_NEW
+    name == MARKER || name == STAGING || name == MARKER_NEW || name == RETENTION
 }
 
 /// Replaces the folder's marker atomically and durably. The new marker is written to a file created exclusively and
@@ -271,6 +403,50 @@ pub(super) fn read_marker(dir: &FolderDir) -> MarkerState {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(marker) => MarkerState::Present(marker),
             Err(e) => MarkerState::Unreadable(e.to_string()),
+        },
+    }
+}
+
+/// Why the folder's marker, read through `dir`, does not show it is Managed Folder `folder` of store `store` at
+/// `generation`, as a sentence; `None` when it does. `empty` is whether the folder holds nothing but Title Select's
+/// own entries.
+pub(super) fn marker_problem(
+    dir: &FolderDir,
+    store: &str,
+    folder: i64,
+    generation: u64,
+    empty: bool,
+) -> Option<String> {
+    match read_marker(dir) {
+        MarkerState::Absent if empty && generation == 0 => None,
+        MarkerState::Absent if empty => Some(format!(
+            "the folder is empty and has no marker, though {generation} builds went into it; is its share mounted?"
+        )),
+        MarkerState::Absent => Some(
+            "the folder has files but no .title-select marker; is this the right folder, or the right mount?"
+                .to_owned(),
+        ),
+        MarkerState::Unreadable(e) => Some(format!("its .title-select marker cannot be read: {e}")),
+        MarkerState::Present(marker) if marker.store != store => Some(
+            "its .title-select marker is from another store; is this a restored store, or the wrong mount?"
+                .to_owned(),
+        ),
+        MarkerState::Present(marker) if marker.folder != folder => Some(format!(
+            "its .title-select marker is for managed folder {}, not {folder}; is this the right mount?",
+            marker.folder
+        )),
+        MarkerState::Present(marker) => match marker.generation.cmp(&generation) {
+            Ordering::Equal => None,
+            Ordering::Greater => Some(format!(
+                "its marker is at build generation {}, newer than the store's {generation}; was the store restored \
+                 from a backup?",
+                marker.generation
+            )),
+            Ordering::Less => Some(format!(
+                "its marker is at build generation {}, older than the store's {generation}; was the folder restored \
+                 from a backup, or is this the wrong mount?",
+                marker.generation
+            )),
         },
     }
 }
@@ -483,7 +659,7 @@ impl Store {
             let folder = folder_by_id(tx, id)?;
             if let Some(job) = folder.active_job {
                 return Err(Error::Conflict(format!(
-                    "managed folder {id} has a build queued or running: job {job}"
+                    "managed folder {id} has a build or check queued or running: job {job}"
                 )));
             }
             if let Some(name) = &change.source_set {
@@ -523,6 +699,14 @@ impl Store {
 
     pub fn managed_folder(&self, config: &Config, id: i64) -> Result<ManagedFolder> {
         self.read(|c| record(c, config, folder_by_id(c, id)?))
+    }
+
+    /// What Managed Folder `id` lacks of its current Build's Selection, item by item.
+    pub fn incomplete(&self, id: i64) -> Result<Incomplete> {
+        self.read(|c| {
+            let tx = c.unchecked_transaction()?;
+            incomplete(&tx, &folder_by_id(&tx, id)?)
+        })
     }
 
     /// Every Build of the Managed Folder, newest first.

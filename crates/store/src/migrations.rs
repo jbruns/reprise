@@ -13,6 +13,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_jobs.sql"),
     include_str!("migrations/0003_selections.sql"),
     include_str!("migrations/0004_builds.sql"),
+    include_str!("migrations/0005_folder_checks.sql"),
 ];
 
 pub(super) fn migrate(conn: &mut Connection, dir: &Path, migrations: &[&str]) -> Result<()> {

@@ -371,6 +371,8 @@ pub enum JobKind {
     Selection,
     /// Carries out an approved Change Plan into a Managed Folder.
     Build,
+    /// Checks a Managed Folder against the store's record of it, read-only.
+    Check,
 }
 
 impl JobKind {
@@ -379,13 +381,19 @@ impl JobKind {
             JobKind::Audit => "audit",
             JobKind::Selection => "selection",
             JobKind::Build => "build",
+            JobKind::Check => "check",
         }
     }
 
     pub fn parse(s: &str) -> Option<JobKind> {
-        [JobKind::Audit, JobKind::Selection, JobKind::Build]
-            .into_iter()
-            .find(|k| k.as_str() == s)
+        [
+            JobKind::Audit,
+            JobKind::Selection,
+            JobKind::Build,
+            JobKind::Check,
+        ]
+        .into_iter()
+        .find(|k| k.as_str() == s)
     }
 }
 
@@ -420,7 +428,7 @@ pub struct Job {
     /// The Selection a Succeeded Selection Job recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<i64>,
-    /// The Managed Folder a Build Job builds into.
+    /// The Managed Folder a Build Job builds into, or a Check Job checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_folder: Option<i64>,
     /// The approved plan a Build Job carries out.

@@ -80,6 +80,13 @@ impl Identity {
     }
 }
 
+/// A file's status change time in nanoseconds since the Unix epoch: it moves on any change to the file's content or
+/// metadata, and cannot be set back.
+#[allow(clippy::unnecessary_cast)]
+pub(super) fn ctime_ns(st: &Stat) -> i128 {
+    st.st_ctime as i128 * 1_000_000_000 + st.st_ctime_nsec as i128
+}
+
 /// A file's size and modification time, from `lstat`.
 pub(super) fn file_stat(st: &Stat) -> FileStat {
     FileStat {

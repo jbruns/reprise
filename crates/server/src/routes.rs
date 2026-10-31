@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use title_select_api::build::{
     AddManagedFolder, ApprovePlan, BuildDetail, BuildSummary, BuiltFile, ChangeManagedFolder,
-    ManagedFolder, Plan, PlanBuild,
+    FolderCheck, Incomplete, ManagedFolder, Plan, PlanBuild,
 };
 use title_select_api::selection::{Role, SelectionProfile, diff_rows};
 use title_select_api::{
@@ -110,6 +110,9 @@ pub fn router(state: AppState, auth: Arc<Auth>, ui: Option<&std::path::Path>) ->
         .route("/managed-folders/{id}/builds", get(folder_builds))
         .route("/managed-folders/{id}/files", get(built_files))
         .route("/managed-folders/{id}/plans", post(plan_build))
+        .route("/managed-folders/{id}/checks", post(start_check))
+        .route("/managed-folders/{id}/check", get(latest_check))
+        .route("/managed-folders/{id}/incomplete", get(incomplete))
         .route("/plans/{id}", get(plan))
         .route("/plans/{id}/approval", post(approve_plan))
         .route("/builds/{id}", get(build))
@@ -442,8 +445,42 @@ async fn built_files(
     ))
 }
 
-/// Computes and stores a Change Plan for review. Planning reads the store and stats the folder, so it is quick
-/// enough to answer at once.
+/// Queues a read-only Check of the folder. It runs whether or not the client stays connected.
+async fn start_check(
+    State(state): State<AppState>,
+    Extension(Actor(actor)): Extension<Actor>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<(StatusCode, Json<title_select_api::Job>)> {
+    let Path(id) = id?;
+    let job = blocking(&state, move |store| store.enqueue_check(id, &actor)).await?;
+    state.jobs.changed(job.clone());
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+/// The folder's latest check; 404 when it was never checked.
+async fn latest_check(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Json<FolderCheck>> {
+    let Path(id) = id?;
+    let check = blocking(&state, move |store| store.latest_check(id)).await?;
+    check
+        .map(Json)
+        .ok_or_else(|| Error::NotFound(format!("managed folder {id} was never checked")).into())
+}
+
+async fn incomplete(
+    State(state): State<AppState>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Json<Incomplete>> {
+    let Path(id) = id?;
+    Ok(Json(
+        blocking(&state, move |store| store.incomplete(id)).await?,
+    ))
+}
+
+/// Computes and stores a Change Plan for review, with a check of the folder. Planning reads the store, stats the
+/// folder and reads only what changed in it, so it answers at once.
 async fn plan_build(
     State(state): State<AppState>,
     id: Result<Path<i64>, PathRejection>,
@@ -453,7 +490,7 @@ async fn plan_build(
     let Json(request) = body?;
     let config = state.config.clone();
     let plan = blocking(&state, move |store| {
-        store.plan_build(&config, id, request.selection)
+        store.plan_build_with(&config, id, &request)
     })
     .await?;
     Ok((StatusCode::CREATED, Json(plan)))

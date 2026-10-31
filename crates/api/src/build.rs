@@ -9,6 +9,9 @@ use crate::selection::Role;
 pub const MARKER: &str = ".title-select";
 /// The folder, inside a Managed Folder, that a Build stages its files in, so that renames never cross mounts.
 pub const STAGING: &str = ".title-select-staging";
+/// The directory, inside a Managed Folder, where Kept Files will be set aside under `<generation>/` (#37). Reserved
+/// now, so that a check never reports it as Drift.
+pub const RETENTION: &str = ".title-select-retained";
 
 /// What a Managed Folder's marker records. The store stays the source of truth; the marker lets a plan tell its
 /// folder from a folder another store manages, a folder restored from a backup, or a wrong mount.
@@ -46,6 +49,30 @@ pub struct ManagedFolder {
     pub active_job: Option<i64>,
     /// The newest plan made for the folder.
     pub latest_plan: Option<i64>,
+    /// What the folder lacks of its current build's selection, by reason; absent when it lacks nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<IncompleteCounts>,
+    /// The latest build, when it stopped before it finished and no build has succeeded since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unfinished: Option<UnfinishedBuild>,
+    /// The latest check of the folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<CheckSummary>,
+}
+
+/// A build that stopped before it finished, as the store recorded it: shown straight after a restart, without a
+/// rescan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnfinishedBuild {
+    pub build: i64,
+    /// `interrupted` when the service stopped, `failed` when the build stopped itself.
+    pub state: BuildState,
+    /// Files renamed into place.
+    pub applied: u64,
+    /// Files whose target holds something other than what the build wrote.
+    pub uncertain: u64,
+    /// Files the build never reached, or that failed.
+    pub not_written: u64,
 }
 
 /// The request to register a Managed Folder.
@@ -73,10 +100,33 @@ pub struct ChangeManagedFolder {
     pub profile: Option<String>,
 }
 
-/// The request to plan building a Selection into a Managed Folder.
+/// The request to plan building a Selection into a Managed Folder, with your choices.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanBuild {
     pub selection: i64,
+    #[serde(flatten)]
+    pub choices: PlanChoices,
+}
+
+impl PlanBuild {
+    pub fn new(selection: i64) -> PlanBuild {
+        PlanBuild {
+            selection,
+            choices: PlanChoices::default(),
+        }
+    }
+}
+
+/// What you chose for a plan. They are part of its content, and so of the digest you approve.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanChoices {
+    /// Build the resolved groups only, leaving unresolved groups untouched, instead of blocking on them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resolved_only: bool,
+    /// The targets in conflict whose file you adopt: recorded as built, without writing anything. Any other conflict
+    /// is left as it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adopt: Vec<String>,
 }
 
 /// The request to approve a plan: the digest of the plan you reviewed.
@@ -102,15 +152,23 @@ pub enum ItemKind {
     Conflict,
     /// Cannot be built as planned, such as an invalid name or an unmanaged file at the target; skipped.
     Blocked,
+    /// A file in conflict at the target that you chose to adopt: its ROMs are the ones the DAT expects there, so it
+    /// is recorded as built and nothing is written.
+    Adopt,
+    /// Its group is unresolved and you chose to build the resolved groups only; skipped, and whatever is at its
+    /// target is left untouched.
+    Unresolved,
 }
 
 impl ItemKind {
-    pub const ALL: [ItemKind; 6] = [
+    pub const ALL: [ItemKind; 8] = [
         ItemKind::Copy,
         ItemKind::Repack,
+        ItemKind::Adopt,
         ItemKind::Unchanged,
         ItemKind::NoSource,
         ItemKind::Conflict,
+        ItemKind::Unresolved,
         ItemKind::Blocked,
     ];
 
@@ -122,6 +180,8 @@ impl ItemKind {
             ItemKind::NoSource => "no_source",
             ItemKind::Conflict => "conflict",
             ItemKind::Blocked => "blocked",
+            ItemKind::Adopt => "adopt",
+            ItemKind::Unresolved => "unresolved",
         }
     }
 
@@ -193,6 +253,9 @@ pub struct PlanItem {
     /// What is at the target now, if anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub existing: Option<FileStat>,
+    /// For a conflict: the file at the target holds the ROMs the DAT expects there, so you may adopt it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adoptable: bool,
 }
 
 /// Why a plan cannot be approved.
@@ -243,8 +306,17 @@ pub struct PlanContent {
     pub audit: Option<i64>,
     /// The Selection's DAT Revision, by SHA-256.
     pub dat_revision: String,
+    /// Your choices, as you made them when planning.
+    #[serde(default, skip_serializing_if = "PlanChoices::is_default")]
+    pub choices: PlanChoices,
     pub items: Vec<PlanItem>,
     pub blockers: Vec<Blocker>,
+}
+
+impl PlanChoices {
+    pub fn is_default(&self) -> bool {
+        *self == PlanChoices::default()
+    }
 }
 
 /// What caused a release to change from the folder's current build to the plan.
@@ -279,6 +351,10 @@ pub struct PlanSummary {
     pub no_source: u64,
     pub conflict: u64,
     pub blocked: u64,
+    #[serde(default)]
+    pub adopt: u64,
+    #[serde(default)]
+    pub unresolved: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +379,9 @@ pub struct Plan {
     pub approval: Option<Approval>,
     /// The Build Job that carries the plan out, once approved.
     pub job: Option<i64>,
+    /// The check of the folder made with the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<i64>,
 }
 
 impl Plan {
@@ -322,6 +401,8 @@ impl PlanContent {
                 ItemKind::NoSource => &mut s.no_source,
                 ItemKind::Conflict => &mut s.conflict,
                 ItemKind::Blocked => &mut s.blocked,
+                ItemKind::Adopt => &mut s.adopt,
+                ItemKind::Unresolved => &mut s.unresolved,
             } += 1;
         }
         s
@@ -378,6 +459,9 @@ pub struct BuildSummary {
     pub applied: u64,
     pub failed: u64,
     pub pending: u64,
+    /// Files whose target, once the build stopped, held something other than what it wrote.
+    #[serde(default)]
+    pub uncertain: u64,
     /// What the plan held, including the items it skipped.
     pub planned: PlanSummary,
 }
@@ -453,6 +537,265 @@ pub struct BuiltFile {
     pub sources: Vec<PlanSource>,
     pub roms: Vec<ExpectedRom>,
     pub file: FileStat,
+    /// The SHA-256 of the whole file, when the store recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// False once a check found the file holds the right ROMs in a ZIP that is not TorrentZip, such as one re-zipped
+    /// by another tool.
+    #[serde(default = "yes")]
+    pub torrentzip: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Why a Managed Folder is Incomplete: why its current build lacks a selected game.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncompleteReason {
+    /// Its group was unresolved and you built the resolved groups only.
+    Unresolved,
+    /// No audited file holds every ROM.
+    NoSource,
+    /// Its file failed to build.
+    Failed,
+    /// Something Title Select did not build, or changed since, is at its target.
+    Conflict,
+    /// It cannot be built as planned, such as for an invalid name.
+    Blocked,
+    /// A check found its built file gone.
+    Missing,
+}
+
+impl IncompleteReason {
+    pub const ALL: [IncompleteReason; 6] = [
+        IncompleteReason::Unresolved,
+        IncompleteReason::NoSource,
+        IncompleteReason::Failed,
+        IncompleteReason::Conflict,
+        IncompleteReason::Blocked,
+        IncompleteReason::Missing,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IncompleteReason::Unresolved => "unresolved",
+            IncompleteReason::NoSource => "no_source",
+            IncompleteReason::Failed => "failed",
+            IncompleteReason::Conflict => "conflict",
+            IncompleteReason::Blocked => "blocked",
+            IncompleteReason::Missing => "missing",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<IncompleteReason> {
+        IncompleteReason::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+}
+
+/// How many selected games a Managed Folder lacks, by reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncompleteCounts {
+    pub unresolved: u64,
+    pub no_source: u64,
+    pub failed: u64,
+    pub conflict: u64,
+    pub blocked: u64,
+    pub missing: u64,
+}
+
+impl IncompleteCounts {
+    pub fn get(&self, reason: IncompleteReason) -> u64 {
+        match reason {
+            IncompleteReason::Unresolved => self.unresolved,
+            IncompleteReason::NoSource => self.no_source,
+            IncompleteReason::Failed => self.failed,
+            IncompleteReason::Conflict => self.conflict,
+            IncompleteReason::Blocked => self.blocked,
+            IncompleteReason::Missing => self.missing,
+        }
+    }
+
+    pub fn add(&mut self, reason: IncompleteReason) {
+        *match reason {
+            IncompleteReason::Unresolved => &mut self.unresolved,
+            IncompleteReason::NoSource => &mut self.no_source,
+            IncompleteReason::Failed => &mut self.failed,
+            IncompleteReason::Conflict => &mut self.conflict,
+            IncompleteReason::Blocked => &mut self.blocked,
+            IncompleteReason::Missing => &mut self.missing,
+        } += 1;
+    }
+
+    pub fn total(&self) -> u64 {
+        IncompleteReason::ALL.into_iter().map(|r| self.get(r)).sum()
+    }
+}
+
+/// One selected game a Managed Folder lacks, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncompleteItem {
+    pub reason: IncompleteReason,
+    pub group: String,
+    pub game: String,
+    pub target: String,
+    /// The error of a failed file, or why the item was skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// What a Managed Folder lacks: what its current build recorded, and the conflicts and missing files its latest
+/// check found since. Never written to the marker.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Incomplete {
+    /// The current build.
+    pub build: Option<i64>,
+    pub counts: IncompleteCounts,
+    pub items: Vec<IncompleteItem>,
+}
+
+/// What a check found for one built file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOutcome {
+    /// Its size and modification time are as recorded; it was not read.
+    Unchanged,
+    /// Its size or modification time changed, but it is still the file the build wrote; the record was refreshed.
+    Refreshed,
+    /// It holds the ROMs the DAT expects there in another ZIP, such as one re-zipped by another tool; recorded as
+    /// built, and flagged when it is not TorrentZip.
+    Repacked,
+    /// It changed and no longer holds the ROMs the DAT expects there, or is no longer a regular file.
+    Conflict,
+    /// It is gone.
+    Missing,
+    /// It could not be read, or changed while it was read.
+    Unreadable,
+}
+
+impl FileOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileOutcome::Unchanged => "unchanged",
+            FileOutcome::Refreshed => "refreshed",
+            FileOutcome::Repacked => "repacked",
+            FileOutcome::Conflict => "conflict",
+            FileOutcome::Missing => "missing",
+            FileOutcome::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// One built file, as a check found it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckedFile {
+    pub target: String,
+    pub game: String,
+    pub outcome: FileOutcome,
+    /// Whether the check read the file. A file whose size and modification time are as recorded is never read.
+    pub hashed: bool,
+    /// False when the file holds the right ROMs in a ZIP that is not TorrentZip.
+    pub torrentzip: bool,
+    /// Whether the selection the check was made against selects it.
+    pub selected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// What an entry Title Select did not build is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftKind {
+    /// A game the DAT lists, under its own name, that the selection does not select.
+    Unselected,
+    /// A selected game, under its own name, that Title Select did not build. A plan can adopt it.
+    Selected,
+    /// A game the DAT lists, under another name.
+    Renamed,
+    /// Nothing the DAT lists: a hack, homebrew or junk, or a file that cannot be read as one.
+    Unknown,
+    /// A directory, which is never opened.
+    Directory,
+}
+
+impl DriftKind {
+    pub const ALL: [DriftKind; 5] = [
+        DriftKind::Unselected,
+        DriftKind::Selected,
+        DriftKind::Renamed,
+        DriftKind::Unknown,
+        DriftKind::Directory,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DriftKind::Unselected => "unselected",
+            DriftKind::Selected => "selected",
+            DriftKind::Renamed => "renamed",
+            DriftKind::Unknown => "unknown",
+            DriftKind::Directory => "directory",
+        }
+    }
+}
+
+/// One entry in a Managed Folder that Title Select did not build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftEntry {
+    pub name: String,
+    pub kind: DriftKind,
+    /// The DAT's game it holds, for a known title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game: Option<String>,
+    /// Whether it sits at a selected game's target, which makes the folder Incomplete.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conflict: bool,
+    /// Whether the check read it; one unchanged since an earlier check is not read again.
+    pub hashed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// The counts of a check.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckSummary {
+    pub id: i64,
+    pub at: String,
+    /// The Check Job that made it, or none when a plan made it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<i64>,
+    /// Why the folder's marker is not this store's and this folder's; absent when it is. The rest of the check is
+    /// skipped when it is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+    pub unchanged: u64,
+    pub refreshed: u64,
+    pub repacked: u64,
+    /// Built files in conflict, and entries in conflict at a selected game's target.
+    pub conflict: u64,
+    pub missing: u64,
+    pub unreadable: u64,
+    /// Files the check read.
+    pub hashed: u64,
+    /// Entries Title Select did not build.
+    pub drift: u64,
+}
+
+/// A read-only check of a Managed Folder against the store's record of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderCheck {
+    pub folder: i64,
+    pub summary: CheckSummary,
+    /// The folder's generation when checked.
+    pub generation: u64,
+    /// The Selection checked against: the plan's, or the current build's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<i64>,
+    /// The DAT Revision entries were hashed against, by SHA-256.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dat_revision: Option<String>,
+    pub files: Vec<CheckedFile>,
+    pub drift: Vec<DriftEntry>,
 }
 
 /// Why a name cannot be a file name on every filesystem a Play Library may be shared from, or `None` when it can.

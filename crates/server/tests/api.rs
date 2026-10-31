@@ -1251,5 +1251,36 @@ mod selections {
             json!({"digest": plan.digest}),
         );
         assert_ne!(status, 202, "a plan is approved once");
+
+        // A check job reads the folder and records what it found; the folder is left as it is.
+        std::fs::write(play.join("test/notes.txt"), b"mine").unwrap();
+        let planned: title_select_api::build::FolderCheck =
+            client.json(&format!("/managed-folders/{}/check", folder.id));
+        assert_eq!(planned.summary.job, None, "planning checked the folder");
+        let (status, job) = send(
+            client.post(&format!("/managed-folders/{}/checks", folder.id)),
+            json!(null),
+        );
+        assert_eq!(status, 202, "{job}");
+        let job: Job = serde_json::from_value(job).unwrap();
+        assert_eq!(
+            (job.kind, job.managed_folder),
+            (JobKind::Check, Some(folder.id))
+        );
+        let (_, job) = client.follow(job.id);
+        assert_eq!(job.state, JobState::Succeeded, "{job:?}");
+        let check: title_select_api::build::FolderCheck =
+            client.json(&format!("/managed-folders/{}/check", folder.id));
+        assert_eq!(check.summary.job, Some(job.id));
+        assert_eq!((check.files.len(), check.drift.len()), (2, 1));
+        assert_eq!(std::fs::read(play.join("test/notes.txt")).unwrap(), b"mine");
+        let incomplete: title_select_api::build::Incomplete =
+            client.json(&format!("/managed-folders/{}/incomplete", folder.id));
+        let reasons: Vec<_> = incomplete.items.iter().map(|i| i.reason).collect();
+        assert_eq!(
+            reasons,
+            [title_select_api::build::IncompleteReason::NoSource],
+            "drift alone leaves the folder as complete as its build"
+        );
     }
 }

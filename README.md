@@ -369,14 +369,37 @@ against the selection's DAT revision:
 - **conflict**: a file the store did not build, or one changed since it was built, is at the target. It is never
   overwritten;
 - **blocked**: the game's name is not a valid file name on every filesystem, two names differ only in case, or the
-  game is not in the DAT.
+  game is not in the DAT;
+- **adopt**: you chose to adopt a conflict whose file, at exactly the game's name, holds exactly the ROMs the DAT
+  expects. Nothing is written; the build checks the file again and records it as built;
+- **unresolved**: you chose to build resolved groups only, and the game's group is unresolved. Whatever is at its
+  target is left untouched.
 
 Each ROM's source is ranked: matched before misnamed or conflicting, payload evidence before metadata, a copyable
 archive before another, then by path. No source, conflict and blocked items are skipped and shown. A plan cannot be
 approved while the source set has no audit against the selection's DAT revision, a group is unresolved and you have
-not confirmed a choice, the root is not writable, the folder or its marker is wrong, or a built file would be removed
+neither confirmed a choice nor chosen to build resolved groups only, the root is not writable, the folder or its marker is wrong, or a built file would be removed
 or replaced; removing and replacing built files need a later build step. It shows what changed since the current
 build, and whether your settings, your choices or the DAT revision caused it.
+
+Your choices are part of the plan, and of its digest: building resolved groups only, and, for each conflict that
+holds the ROMs the DAT expects, leaving it (the default) or adopting it. To change one, plan again with it. The
+folder name `.title-select-retained` is reserved for a later build step.
+
+Planning also checks the folder, as a check job does. A check job (`POST /managed-folders/{id}/checks`) reads the
+folder and writes only to the store. It reads a built file only when its size or modification time differs from the
+store's record: a file with the same content refreshes the record; one holding the same ROMs in another ZIP is
+recorded as built and flagged not TorrentZip; anything else is a conflict. Every other entry is drift, reported as a
+known title that is not selected, a selected title the store did not build, a known title under another name, an
+unknown file, or a directory, which is never opened. Symlinks and special files are unknown and never opened. Title
+Select's own entries are never drift. Drift is a warning: only a conflict at a selected game's file makes the folder
+incomplete.
+
+A folder is incomplete when its current build lacks some of its selection: unresolved groups left out, games with no
+source, files that failed, conflicts and blocked games, or built files a check found missing. The store records this
+for each build, with counts and items by reason; it is never written to the marker. A build cut off by a stop or a
+failure shows as an interrupted or failed build, with how many files were applied and how many are uncertain, from
+the store's record, straight after a restart. Planning again finishes it: the files already built are unchanged.
 
 A plan is stored with the SHA-256 of its content, its digest, and you approve it by sending that digest. The approval
 queues a job of kind `build`, which plans again and refuses, writing nothing, when the plan changed since you
@@ -451,7 +474,10 @@ Every body is JSON, and every error is `{"error": "...", "job": <id, when one is
 | `PATCH /api/v1/managed-folders/{id}`               | rebind it: `{"source_set"?, "profile"?}`                     |
 | `GET /api/v1/managed-folders/{id}/builds`          | its builds, newest first                                     |
 | `GET /api/v1/managed-folders/{id}/files`           | the files built into it, with their provenance               |
-| `POST /api/v1/managed-folders/{id}/plans`          | plan building a selection into it: `{"selection"}`; `201`    |
+| `POST /api/v1/managed-folders/{id}/plans`          | plan building a selection into it: `{"selection", "resolved_only"?, "adopt"?: [target]}`; `201` |
+| `POST /api/v1/managed-folders/{id}/checks`         | check it; `202` with the check job                           |
+| `GET /api/v1/managed-folders/{id}/check`           | its latest check: each built file and the drift; `404` when never checked |
+| `GET /api/v1/managed-folders/{id}/incomplete`      | what its current build lacks, by reason                      |
 | `GET /api/v1/plans/{id}`                           | a plan, with its digest, summary and changes                 |
 | `POST /api/v1/plans/{id}/approval`                 | approve it: `{"digest"}`; `202` with the build job, `409` when the plan changed |
 | `GET /api/v1/builds/{id}`                          | a build and each file it wrote                               |
@@ -563,8 +589,10 @@ The workbench is your browser interface to the Service: a Leptos app compiled to
 - **Managed folders** lists each managed folder with its current build, and registers another in a writable root,
   with the path proposed from the source set's DAT as for a source set. Opening one plans a build of a selection,
   shows the plan's files by what they do, what blocks it and what changed, approves it and follows the build live. It
-  rebinds the folder, and lists its builds and the files built into it. Each build shows every file it wrote or
-  failed to write.
+  rebinds the folder, and lists its builds and the files built into it. A plan with unresolved groups offers to build
+  resolved groups only, and each conflict you can adopt has a choice to leave or adopt it. The folder shows badges
+  for an incomplete folder and an interrupted build, what the folder lacks, and its latest check, which you can run
+  again. Each build shows every file it wrote or failed to write.
 - **Jobs** lists the latest jobs with their kind, state, progress and result, live: it follows `/api/v1/events`, applies `state`
   and `progress` events by the job `version` rule above, and replaces what it holds with each `resync` snapshot,
   which also arrives after a reconnect.

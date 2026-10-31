@@ -9,7 +9,8 @@ use std::time::{Duration, SystemTime};
 
 use common::*;
 use title_select_api::build::{
-    AddManagedFolder, BlockerKind, BuildState, Cause, ItemKind, ItemState, ManagedFolder, Plan,
+    AddManagedFolder, BlockerKind, BuildState, Cause, DriftKind, FileOutcome, FolderCheck,
+    IncompleteReason, ItemKind, ItemState, ManagedFolder, Plan, PlanBuild, PlanChoices,
 };
 use title_select_api::selection::{
     Alternative, CoverageDrift, Exclusion, Rule, Selection, SelectionGroup, SelectionPins,
@@ -1549,4 +1550,574 @@ fn a_builds_selection_and_audit_are_held_from_pruning_while_it_runs_and_released
     assert!(env.store.selection_record(second).unwrap().pruned);
     assert_ne!(held, audit);
     assert!(env.store.audit(held).unwrap().pruned);
+}
+
+/// Each entry's name, bytes and mtime, for proving the folder did not change.
+fn snapshot(dir: &Path) -> BTreeMap<String, (Option<Vec<u8>>, SystemTime)> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            let meta = std::fs::symlink_metadata(e.path()).unwrap();
+            let bytes = meta.is_file().then(|| std::fs::read(e.path()).unwrap());
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                (bytes, meta.modified().unwrap()),
+            )
+        })
+        .collect()
+}
+
+fn titles(env: &Env, games: &[&str]) -> i64 {
+    env.record(&selection(
+        &env.sha256,
+        games.iter().map(|g| group(g)).collect(),
+    ))
+}
+
+fn plan_with(env: &Env, folder: &ManagedFolder, selection: i64, choices: PlanChoices) -> Plan {
+    env.store
+        .plan_build_with(&env.config, folder.id, &PlanBuild { selection, choices })
+        .unwrap()
+}
+
+fn check(env: &Env, folder: &ManagedFolder) -> FolderCheck {
+    let job = env.store.enqueue_check(folder.id, "Operator").unwrap();
+    assert_eq!(job.kind, JobKind::Check);
+    assert_eq!(env.store.claim_job().unwrap().unwrap().id, job.id);
+    let done = env.store.run_check_job(&env.config, job.id, None).unwrap();
+    assert_eq!(done.state, JobState::Succeeded, "{:?}", done.error);
+    let check = env.store.latest_check(folder.id).unwrap().unwrap();
+    assert_eq!(check.summary.job, Some(job.id));
+    check
+}
+
+#[test]
+fn a_check_reads_only_changed_files_reports_drift_and_never_writes_to_the_folder() {
+    let env = Env::new();
+    env.audit();
+    let id = titles(
+        &env,
+        &[
+            "Pong (USA)",
+            "Combat (USA)",
+            "Breakout (USA)",
+            "Yars (USA)",
+            "Missing (USA)",
+        ],
+    );
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    assert_eq!(env.build(&env.plan(&folder, id)).state, JobState::Succeeded);
+
+    // Combat touched, Breakout rezipped from the same ROMs, Yars edited.
+    let combat = std::fs::File::options()
+        .write(true)
+        .open(dir.join("Combat (USA).zip"))
+        .unwrap();
+    combat
+        .set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+    drop(combat);
+    write_stored_zip(
+        &dir.join("Breakout (USA).zip"),
+        &[
+            ("Breakout (USA).a26", b"break"),
+            ("Breakout (USA).txt", b"manual"),
+        ],
+    );
+    write_stored_zip(&dir.join("Yars (USA).zip"), &[("Yars (USA).a26", b"yarz")]);
+    // Drift of every kind.
+    write_file(&dir.join("notes.txt"), b"mine");
+    torrentzip_file(&dir.join("pong copy.zip"), &[("Pong (USA).a26", b"pong")]);
+    torrentzip_file(
+        &dir.join("Ōkami (Japan).zip"),
+        &[("Ōkami (Japan).a26", b"cafe")],
+    );
+    torrentzip_file(
+        &dir.join("Missing (USA).zip"),
+        &[("Missing (USA).a26", b"missing")],
+    );
+    std::fs::create_dir(dir.join("extras")).unwrap();
+    write_file(&dir.join("extras/inside.zip"), b"never read");
+    std::os::unix::fs::symlink(env.set_dir().join("Pong (USA).zip"), dir.join("link.zip")).unwrap();
+    let before = snapshot(&dir);
+    // Unchanged in size and mtime, Pong is never read: a read would fail.
+    let pong = dir.join("Pong (USA).zip");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&pong, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let first = check(&env, &folder);
+
+    std::fs::set_permissions(&pong, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(snapshot(&dir), before, "a check never writes to the folder");
+    let files: BTreeMap<&str, (FileOutcome, bool, bool)> = first
+        .files
+        .iter()
+        .map(|f| (f.game.as_str(), (f.outcome, f.hashed, f.torrentzip)))
+        .collect();
+    assert_eq!(
+        files,
+        BTreeMap::from([
+            ("Pong (USA)", (FileOutcome::Unchanged, false, true)),
+            ("Combat (USA)", (FileOutcome::Refreshed, true, true)),
+            ("Breakout (USA)", (FileOutcome::Repacked, true, false)),
+            ("Yars (USA)", (FileOutcome::Conflict, true, true)),
+        ])
+    );
+    let drift: BTreeMap<&str, (DriftKind, Option<&str>, bool)> = first
+        .drift
+        .iter()
+        .map(|d| (d.name.as_str(), (d.kind, d.game.as_deref(), d.conflict)))
+        .collect();
+    assert_eq!(
+        drift,
+        BTreeMap::from([
+            (
+                "Missing (USA).zip",
+                (DriftKind::Selected, Some("Missing (USA)"), true)
+            ),
+            ("extras", (DriftKind::Directory, None, false)),
+            ("link.zip", (DriftKind::Unknown, None, false)),
+            ("notes.txt", (DriftKind::Unknown, None, false)),
+            (
+                "pong copy.zip",
+                (DriftKind::Renamed, Some("Pong (USA)"), false)
+            ),
+            (
+                "Ōkami (Japan).zip",
+                (DriftKind::Unselected, Some("Ōkami (Japan)"), false)
+            ),
+        ])
+    );
+    assert!(
+        first
+            .drift
+            .iter()
+            .all(|d| !d.name.starts_with(".title-select"))
+    );
+
+    // The records follow the touched and rezipped files; the rezipped one is not TorrentZip.
+    let built = env.store.built_files(folder.id).unwrap();
+    let breakout = built.iter().find(|f| f.game == "Breakout (USA)").unwrap();
+    assert!(!breakout.torrentzip);
+    assert_eq!(
+        breakout.file.size,
+        std::fs::metadata(dir.join("Breakout (USA).zip"))
+            .unwrap()
+            .len()
+    );
+    let again = check(&env, &folder);
+    assert!(
+        again
+            .files
+            .iter()
+            .filter(|f| f.game != "Yars (USA)")
+            .all(|f| f.outcome == FileOutcome::Unchanged && !f.hashed),
+        "{:?}",
+        again.files
+    );
+
+    // Drift is a warning: only the conflicts at selected games' files make the folder incomplete.
+    let folder = env.store.managed_folder(&env.config, folder.id).unwrap();
+    let counts = folder.incomplete.clone().unwrap();
+    assert_eq!(
+        (counts.conflict, counts.no_source, counts.total()),
+        (1, 1, 2)
+    );
+    let incomplete = env.store.incomplete(folder.id).unwrap();
+    let reasons: BTreeMap<&str, IncompleteReason> = incomplete
+        .items
+        .iter()
+        .map(|i| (i.target.as_str(), i.reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        BTreeMap::from([
+            ("Missing (USA).zip", IncompleteReason::NoSource),
+            ("Yars (USA).zip", IncompleteReason::Conflict),
+        ])
+    );
+    assert!(marker(&dir).get("incomplete").is_none());
+
+    // Planning runs the same check, without a job.
+    let plan = env.plan(&folder, id);
+    let planned = env.store.latest_check(folder.id).unwrap().unwrap();
+    assert_eq!(plan.check, Some(planned.summary.id));
+    assert_eq!(planned.summary.job, None);
+    assert_eq!(kinds(&plan)["Breakout (USA)"], ItemKind::Unchanged);
+    assert_eq!(kinds(&plan)["Yars (USA)"], ItemKind::Conflict);
+}
+
+#[test]
+fn building_resolved_groups_only_is_a_choice_the_digest_binds_and_leaves_the_rest_incomplete() {
+    let env = Env::new();
+    env.audit();
+    let mut unresolved = everything(&env.sha256);
+    unresolved.groups[1].unresolved = true;
+    let id = env.record(&unresolved);
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    write_file(&dir.join("Combat (USA).zip"), b"theirs");
+
+    let blocked = env.plan(&folder, id);
+    assert_eq!(
+        blockers(&blocked),
+        BTreeSet::from([BlockerKind::Unresolved])
+    );
+    let partial = plan_with(
+        &env,
+        &folder,
+        id,
+        PlanChoices {
+            resolved_only: true,
+            adopt: vec![],
+        },
+    );
+
+    assert!(partial.approvable(), "{:?}", partial.content.blockers);
+    assert!(partial.content.choices.resolved_only);
+    assert_ne!(partial.digest, blocked.digest);
+    assert_eq!(kinds(&partial)["Combat (USA)"], ItemKind::Unresolved);
+    let refused = env.store.approve_plan(
+        &env.config,
+        blocked.id,
+        &blocked.digest,
+        "Operator",
+        WORKERS,
+    );
+    assert!(matches!(refused, Err(Error::Refused(_))), "{refused:?}");
+    assert_eq!(env.build(&partial).state, JobState::Succeeded);
+
+    assert_eq!(
+        std::fs::read(dir.join("Combat (USA).zip")).unwrap(),
+        b"theirs"
+    );
+    assert!(names(&dir).contains("Pong (USA).zip"));
+    let folder = env.store.managed_folder(&env.config, folder.id).unwrap();
+    let counts = folder.incomplete.clone().unwrap();
+    assert_eq!(
+        (
+            counts.unresolved,
+            counts.no_source,
+            counts.blocked,
+            counts.failed,
+            counts.conflict
+        ),
+        (1, 1, 1, 0, 0)
+    );
+    let incomplete = env.store.incomplete(folder.id).unwrap();
+    let combat = incomplete
+        .items
+        .iter()
+        .find(|i| i.reason == IncompleteReason::Unresolved)
+        .unwrap();
+    assert_eq!(
+        (combat.group.as_str(), combat.target.as_str()),
+        ("combat (usa)", "Combat (USA).zip")
+    );
+    assert!(marker(&dir).get("incomplete").is_none());
+}
+
+#[test]
+fn a_conflict_is_adopted_only_when_its_roms_match_the_dat_and_nothing_is_written() {
+    let env = Env::new();
+    env.audit();
+    let id = titles(&env, &["Pong (USA)", "Combat (USA)"]);
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    write_stored_zip(&dir.join("Pong (USA).zip"), &[("Pong (USA).a26", b"pong")]);
+    write_stored_zip(
+        &dir.join("Combat (USA).zip"),
+        &[("Combat (USA).a26", b"combat!")],
+    );
+    let before = snapshot(&dir);
+
+    let left = env.plan(&folder, id);
+    let adoptable: BTreeMap<&str, (ItemKind, bool)> = left
+        .content
+        .items
+        .iter()
+        .map(|i| (i.game.as_str(), (i.kind, i.adoptable)))
+        .collect();
+    assert_eq!(
+        adoptable,
+        BTreeMap::from([
+            ("Combat (USA)", (ItemKind::Conflict, false)),
+            ("Pong (USA)", (ItemKind::Conflict, true)),
+        ])
+    );
+    let adopt = plan_with(
+        &env,
+        &folder,
+        id,
+        PlanChoices {
+            resolved_only: false,
+            adopt: vec!["Pong (USA).zip".into(), "Combat (USA).zip".into()],
+        },
+    );
+    assert_ne!(adopt.digest, left.digest);
+    assert_eq!(kinds(&adopt)["Pong (USA)"], ItemKind::Adopt);
+    assert_eq!(kinds(&adopt)["Combat (USA)"], ItemKind::Conflict);
+    assert_eq!(adopt.summary.adopt, 1);
+
+    assert_eq!(env.build(&adopt).state, JobState::Succeeded);
+
+    let after = snapshot(&dir);
+    assert_eq!(after.len(), before.len());
+    for (name, entry) in &before {
+        if name != ".title-select" {
+            assert_eq!(&after[name], entry, "{name}");
+        }
+    }
+    let built = env.store.built_files(folder.id).unwrap();
+    assert_eq!(built.len(), 1);
+    assert_eq!(
+        (built[0].kind, built[0].torrentzip),
+        (ItemKind::Adopt, false)
+    );
+    let folder = env.store.managed_folder(&env.config, folder.id).unwrap();
+    assert_eq!(folder.incomplete.as_ref().unwrap().conflict, 1);
+    // Adopted, it is the folder's own: planned again, it is unchanged.
+    assert_eq!(
+        kinds(&env.plan(&folder, id))["Pong (USA)"],
+        ItemKind::Unchanged
+    );
+}
+
+#[test]
+fn an_interrupted_build_is_badged_from_the_store_and_a_new_plan_completes_the_folder() {
+    let env = Env::new();
+    env.audit();
+    let id = titles(
+        &env,
+        &["Pong (USA)", "Combat (USA)", "Breakout (USA)", "Yars (USA)"],
+    );
+    let folder = env.folder("atari2600");
+    let plan = env.plan(&folder, id);
+    env.crash(&plan, Fault::AfterPublish(2));
+    let (env, _) = env.restart();
+
+    let badged = env.store.managed_folder(&env.config, folder.id).unwrap();
+    let unfinished = badged.unfinished.clone().unwrap();
+    assert_eq!(unfinished.state, BuildState::Interrupted);
+    let detail = env.store.build(unfinished.build).unwrap();
+    let count = |s: ItemState| detail.items.iter().filter(|i| i.state == s).count() as u64;
+    assert_eq!(
+        (unfinished.applied, unfinished.uncertain),
+        (count(ItemState::Applied), count(ItemState::Uncertain))
+    );
+    assert!(unfinished.applied + unfinished.uncertain > 0);
+
+    let next = env.plan(&badged, id);
+    assert!(next.approvable(), "{:?}", next.content.blockers);
+    assert_eq!(env.build(&next).state, JobState::Succeeded);
+
+    let done = env.store.managed_folder(&env.config, folder.id).unwrap();
+    assert_eq!(done.unfinished, None);
+    assert_eq!(done.incomplete, None);
+    assert_eq!(done.files, 4);
+}
+
+/// Replaces `path` with a new file holding `members`, with the modification time it had.
+fn replace_keeping_mtime(path: &Path, members: &[(&str, &[u8])]) {
+    let mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+    std::fs::remove_file(path).unwrap();
+    write_stored_zip(path, members);
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(mtime).unwrap();
+}
+
+#[test]
+fn a_file_replaced_with_the_same_size_and_mtime_is_read_again() {
+    let env = Env::new();
+    env.audit();
+    let id = titles(&env, &["Pong (USA)"]);
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    assert_eq!(env.build(&env.plan(&folder, id)).state, JobState::Succeeded);
+    let pong = dir.join("Pong (USA).zip");
+    write_stored_zip(&pong, &[("Pong (USA).a26", b"pung")]);
+    let edited = check(&env, &folder);
+    assert_eq!(edited.files[0].outcome, FileOutcome::Conflict);
+    let counts = |env: &Env| {
+        env.store
+            .managed_folder(&env.config, folder.id)
+            .unwrap()
+            .incomplete
+            .map(|c| c.conflict)
+    };
+    assert_eq!(counts(&env), Some(1));
+
+    // The same size and modification time, but another file: what was read of the edited one is not reused.
+    replace_keeping_mtime(&pong, &[("Pong (USA).a26", b"pong")]);
+    let fixed = check(&env, &folder);
+
+    assert_eq!(
+        (fixed.files[0].outcome, fixed.files[0].hashed),
+        (FileOutcome::Repacked, true)
+    );
+    assert_eq!(counts(&env), None);
+}
+
+#[test]
+fn planning_another_selection_keeps_the_current_builds_incomplete_badge() {
+    let env = Env::new();
+    env.audit();
+    let both = titles(&env, &["Pong (USA)", "Combat (USA)"]);
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    assert_eq!(
+        env.build(&env.plan(&folder, both)).state,
+        JobState::Succeeded
+    );
+    std::fs::remove_file(dir.join("Pong (USA).zip")).unwrap();
+
+    let without = titles(&env, &["Combat (USA)"]);
+    let plan = env.plan(&folder, without);
+    assert!(plan.check.is_some());
+
+    let folder = env.store.managed_folder(&env.config, folder.id).unwrap();
+    assert_eq!(folder.incomplete.map(|c| c.missing), Some(1));
+    let incomplete = env.store.incomplete(folder.id).unwrap();
+    assert_eq!(incomplete.items[0].target, "Pong (USA).zip");
+}
+
+#[test]
+fn an_unresolved_group_is_complete_only_when_its_built_file_still_holds_the_game() {
+    let env = Env::new();
+    env.audit();
+    let id = titles(&env, &["Pong (USA)", "Combat (USA)", "Yars (USA)"]);
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    assert_eq!(env.build(&env.plan(&folder, id)).state, JobState::Succeeded);
+    std::fs::remove_file(dir.join("Combat (USA).zip")).unwrap();
+    write_stored_zip(&dir.join("Yars (USA).zip"), &[("Yars (USA).a26", b"yarz")]);
+
+    let mut unresolved = selection(
+        &env.sha256,
+        vec![
+            group("Pong (USA)"),
+            group("Combat (USA)"),
+            group("Yars (USA)"),
+        ],
+    );
+    for g in &mut unresolved.groups {
+        g.unresolved = true;
+    }
+    let id = env.record(&unresolved);
+    let plan = plan_with(
+        &env,
+        &folder,
+        id,
+        PlanChoices {
+            resolved_only: true,
+            adopt: vec![],
+        },
+    );
+    assert!(plan.approvable(), "{:?}", plan.content.blockers);
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+
+    let incomplete = env.store.incomplete(folder.id).unwrap();
+    let reasons: BTreeMap<&str, IncompleteReason> = incomplete
+        .items
+        .iter()
+        .map(|i| (i.target.as_str(), i.reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        BTreeMap::from([
+            ("Combat (USA).zip", IncompleteReason::Unresolved),
+            ("Yars (USA).zip", IncompleteReason::Unresolved),
+        ]),
+        "the missing and the changed file stay incomplete; Pong, still as built, does not"
+    );
+}
+
+#[test]
+fn an_unresolved_group_whose_roms_the_newer_dat_revision_changed_is_incomplete() {
+    let env = Env::new();
+    env.audit();
+    let id = titles(&env, &["Pong (USA)", "Combat (USA)"]);
+    let folder = env.folder("atari2600");
+    assert_eq!(env.build(&env.plan(&folder, id)).state, JobState::Succeeded);
+
+    // The newer revision keeps Pong's title but lists another ROM for it.
+    let mut newer = games();
+    newer
+        .iter_mut()
+        .find(|(game, _)| *game == "Pong (USA)")
+        .unwrap()
+        .1 = vec![rom("Pong (USA).a26", b"pong, revised")];
+    let dat = write_dat_version(
+        &env.tmp.path().join("in"),
+        "Test - System (2).dat",
+        "20260102-000000",
+        &newer,
+    );
+    let (revision, _) = env.store.import_dat(&dat, "No-Intro", None).unwrap();
+    env.store
+        .audit_source_set(&env.config, SET, Some(&revision.sha256))
+        .unwrap();
+    let mut unresolved = selection(
+        &revision.sha256,
+        vec![group("Pong (USA)"), group("Combat (USA)")],
+    );
+    unresolved.groups[0].unresolved = true;
+    let id = env.record(&unresolved);
+    let plan = plan_with(
+        &env,
+        &folder,
+        id,
+        PlanChoices {
+            resolved_only: true,
+            adopt: vec![],
+        },
+    );
+    assert!(plan.approvable(), "{:?}", plan.content.blockers);
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+
+    let incomplete = env.store.incomplete(folder.id).unwrap();
+    let reasons: Vec<(&str, IncompleteReason)> = incomplete
+        .items
+        .iter()
+        .map(|i| (i.target.as_str(), i.reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![("Pong (USA).zip", IncompleteReason::Unresolved)],
+        "Pong's built file holds the ROM of the earlier revision, not the one the selection expects"
+    );
+    let folder = env.store.managed_folder(&env.config, folder.id).unwrap();
+    assert_eq!(folder.incomplete.map(|c| c.unresolved), Some(1));
+}
+
+#[test]
+fn a_build_stopped_after_it_advanced_the_generation_is_still_badged() {
+    for fault in [Fault::AfterFinalize, Fault::AfterMarker] {
+        let env = Env::new();
+        env.audit();
+        let id = titles(&env, &["Pong (USA)", "Combat (USA)"]);
+        let folder = env.folder("atari2600");
+        let plan = env.plan(&folder, id);
+        env.crash(&plan, fault);
+        let (env, blocked) = env.restart();
+        assert!(blocked.is_empty(), "{fault:?}: {blocked:?}");
+
+        let badged = env.store.managed_folder(&env.config, folder.id).unwrap();
+        assert_eq!(badged.generation, 1, "{fault:?}");
+        let unfinished = badged.unfinished.clone().unwrap();
+        assert_eq!(
+            (unfinished.state, unfinished.applied, unfinished.uncertain),
+            (BuildState::Interrupted, 2, 0),
+            "{fault:?}"
+        );
+        assert_eq!(Some(unfinished.build), badged.build.as_ref().map(|b| b.id));
+
+        let next = env.plan(&badged, id);
+        assert!(next.approvable(), "{fault:?}: {:?}", next.content.blockers);
+        assert_eq!(env.build(&next).state, JobState::Succeeded);
+        let done = env.store.managed_folder(&env.config, folder.id).unwrap();
+        assert_eq!(done.unfinished, None, "{fault:?}");
+    }
 }

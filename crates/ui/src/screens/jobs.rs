@@ -131,10 +131,11 @@ fn kind_label(kind: JobKind) -> &'static str {
         JobKind::Audit => "Audit",
         JobKind::Selection => "Selection",
         JobKind::Build => "Build",
+        JobKind::Check => "Check",
     }
 }
 
-/// A link to the Audit or Selection a Job recorded, or the Managed Folder a Build Job built into.
+/// A link to the Audit or Selection a Job recorded, or the Managed Folder a Build or Check Job is for.
 fn result_link(job: &Job) -> AnyView {
     if let Some(folder) = job.managed_folder {
         return view! {
