@@ -127,3 +127,17 @@ _Avoid_: Output folder, target
 A pattern of tokens, such as `{provider}/{dat}` or `{platform}`, that proposes the path of a Source Set or Managed
 Folder at registration. It only proposes: a registered path never moves when a template changes.
 _Avoid_: Naming scheme
+
+**Incomplete**:
+A Managed Folder whose current Build lacks a selected Game, because its group was unresolved and skipped, had no
+source, failed, or is in conflict. Title Select shows why and how many.
+
+**Drift**:
+Any difference between a Managed Folder and its current Build: a built file changed or missing, or an entry Title
+Select did not build. Drift is reported, never silently corrected; only an approved Change Plan acts on it.
+_Avoid_: Corruption (when meaning any difference)
+
+**Kept File**:
+A file removed from a Managed Folder by a Build or a cleanup, set aside in that folder's retention area so that no
+tool scans it, until the Operator approves deleting or restoring it.
+_Avoid_: Trash, backup
