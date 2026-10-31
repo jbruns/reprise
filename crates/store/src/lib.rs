@@ -126,6 +126,11 @@ pub enum Fault {
     /// After what was moved aside to delete the kept file with this id, not being that file, is recorded, before it is
     /// moved back.
     Quarantined(i64),
+    /// After what was held aside for the kept file with this id is moved back, before either folder is synced.
+    MovedBack(i64),
+    /// After what was held aside for the kept file with this id is moved back and both folders are synced, before the
+    /// store records it kept again.
+    MoveBackSynced(i64),
     /// After the kept file with this id is deleted, before the store records it deleted.
     AfterUnlink(i64),
     /// After the store commits the folder's next generation, before the marker advances to it.

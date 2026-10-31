@@ -959,15 +959,44 @@ impl Store {
             Err(e) => return Ok(format!("it is at {at} ({e})")),
         };
         let Some(st) = found else {
-            // Moved back before the service stopped, or gone: nothing is held aside any more.
-            let note = match generation.map(|g| g.stat(kept)) {
-                Some(Ok(Some(st))) if Identity::of(&st) == moved => {
-                    format!("it was moved back to {back}")
-                }
-                _ => format!("what was moved aside to be deleted is no longer at {at}"),
+            // Moved back before the service stopped, perhaps not yet durably: cleared only once it is found back
+            // under its name and both folders are synced, so a power loss cannot undo a move-back already recorded.
+            let Some(generation) = generation else {
+                return Ok(format!(
+                    "it is no longer at {at}, and {back} is gone; it stays recorded as held aside"
+                ));
             };
+            let found = match generation.stat(kept) {
+                Ok(found) => found,
+                Err(e) => {
+                    return Ok(format!(
+                        "it is no longer at {at}, and {back} could not be checked ({e}); it stays recorded as held \
+                         aside"
+                    ));
+                }
+            };
+            match found {
+                Some(st) if Identity::of(&st) == moved => {}
+                Some(_) => {
+                    return Ok(format!(
+                        "it is no longer at {at}, and {back} holds something else; it stays recorded as held aside"
+                    ));
+                }
+                None => {
+                    return Ok(format!(
+                        "it is no longer at {at} nor at {back}; it stays recorded as held aside"
+                    ));
+                }
+            }
+            if let Err(e) = generation.sync().and_then(|()| deleting.sync()) {
+                return Ok(format!(
+                    "it was moved back to {back}, but that could not be made durable ({e}); the service tries again \
+                     when it next starts"
+                ));
+            }
+            self.fault_point(Fault::MoveBackSynced(file.id));
             self.write(|tx| still_kept(tx, file.id))?;
-            return Ok(note);
+            return Ok(format!("it was moved back to {back}"));
         };
         if Identity::of(&st) != moved {
             return Ok(format!(
@@ -981,10 +1010,12 @@ impl Store {
         };
         match deleting
             .rename_new(&slot, generation, kept)
+            .map(|()| self.fault_point(Fault::MovedBack(file.id)))
             .and_then(|()| generation.sync())
             .and_then(|()| deleting.sync())
         {
             Ok(()) => {
+                self.fault_point(Fault::MoveBackSynced(file.id));
                 self.write(|tx| still_kept(tx, file.id))?;
                 Ok(format!("it was moved back to {back}"))
             }

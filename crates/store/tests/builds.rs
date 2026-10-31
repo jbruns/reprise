@@ -207,6 +207,12 @@ impl Env {
     /// Opens the store again, as the service does when it starts, and recovers. Returns the Builds whose folders
     /// recovery left as they were.
     fn restart(self) -> (Env, Vec<(i64, String)>) {
+        let (env, blocked) = self.restart_until(None);
+        (env, blocked.unwrap())
+    }
+
+    /// Restarts with `stop` hooked to the faults recovery passes; `None` for the blocked folders when it stopped.
+    fn restart_until(self, stop: Option<Fault>) -> (Env, Option<Vec<(i64, String)>>) {
         let Env {
             tmp,
             store,
@@ -216,9 +222,21 @@ impl Env {
         let path = store.dir().to_path_buf();
         drop(store);
         let store = Store::open(&path).unwrap();
-        store.recover_jobs(WORKERS).unwrap();
-        let blocked = store.recover_builds(&config).unwrap();
-        store.recover_kept_deletions(&config).unwrap();
+        if let Some(stop) = stop {
+            store.hook_faults(Some(std::sync::Arc::new(move |fault| {
+                if fault == stop {
+                    panic!("killed at {fault:?}");
+                }
+            })));
+        }
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.recover_jobs(WORKERS).unwrap();
+            let blocked = store.recover_builds(&config).unwrap();
+            store.recover_kept_deletions(&config).unwrap();
+            blocked
+        }))
+        .ok();
+        store.hook_faults(None);
         (
             Env {
                 tmp,
@@ -1507,6 +1525,97 @@ fn a_retention_area_left_mid_creation_is_recorded_or_adopted_by_recovery_and_an_
             .is_empty()
         );
     }
+}
+
+#[test]
+fn a_move_back_is_recorded_only_once_it_is_found_back_and_made_durable() {
+    let env = Env::new();
+    let (folder, plan) = built_then_deselected(&env);
+    let dir = env.play().join("atari2600");
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+    let kept = env.store.kept_files(folder.id).unwrap();
+    let first = kept[0].clone();
+    let path = dir.join(RETAINED).join("2").join(&first.kept_name);
+    let slot = dir
+        .join(RETAINED)
+        .join(".deleting")
+        .join(first.id.to_string());
+    let aside = env.tmp.path().join("aside");
+    let deletion = env
+        .store
+        .plan_kept_deletion(
+            folder.id,
+            &PlanKeptDeletion {
+                ids: vec![first.id],
+                all: false,
+            },
+        )
+        .unwrap();
+    // Another file takes the kept file's place just before it is moved; the service stops once that is moved back,
+    // before either folder is synced.
+    let (at, away) = (path.clone(), env.tmp.path().join("original"));
+    let id = first.id;
+    env.store
+        .hook_faults(Some(std::sync::Arc::new(move |fault| {
+            if fault == Fault::BeforeDeleteMove(id) {
+                std::fs::rename(&at, &away).unwrap();
+                std::fs::write(&at, b"someone else's").unwrap();
+            } else if fault == Fault::MovedBack(id) {
+                panic!("killed");
+            }
+        })));
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.store
+            .approve_kept_deletion(&env.config, deletion.id, &deletion.digest, "Operator")
+    }));
+    env.store.hook_faults(None);
+    assert!(ran.is_err());
+    assert!(!slot.exists());
+    assert_eq!(std::fs::read(&path).unwrap(), b"someone else's");
+    let held = |env: &Env| {
+        let pending = env.store.kept_deletion(deletion.id).unwrap();
+        assert!(pending.finished_at.is_none(), "{pending:?}");
+        assert!(
+            !env.store
+                .kept_files(folder.id)
+                .unwrap()
+                .iter()
+                .any(|k| k.id == id)
+        );
+        pending.recovery_error.unwrap_or_default()
+    };
+
+    // Found back under its name, it is still held aside until both folders are synced.
+    let (env, stopped) = env.restart_until(Some(Fault::MoveBackSynced(id)));
+    assert!(
+        stopped.is_none(),
+        "recovery syncs before it records it kept"
+    );
+    held(&env);
+
+    // Something else at its name, or nothing at either place, keeps it recorded as held aside.
+    std::fs::rename(&path, &aside).unwrap();
+    let (env, _) = env.restart();
+    let error = held(&env);
+    assert!(error.contains("nor at"), "{error}");
+    std::fs::write(&path, b"a third").unwrap();
+    let (env, _) = env.restart();
+    let error = held(&env);
+    assert!(error.contains("holds something else"), "{error}");
+    std::fs::remove_file(&path).unwrap();
+    assert!(env.store.kept_files(folder.id).unwrap().len() < kept.len());
+
+    // Back under its name, synced, it is recorded kept again and the deletion finishes.
+    std::fs::rename(&aside, &path).unwrap();
+    let (env, _) = env.restart();
+    let done = env.store.kept_deletion(deletion.id).unwrap();
+    assert!(
+        done.finished_at.is_some() && done.recovery_error.is_none(),
+        "{done:?}"
+    );
+    assert!(!done.outcomes[0].deleted);
+    assert_eq!(std::fs::read(&path).unwrap(), b"someone else's");
+    assert_eq!(env.store.kept_files(folder.id).unwrap(), kept);
 }
 
 #[test]
