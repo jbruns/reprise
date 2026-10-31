@@ -6,7 +6,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use title_select_api::build::{
     BlockerKind, CheckSummary, Cleanup, CleanupAction, CleanupEntry, CleanupRepack, CleanupRestore,
     DriftKind, ExpectedRom, FileOutcome, FolderCheck, KeptFile, Plan, PlanChoices, PlanCleanup,
@@ -15,13 +16,16 @@ use title_select_api::build::{
 use title_select_engine::build::{GameIndex, Probe, holds};
 use title_select_engine::dat::Dat;
 
-use super::{Blocker, Folder, Planned, blocker, check_folder, insert_plan, load, short, to_json};
+use super::{
+    Blocker, Folder, Found, Inputs, Planned, blocker, check_folder, insert_plan, load, short,
+    to_json,
+};
 use crate::checks::{Seen, reuse, store_check};
 use crate::config::Config;
 use crate::folder_dir::{FolderDir, Identity, file_stat};
 use crate::folders::{folder_by_id, is_own, open_folder};
 use crate::kept::{kept_where, open_retention};
-use crate::{Error, Result, Store};
+use crate::{Error, Fault, Result, Store};
 
 /// The ROMs the DAT lists for `game`, in DAT order.
 fn roms_of(dat: &Dat, game: &str) -> Vec<ExpectedRom> {
@@ -75,6 +79,64 @@ fn selected_game(
         return Err(why);
     }
     Ok((game.to_owned(), roms, target))
+}
+
+/// The fingerprint of what Managed Folder `inputs.folder` holds, as `found` found it, for [`Cleanup::fingerprint`]:
+/// each entry in it, each built file's record with what is at its name, each entry acknowledged as found, and each
+/// kept file's record, by identity, size and modification time. Nothing is read: only what was found by `lstat`.
+fn fingerprint(c: &Connection, inputs: &Inputs, found: Option<&Folder>) -> Result<String> {
+    let mut lines = BTreeSet::new();
+    let stat = |f: &Found| {
+        let (dev, ino) = f.identity.to_sql();
+        format!(
+            "{dev}:{ino}:{}:{}:{}",
+            f.file.size, f.file.mtime_ns, f.regular
+        )
+    };
+    let files = found.map(|f| &f.files);
+    for f in files.into_iter().flat_map(|files| files.values()) {
+        lines.insert(format!("entry\t{}\t{}", f.name, stat(f)));
+    }
+    for (target, built) in &inputs.built {
+        let at = files
+            .and_then(|files| files.get(&target.to_lowercase()))
+            .filter(|f| f.name == *target)
+            .map_or_else(|| "absent".to_owned(), stat);
+        lines.insert(format!("built\t{target}\t{}\t{at}", built.build));
+    }
+    for a in found
+        .and_then(|f| f.scan.as_ref())
+        .into_iter()
+        .flat_map(|scan| &scan.acknowledged)
+    {
+        lines.insert(format!("acknowledged\t{}", a.name));
+    }
+    let mut stmt = c.prepare(
+        "SELECT id, generation, kept_name, dev, ino, size, mtime_ns, directory FROM kept_files
+         WHERE folder_id = ?1 AND state = 'kept'",
+    )?;
+    let kept = stmt.query_map([inputs.folder.id], |r| {
+        Ok(format!(
+            "kept\t{}\t{}\t{}\t{}:{}:{}:{}:{}",
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, i64>(5)?,
+            r.get::<_, i64>(6)?,
+            r.get::<_, bool>(7)?
+        ))
+    })?;
+    for line in kept {
+        lines.insert(line?);
+    }
+    let mut hash = Sha256::new();
+    for line in &lines {
+        hash.update(line.as_bytes());
+        hash.update(b"\n");
+    }
+    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The names in the folder a cleanup may put an entry at, and those it claims as it is planned.
@@ -263,6 +325,7 @@ impl Store {
                         action: choices.entries.get(&d.name).copied(),
                         target: None,
                         roms: Vec::new(),
+                        group: String::new(),
                         torrentzip: probe.is_none_or(|p| p.torrentzip),
                     };
                     let why = match entry.action {
@@ -376,6 +439,7 @@ impl Store {
                                 Some(sha256) => Ok(CleanupRepack {
                                     target: target.clone(),
                                     game: built.game.clone(),
+                                    group: String::new(),
                                     roms: built.roms.clone(),
                                     sources: sources.get(target).cloned().unwrap_or_default(),
                                     file: f.file.clone(),
@@ -399,6 +463,33 @@ impl Store {
                 }
             }
         }
+        // Each game a cleanup records as built is recorded in the group it is selected in.
+        let groups: HashMap<&str, &str> = inputs
+            .selection
+            .groups
+            .iter()
+            .flat_map(|g| {
+                g.winners
+                    .iter()
+                    .map(|w| (w.title.as_str(), g.group.as_str()))
+            })
+            .collect();
+        let group_of = |game: Option<&String>| {
+            game.and_then(|game| groups.get(game.as_str()))
+                .map(|group| (*group).to_owned())
+                .unwrap_or_default()
+        };
+        for e in entries.iter_mut().filter(|e| e.target.is_some()) {
+            e.group = group_of(e.game.as_ref());
+        }
+        for r in &mut restores {
+            r.group = group_of(r.game.as_ref());
+        }
+        for r in &mut repacks {
+            r.group = group_of(Some(&r.game));
+        }
+        let fingerprint = self.read(|c| fingerprint(c, &inputs, found.as_ref()))?;
+
         if !probed.is_empty() {
             self.write(|tx| {
                 for (id, (seen, probe)) in &probed {
@@ -463,6 +554,7 @@ impl Store {
                     entries,
                     restores,
                     repacks,
+                    fingerprint,
                 }),
             },
             previous: None,
@@ -502,6 +594,7 @@ impl Store {
                 target: name.clone(),
                 game: None,
                 roms: Vec::new(),
+                group: String::new(),
                 torrentzip: true,
             })
         };
@@ -574,6 +667,7 @@ impl Store {
                     target: target.clone(),
                     game: Some(game),
                     roms,
+                    group: String::new(),
                     torrentzip: probe.torrentzip,
                 })
                 .map_err(|why| format!("{name} cannot be put back as {target}: {why}")),
@@ -609,6 +703,7 @@ impl Store {
             .into_iter()
             .collect();
         let planned = self.compute_cleanup(config, folder, &choices)?;
+        self.fault_point(Fault::Scanned);
         self.write(|tx| {
             let active = folder_by_id(tx, folder)?.active_job;
             let check = match (&planned.check, active) {

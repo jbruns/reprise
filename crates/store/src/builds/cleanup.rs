@@ -40,7 +40,7 @@ use crate::folders::{
     write_marker,
 };
 use crate::jobs::finish_running;
-use crate::kept::{Keep, Retention, drop_citations, open_retention};
+use crate::kept::{Keep, Retention, create_dir, drop_citations, open_retention};
 use crate::plans::Planned;
 use crate::{Error, Fault, Result, Store, now};
 
@@ -105,13 +105,14 @@ fn steps(cleanup: &Cleanup) -> Vec<Step<'_>> {
 /// The plan item a cleanup records a built file with.
 fn built_item(
     target: &str,
+    group: &str,
     game: &str,
     kind: ItemKind,
     roms: &[title_select_api::build::ExpectedRom],
     sources: &[PlanSource],
 ) -> PlanItem {
     PlanItem {
-        group: String::new(),
+        group: group.to_owned(),
         game: game.to_owned(),
         target: target.to_owned(),
         kind,
@@ -130,7 +131,16 @@ pub(super) fn written_items(cleanup: &Cleanup) -> Vec<PlanItem> {
     cleanup
         .repacks
         .iter()
-        .map(|r| built_item(&r.target, &r.game, ItemKind::Repack, &r.roms, &r.sources))
+        .map(|r| {
+            built_item(
+                &r.target,
+                &r.group,
+                &r.game,
+                ItemKind::Repack,
+                &r.roms,
+                &r.sources,
+            )
+        })
         .collect()
 }
 
@@ -150,6 +160,7 @@ fn recorded_as(
                 (
                     built_item(
                         target,
+                        &e.group,
                         e.game.as_deref().unwrap_or_default(),
                         ItemKind::Adopt,
                         &e.roms,
@@ -165,7 +176,7 @@ fn recorded_as(
             .and_then(|r| {
                 let game = r.game.as_deref()?;
                 Some((
-                    built_item(target, game, ItemKind::Adopt, &r.roms, &[]),
+                    built_item(target, &r.group, game, ItemKind::Adopt, &r.roms, &[]),
                     r.torrentzip,
                 ))
             }),
@@ -253,6 +264,7 @@ impl Run<'_> {
             seq,
             generation,
             keep: &keep,
+            hashed: None,
         };
         let area = self.retention.as_ref().expect("opened above");
         Ok(store.keep_aside(&self.dir, area, &k)?.map(|_| ()))
@@ -290,6 +302,7 @@ impl Run<'_> {
         };
         let item = built_item(
             target,
+            &e.group,
             e.game.as_deref().unwrap_or_default(),
             ItemKind::Adopt,
             &e.roms,
@@ -469,7 +482,7 @@ impl Run<'_> {
         let built = r
             .game
             .as_deref()
-            .map(|game| built_item(&r.target, game, ItemKind::Adopt, &r.roms, &[]));
+            .map(|game| built_item(&r.target, &r.group, game, ItemKind::Adopt, &r.roms, &[]));
         let applied = self.store.write(|tx| {
             let applied = match &built {
                 Some(item) => {
@@ -513,15 +526,16 @@ impl Run<'_> {
             Ok(source) => source,
             Err(e) => return left(&e.to_string()),
         };
-        match rustix::fs::fstat(&source) {
-            Ok(st) if same(&st) && is_file(&self.dir, &r.target, id).unwrap_or(false) => {}
+        let before = match rustix::fs::fstat(&source) {
+            Ok(st) if same(&st) && is_file(&self.dir, &r.target, id).unwrap_or(false) => {
+                Seen::of(&st)
+            }
             _ => return left("it changed since you approved the plan"),
-        }
+        };
         if self.staging.is_none() {
-            self.dir.mkdir_private(STAGING).map_err(folder_io)?;
-            let staging = self.dir.sub(STAGING).map_err(folder_io)?;
+            let staging = create_dir(self.store, self.folder, &self.dir, STAGING, STAGING)?
+                .map_err(Error::Refused)?;
             let own = staging.identity().map_err(folder_io)?;
-            record_temp(self.store, self.folder, STAGING, own)?;
             self.staging = Some((staging, own));
         }
         let name = format!("{seq}.zip");
@@ -531,8 +545,16 @@ impl Run<'_> {
         record_temp(self.store, self.folder, &staged_temp(&name), file_id)?;
         self.staged.insert(name.clone(), file_id);
         let staged_path = staging.path().join(&name);
+        // The old ZIP is read once: the rewrite hashes it whole as it reads it, for keeping it aside.
+        let mut read = None;
         let written = repack_from(&file, &r.roms, &source)
-            .and_then(|()| verify(&file, &r.roms))
+            .and_then(|(sha256, size)| {
+                if sha256 != r.sha256 || size != r.file.size {
+                    return Err("it is not the file the plan was made with".to_owned());
+                }
+                read = Some(sha256);
+                verify(&file, &r.roms)
+            })
             .and_then(|()| {
                 file.set_modified(self.built_at)
                     .and_then(|()| file.sync_all())
@@ -540,7 +562,7 @@ impl Run<'_> {
             })
             .and_then(|()| sha256_of(&file).map_err(|e| format!("{}: {e}", staged_path.display())))
             .and_then(|written| match rustix::fs::fstat(&source) {
-                Ok(st) if same(&st) => Ok(written),
+                Ok(st) if same(&st) => Ok((written, Seen::of(&st) == before)),
                 _ => Err("it changed while it was read".to_owned()),
             });
         drop(source);
@@ -550,10 +572,13 @@ impl Run<'_> {
             remove_staged(staging, &name, file_id).map_err(Error::Refused)?;
             left(why)
         };
-        let (sha256, size) = match written {
+        let ((sha256, size), unchanged) = match written {
             Ok(written) => written,
             Err(why) => return unstage(self, file, &why),
         };
+        let hashed = read
+            .filter(|_| unchanged)
+            .map(|read| (before.clone(), read));
         let keep = KeepAside {
             reason: KeepReason::Repack,
             name: r.target.clone(),
@@ -570,6 +595,7 @@ impl Run<'_> {
             seq,
             generation: self.generation,
             keep: &keep,
+            hashed,
         };
         let area = self.retention.as_ref().expect("opened above");
         if let Err(why) = self.store.keep_aside(&self.dir, area, &k)? {
@@ -609,9 +635,20 @@ impl Run<'_> {
             self.fail(seq, ItemState::Failed, &error)?;
             return Err(Error::Refused(error));
         }
-        self.dir.sync().map_err(folder_io)?;
+        self.store.fault_point(Fault::PublishedUnsynced(seq));
+        staging
+            .sync()
+            .and_then(|()| self.dir.sync())
+            .map_err(folder_io)?;
         self.store.fault_point(Fault::AfterPublish(seq));
-        let item = built_item(&r.target, &r.game, ItemKind::Repack, &r.roms, &r.sources);
+        let item = built_item(
+            &r.target,
+            &r.group,
+            &r.game,
+            ItemKind::Repack,
+            &r.roms,
+            &r.sources,
+        );
         let applied = match self.dir.stat(&r.target).map_err(folder_io)? {
             Some(st) => self
                 .store
@@ -628,6 +665,19 @@ impl Run<'_> {
         }
         Ok(Ok(()))
     }
+}
+
+/// Stores the check a cleanup of Managed Folder `folder` made of it as it left it, if it made one.
+fn store_refreshed(tx: &Transaction, folder: i64, refreshed: Option<Planned>) -> Result<()> {
+    if let Some(Planned {
+        check: Some(check),
+        scan,
+        ..
+    }) = refreshed
+    {
+        crate::checks::store_check(tx, folder, None, scan.as_ref(), check)?;
+    }
+    Ok(())
 }
 
 /// Acknowledges entry `e` for item `seq` of Build `build`, if `found`, its `lstat` now, is the entry the plan
@@ -739,8 +789,8 @@ impl Store {
             )?;
             tx.execute(
                 "INSERT INTO builds (folder_id, plan_id, job_id, selection_id, audit_id, dat_revision_id, state,
-                                     generation, started_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                     generation, started_at, kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'cleanup')",
                 params![
                     folder,
                     plan_id,
@@ -784,12 +834,14 @@ impl Store {
                     "UPDATE builds SET state = 'succeeded', finished_at = ?2, cleaned_at = ?2 WHERE id = ?1",
                     params![id, now()],
                 )?;
-                finish_running(tx, job, JobState::Succeeded, None)?;
                 Ok(id)
             })?;
             *build_id = Some(id);
-            self.refresh_check(config, folder);
-            return Ok(());
+            let refreshed = self.refresh_check(config, folder);
+            return self.write(|tx| {
+                store_refreshed(tx, folder, refreshed)?;
+                finish_running(tx, job, JobState::Succeeded, None)
+            });
         }
 
         let generation = content.generation + 1;
@@ -898,37 +950,29 @@ impl Store {
             &mut |tmp| record_temp(self, folder, MARKER_NEW, tmp),
         )?;
         self.fault_point(Fault::AfterMarker);
+        let refreshed = self.refresh_check(config, folder);
         self.write(|tx| {
             tx.execute(
                 "UPDATE builds SET state = 'succeeded', finished_at = ?2, cleaned_at = ?2 WHERE id = ?1",
                 params![id, now()],
             )?;
             tx.execute("DELETE FROM folder_temps WHERE folder_id = ?1", [folder])?;
+            store_refreshed(tx, folder, refreshed)?;
             finish_running(tx, job, JobState::Succeeded, None)
-        })?;
-        self.refresh_check(config, folder);
-        Ok(())
+        })
     }
 
     /// Checks Managed Folder `folder` again once a cleanup changed what a check finds in it, so that what it reports
-    /// is the folder as the cleanup left it. Only read; if it cannot be made, the last check stands.
-    fn refresh_check(&self, config: &Config, folder: i64) {
-        let Ok(planned) = self.compute_cleanup(
+    /// is the folder as the cleanup left it, to be stored with [`store_refreshed`] before the cleanup's job ends,
+    /// while nothing else acts on the folder. Only read; if it cannot be made, the last check stands.
+    fn refresh_check(&self, config: &Config, folder: i64) -> Option<Planned> {
+        self.compute_cleanup(
             config,
             folder,
             &title_select_api::build::PlanCleanup::default(),
-        ) else {
-            return;
-        };
-        let Some(check) = planned.check else {
-            return;
-        };
-        let _ = self.write(|tx| {
-            if folder_by_id(tx, folder)?.active_job.is_none() {
-                crate::checks::store_check(tx, folder, None, planned.scan.as_ref(), check)?;
-            }
-            Ok(())
-        });
+        )
+        .ok()
+        .filter(|planned| planned.check.is_some())
     }
 
     /// Settles item `p` of the unfinished cleanup Build `build`, which was moving an entry within the folder `dir`

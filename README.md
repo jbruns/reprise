@@ -425,13 +425,17 @@ recorded as built; or acknowledge an entry, which writes nothing to the folder a
 identity, size or modification time changes. A cleanup also puts kept files back, under their own name when it is
 free and, for a file holding a selected game, that game's file name; a kept file holding a selected game under
 another name is adopted under that game's file name instead, and one whose name is taken is refused. It repacks a
-built file flagged not TorrentZip from its own contents, keeping the file as it was aside. A kept folder is put back
+built file flagged not TorrentZip from its own contents, in one read, keeping the file as it was aside; if the
+service stops after the old file is kept aside and before the new one is in place, the game is reported failed, so
+the folder shows as incomplete until you put the kept copy back or build again. A kept folder is put back
 as it was, never adopted or deleted by Title Select. Every entry the cleanup found is part of its digest, chosen or
-not: if anything in the folder changes before you approve, the approval is refused and you review the new plan.
+not, along with the built files, acknowledged entries and kept files as they were: if anything in the folder changes
+before you approve, or before the cleanup starts, it is refused and you review the new plan.
 Every move is one rename that never replaces anything, made only while the entry is still the one the plan found,
 and recorded before it is made, so that a cleanup the service stopped during is settled when it next starts. A
 cleanup needs a current build, whose selection and DAT revision it uses; only one that moves or writes something
-advances the folder's generation.
+advances the folder's generation. A cleanup never counts as a build: a build that stopped stays reported until a
+build finishes.
 
 A folder is incomplete when its current build lacks some of its selection: unresolved groups left out, games with no
 source, files that failed, conflicts and blocked games, or built files a check found missing. The store records this

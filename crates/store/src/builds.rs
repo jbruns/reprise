@@ -33,7 +33,7 @@ use super::folders::{
     open_writable_folder, read_marker, store_id, write_marker,
 };
 use super::jobs::finish_running;
-use super::kept::{Keep, Retention, open_retention, settle_dir_temps};
+use super::kept::{Keep, Retention, create_dir, open_retention, settle_dir_temps};
 use super::plans::{digest, json, to_json};
 use super::{Error, Fault, Result, Store, now};
 use crate::config::Config;
@@ -293,6 +293,13 @@ fn record_applied(
             seq,
             torrentzip
         ],
+    )?;
+    // A file kept aside to be repacked is no longer missing once a file is built at its name.
+    tx.execute(
+        "DELETE FROM build_incomplete
+         WHERE build_id = (SELECT current_build_id FROM managed_folders WHERE id = ?1)
+           AND lower(target) = lower(?2) AND reason = 'failed' AND detail = ?3",
+        params![folder, item.target, super::kept::REPACK_UNPUBLISHED],
     )?;
     Ok(true)
 }
@@ -625,10 +632,8 @@ impl Store {
 
         let folder_io = |e: io::Error| Error::Io(e.to_string());
         let folder = content.folder;
-        dir.mkdir_private(STAGING).map_err(folder_io)?;
-        let staging = dir.sub(STAGING).map_err(folder_io)?;
+        let staging = create_dir(self, folder, &dir, STAGING, STAGING)?.map_err(Error::Refused)?;
         let staging_id = staging.identity().map_err(folder_io)?;
-        record_temp(self, folder, STAGING, staging_id)?;
         let mut staged_ids = HashMap::new();
         let built_at = SystemTime::now();
         let total = all.len() + removals.len();
@@ -700,6 +705,7 @@ impl Store {
                             seq: w.seq,
                             generation,
                             keep,
+                            hashed: None,
                         };
                         let area = retention.as_ref().expect("opened above");
                         if let Err(error) = self.keep_aside(&dir, area, &k)? {
@@ -747,7 +753,11 @@ impl Store {
                         return Err(Error::Refused(error));
                     }
                     // From here until the item is recorded applied, recovery settles it from its publish intent.
-                    dir.sync().map_err(folder_io)?;
+                    self.fault_point(Fault::PublishedUnsynced(w.seq));
+                    staging
+                        .sync()
+                        .and_then(|()| dir.sync())
+                        .map_err(folder_io)?;
                     self.fault_point(Fault::AfterPublish(w.seq));
                     let found = dir.stat(target).map_err(folder_io)?;
                     let applied = match &found {
@@ -816,6 +826,7 @@ impl Store {
                         seq,
                         generation,
                         keep,
+                        hashed: None,
                     };
                     let area = retention.as_ref().expect("opened above");
                     self.keep_aside(&dir, area, &k)?.map(|_| ())
@@ -1015,11 +1026,12 @@ impl Store {
                 marker.generation, folder.generation
             )));
         };
-        let temps = self.read(|c| temps(c, folder.id))?;
-
         if let Err(reason) = settle_dir_temps(self, folder.id, &dir)? {
             return Ok(Err(reason));
         }
+        // Read once the directories being created are settled: a staging directory renamed into place is then
+        // recorded among them.
+        let temps = self.read(|c| temps(c, folder.id))?;
         if let Err(reason) = self.settle_keeping(&dir, folder.id, build)? {
             return Ok(Err(reason));
         }
@@ -1071,6 +1083,31 @@ impl Store {
                             .map_err(|e| e.to_string()),
                     ),
                 };
+                // The file written is recorded in place only once its rename is durable: the Build may have stopped
+                // before it synced either folder, and a rename that is not durable may yet be undone.
+                if let Some(Ok(((sha256, size), _))) = &found
+                    && Some(sha256) == p.sha256.as_ref()
+                    && Some(*size as i64) == p.size
+                {
+                    let staging = match dir.stat(STAGING) {
+                        Ok(Some(st))
+                            if FolderDir::kind(&st) == rustix::fs::FileType::Directory
+                                && temps.get(STAGING) == Some(&Identity::of(&st)) =>
+                        {
+                            Some(dir.sub(STAGING))
+                        }
+                        Ok(_) => None,
+                        Err(e) => return Ok(Err(e.to_string())),
+                    };
+                    let synced = staging
+                        .transpose()
+                        .and_then(|staging| staging.map_or(Ok(()), |s| s.sync()))
+                        .and_then(|()| dir.sync());
+                    if let Err(e) = synced {
+                        return Ok(Err(e.to_string()));
+                    }
+                    self.fault_point(Fault::AfterPublish(p.seq));
+                }
                 self.write(|tx| match found {
                     None => set_item(
                         tx,

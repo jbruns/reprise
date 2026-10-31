@@ -92,3 +92,16 @@ CREATE TABLE drift_acks (
     acknowledged_at TEXT NOT NULL,
     PRIMARY KEY (folder_id, name)
 );
+
+-- What a Build row records: a Build of a Selection ('build'), or a cleanup of a folder's drift ('cleanup'). Only a
+-- Build that succeeded settles an earlier one that stopped: a cleanup never does.
+ALTER TABLE builds ADD COLUMN kind TEXT NOT NULL DEFAULT 'build' CHECK (kind IN ('build', 'cleanup'));
+
+-- The unique temporary name a directory Title Select creates in a Managed Folder is about to be made under,
+-- committed before it is made, so that one a stop left there, before its identity was recorded in folder_temps, is
+-- still known to be this store's: recovery records it, when it is the empty private directory made, and leaves it.
+CREATE TABLE folder_temp_names (
+    folder_id INTEGER NOT NULL REFERENCES managed_folders (id),
+    name TEXT NOT NULL,
+    PRIMARY KEY (folder_id, name)
+);

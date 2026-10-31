@@ -90,6 +90,8 @@ pub(super) struct Scan {
     updates: Vec<Update>,
     /// What was read of each entry, by name, with the file as it was when read.
     pub probes: HashMap<String, (Seen, Probe)>,
+    /// The acknowledgements the check was made with: only these can it find changed.
+    acks: HashMap<String, Ack>,
 }
 
 /// What a check compares the folder with.
@@ -177,6 +179,7 @@ pub(super) fn scan(
         acknowledged: Vec::new(),
         updates: Vec::new(),
         probes: HashMap::new(),
+        acks: input.acks.clone(),
     };
     let by_lower: HashMap<String, &str> = entries
         .iter()
@@ -455,17 +458,22 @@ pub(super) fn store_check(
         }
         tx.execute("DELETE FROM folder_probes WHERE folder_id = ?1", [folder])?;
         // An acknowledgement lasts only while its entry is as it was: one the check found changed, or gone, is
-        // dropped, and the entry is drift again.
+        // dropped, and the entry is drift again. Only one the check was made with, and still as it was then, is: one
+        // made, or made again, since the check read the store is not what it found changed.
         let kept: HashSet<&str> = scan.acknowledged.iter().map(|d| d.name.as_str()).collect();
-        let acks: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT name FROM drift_acks WHERE folder_id = ?1")?;
-            let rows = stmt.query_map([folder], |r| r.get(0))?;
-            rows.collect::<Result<_, _>>()?
-        };
-        for name in acks.iter().filter(|n| !kept.contains(n.as_str())) {
+        for (name, ack) in scan.acks.iter().filter(|(n, _)| !kept.contains(n.as_str())) {
+            let (dev, ino) = ack.identity.to_sql();
             tx.execute(
-                "DELETE FROM drift_acks WHERE folder_id = ?1 AND name = ?2",
-                params![folder, name],
+                "DELETE FROM drift_acks
+                 WHERE folder_id = ?1 AND name = ?2 AND dev = ?3 AND ino = ?4 AND size = ?5 AND mtime_ns = ?6",
+                params![
+                    folder,
+                    name,
+                    dev,
+                    ino,
+                    ack.file.size as i64,
+                    ack.file.mtime_ns as i64
+                ],
             )?;
         }
         for (name, (at, probe)) in &scan.probes {

@@ -1084,6 +1084,9 @@ pub struct CleanupEntry {
     /// For an adoption: the ROMs the DAT expects in it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roms: Vec<ExpectedRom>,
+    /// For an adoption: the group the game is selected in.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
     /// Whether the check found it was not TorrentZip, for an adoption.
     #[serde(default = "yes")]
     pub torrentzip: bool,
@@ -1113,6 +1116,9 @@ pub struct CleanupRestore {
     pub game: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roms: Vec<ExpectedRom>,
+    /// The group the game is selected in, when it holds a selected game.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
     #[serde(default = "yes")]
     pub torrentzip: bool,
 }
@@ -1122,6 +1128,9 @@ pub struct CleanupRestore {
 pub struct CleanupRepack {
     pub target: String,
     pub game: String,
+    /// The group the game is selected in.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
     pub roms: Vec<ExpectedRom>,
     /// Where the file was built from, which its record keeps once it is repacked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1141,6 +1150,11 @@ pub struct Cleanup {
     pub restores: Vec<CleanupRestore>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repacks: Vec<CleanupRepack>,
+    /// The SHA-256 of what the folder held as the cleanup was planned: each entry in it, each built file's record
+    /// and what is at its name, each acknowledged entry and each kept file, by identity, size and modification time.
+    /// The plan is carried out only while the folder still holds the same.
+    #[serde(default)]
+    pub fingerprint: String,
 }
 
 impl Cleanup {

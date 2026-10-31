@@ -189,7 +189,8 @@ fn record(c: &Connection, config: &Config, row: FolderRow) -> Result<ManagedFold
 }
 
 /// The folder's latest Build that stopped before it finished, unless a Build has succeeded since. Whether it is the
-/// folder's current Build does not matter: one stopped after it advanced the generation still did not finish.
+/// folder's current Build does not matter: one stopped after it advanced the generation still did not finish. A
+/// cleanup that succeeded since does not settle it: it built nothing the Build left undone.
 fn unfinished(c: &Connection, row: &FolderRow) -> Result<Option<UnfinishedBuild>> {
     Ok(c.query_row(
         "SELECT b.id, b.state,
@@ -199,7 +200,8 @@ fn unfinished(c: &Connection, row: &FolderRow) -> Result<Option<UnfinishedBuild>
                 (SELECT count(*) FROM kept_files k WHERE k.build_id = b.id AND k.state IN ('kept', 'deleting', 'quarantined', 'deleted', 'gone', 'restoring', 'restored'))
          FROM builds b
          WHERE b.folder_id = ?1 AND b.state IN ('failed', 'interrupted')
-           AND NOT EXISTS (SELECT 1 FROM builds s WHERE s.folder_id = ?1 AND s.id > b.id AND s.state = 'succeeded')
+           AND NOT EXISTS (SELECT 1 FROM builds s WHERE s.folder_id = ?1 AND s.id > b.id AND s.state = 'succeeded'
+                             AND s.kind = 'build')
          ORDER BY b.id DESC LIMIT 1",
         params![row.id],
         |r| {
