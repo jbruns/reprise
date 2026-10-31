@@ -9,9 +9,9 @@ use crate::selection::Role;
 pub const MARKER: &str = ".title-select";
 /// The folder, inside a Managed Folder, that a Build stages its files in, so that renames never cross mounts.
 pub const STAGING: &str = ".title-select-staging";
-/// The folder's retention area, where Kept Files will be set aside (#37). Reserved now, so that a check never reports
-/// it as Drift.
-pub const RETENTION: &str = ".title-select-kept";
+/// The directory, inside a Managed Folder, where Kept Files will be set aside under `<generation>/` (#37). Reserved
+/// now, so that a check never reports it as Drift.
+pub const RETENTION: &str = ".title-select-retained";
 
 /// What a Managed Folder's marker records. The store stays the source of truth; the marker lets a plan tell its
 /// folder from a folder another store manages, a folder restored from a backup, or a wrong mount.

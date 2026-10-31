@@ -17,8 +17,8 @@ use std::time::SystemTime;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 use title_select_api::build::{
-    BuildDetail, BuildItem, BuildSummary, BuiltFile, ExpectedRom, FileStat, IncompleteReason,
-    ItemKind, ItemState, Marker, PlanItem, STAGING,
+    BuildDetail, BuildItem, BuildSummary, BuiltFile, ExpectedRom, FileOutcome, FileStat,
+    IncompleteReason, ItemKind, ItemState, Marker, PlanItem, STAGING,
 };
 use title_select_api::{Job, JobKind, JobState};
 use title_select_engine::Progress;
@@ -375,9 +375,15 @@ fn adopt(dir: &FolderDir, item: &PlanItem) -> std::result::Result<(String, Stat,
     }
 }
 
-/// Records what the Build `build` left Managed Folder `folder` lacking of its Selection: each item of its plan that
-/// was skipped, other than an unresolved one whose file is built here, and each item that failed.
-fn record_incomplete(tx: &Transaction, build: i64, folder: i64, items: &[PlanItem]) -> Result<()> {
+/// Records what the Build `build` left its Managed Folder lacking of its Selection: each item of its plan that was
+/// skipped, other than an unresolved one whose earlier built file the build's check found `retained` (target to
+/// game) for the same game, and each item that failed.
+fn record_incomplete(
+    tx: &Transaction,
+    build: i64,
+    items: &[PlanItem],
+    retained: &HashMap<String, String>,
+) -> Result<()> {
     let failed: HashMap<String, Option<String>> = {
         let mut stmt = tx.prepare(
             "SELECT target, error FROM build_items WHERE build_id = ?1 AND state IN ('failed', 'uncertain', 'pending')",
@@ -389,17 +395,9 @@ fn record_incomplete(tx: &Transaction, build: i64, folder: i64, items: &[PlanIte
     for item in items {
         let reason = match item.kind {
             _ if failed.contains_key(&item.target) => IncompleteReason::Failed,
-            ItemKind::Unresolved => {
-                let built: bool = tx.query_row(
-                    "SELECT EXISTS (SELECT 1 FROM built_files WHERE folder_id = ?1 AND target = ?2)",
-                    params![folder, item.target],
-                    |r| r.get(0),
-                )?;
-                if built {
-                    continue;
-                }
-                IncompleteReason::Unresolved
-            }
+            // Left out, but only complete when the build's check found the file built before still holds the game.
+            ItemKind::Unresolved if retained.get(&item.target) == Some(&item.game) => continue,
+            ItemKind::Unresolved => IncompleteReason::Unresolved,
             ItemKind::NoSource => IncompleteReason::NoSource,
             ItemKind::Conflict => IncompleteReason::Conflict,
             ItemKind::Blocked => IncompleteReason::Blocked,
@@ -510,6 +508,19 @@ impl Store {
         let content = &plan.content;
         let again =
             self.compute_plan(config, content.folder, content.selection, &content.choices)?;
+        // The built files this build's own check found still hold their games, by target.
+        let retained: HashMap<String, String> = again
+            .check
+            .iter()
+            .flat_map(|check| &check.files)
+            .filter(|f| {
+                matches!(
+                    f.outcome,
+                    FileOutcome::Unchanged | FileOutcome::Refreshed | FileOutcome::Repacked
+                )
+            })
+            .map(|f| (f.target.clone(), f.game.clone()))
+            .collect();
         if digest(&again.content) != approved.digest {
             let newer = self.write(|tx| super::plans::insert_plan(tx, &again, None))?;
             return Err(Error::Conflict(format!(
@@ -761,7 +772,7 @@ impl Store {
                 "UPDATE builds SET finalizing_at = ?2 WHERE id = ?1",
                 params![id, now()],
             )?;
-            record_incomplete(tx, id, folder, &content.items)?;
+            record_incomplete(tx, id, &content.items, &retained)?;
             tx.execute("DELETE FROM audit_citations WHERE cited_by = ?1", [&key])?;
             tx.execute(
                 "INSERT INTO audit_citations (audit_id, cited_by) VALUES (?1, ?2)",

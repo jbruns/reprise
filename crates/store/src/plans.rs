@@ -20,7 +20,7 @@ use title_select_engine::build::{Probe, holds, is_torrentzip};
 use title_select_engine::dat::Dat;
 
 use super::audits::{ENTRY_COLUMNS, entry_from_row};
-use super::checks::{Scan, ScanInput, read_probes, scan, store_check};
+use super::checks::{Scan, ScanInput, Seen, read_probes, scan, store_check};
 use super::dats::revision_by_id;
 use super::folder_dir::{FolderDir, file_stat};
 use super::folders::{
@@ -138,7 +138,7 @@ struct Inputs {
     /// The selected Games, by their target's lowercased name.
     selected: HashMap<String, String>,
     /// What earlier checks of the folder read, by name.
-    cached: HashMap<String, (FileStat, Probe)>,
+    cached: HashMap<String, (Seen, Probe)>,
 }
 
 fn load(
@@ -849,7 +849,7 @@ fn plan_items(
                 && scan
                     .and_then(|s| s.probes.get(name))
                     .is_some_and(|(at, probe)| {
-                        Some(at) == item.existing.as_ref() && holds(probe, &item.roms)
+                        Some(&at.file) == item.existing.as_ref() && holds(probe, &item.roms)
                     });
             let chosen = inputs.choices.adopt.contains(&target);
             if item.adoptable && chosen {

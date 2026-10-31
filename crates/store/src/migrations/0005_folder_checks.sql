@@ -130,6 +130,9 @@ CREATE TABLE folder_probes (
     name TEXT NOT NULL,
     size INTEGER NOT NULL,
     mtime_ns INTEGER NOT NULL,
+    dev INTEGER NOT NULL,
+    ino INTEGER NOT NULL,
+    ctime_ns INTEGER NOT NULL,
     probe TEXT NOT NULL,
     PRIMARY KEY (folder_id, name)
 );

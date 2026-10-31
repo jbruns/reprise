@@ -18,7 +18,7 @@ use title_select_engine::dat::Dat;
 
 use super::audits::choose_revision;
 use super::dats::revision_by_id;
-use super::folder_dir::{FolderDir, Identity, file_stat};
+use super::folder_dir::{FolderDir, Identity, ctime_ns, file_stat};
 use super::folders::{folder_by_id, is_own, marker_problem, open_folder, store_id};
 use super::jobs::{finish_running, job_by_id};
 use super::plans::{Built, json, read_built, to_json};
@@ -36,13 +36,32 @@ pub(super) struct Update {
     torrentzip: bool,
 }
 
+/// A file as `lstat` or `fstat` saw it: what it is, and every time its content or metadata could change. What was
+/// read of a file is reused only while all of it is the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Seen {
+    pub file: FileStat,
+    pub identity: Identity,
+    pub ctime_ns: i128,
+}
+
+impl Seen {
+    pub fn of(st: &Stat) -> Seen {
+        Seen {
+            file: file_stat(st),
+            identity: Identity::of(st),
+            ctime_ns: ctime_ns(st),
+        }
+    }
+}
+
 /// What a check found, before it is stored.
 pub(super) struct Scan {
     pub files: Vec<CheckedFile>,
     pub drift: Vec<DriftEntry>,
     updates: Vec<Update>,
-    /// What was read of each entry, by name, with the size and modification time it was read at.
-    pub probes: HashMap<String, (FileStat, Probe)>,
+    /// What was read of each entry, by name, with the file as it was when read.
+    pub probes: HashMap<String, (Seen, Probe)>,
 }
 
 /// What a check compares the folder with.
@@ -52,7 +71,7 @@ pub(super) struct ScanInput<'a> {
     pub selected: &'a HashMap<String, String>,
     pub dat: Option<&'a Dat>,
     /// What earlier checks read, by name.
-    pub cached: &'a HashMap<String, (FileStat, Probe)>,
+    pub cached: &'a HashMap<String, (Seen, Probe)>,
 }
 
 /// The names in a folder other than Title Select's own entries, sorted.
@@ -73,24 +92,46 @@ fn read(dir: &FolderDir, name: &str, seen: &Stat) -> std::result::Result<Probe, 
     let changed = || "it changed while it was read".to_owned();
     let file: File = dir.open_file(name).map_err(|e| e.to_string())?;
     let before = rustix::fs::fstat(&file).map_err(|e| e.to_string())?;
-    if Identity::of(&before) != Identity::of(seen) || file_stat(&before) != file_stat(seen) {
+    if Seen::of(&before) != Seen::of(seen) {
         return Err(changed());
     }
     let probe = probe(&file).map_err(|e| e.to_string())?;
-    let after = rustix::fs::fstat(&file).map_err(|e| e.to_string())?;
-    if file_stat(&after) != file_stat(&before) {
-        return Err(changed());
-    }
+    still(dir, name, &file, seen)?;
+    Ok(probe)
+}
+
+/// Whether `file`, opened from `name` in `dir`, and the entry at `name` are both still the file `seen`.
+fn still(dir: &FolderDir, name: &str, file: &File, seen: &Stat) -> std::result::Result<(), String> {
+    let after = rustix::fs::fstat(file).map_err(|e| e.to_string())?;
     match dir.stat(name) {
         Ok(Some(st))
             if FolderDir::kind(&st) == FileType::RegularFile
-                && Identity::of(&st) == Identity::of(&before)
-                && file_stat(&st) == file_stat(&before) =>
+                && Seen::of(&after) == Seen::of(seen)
+                && Seen::of(&st) == Seen::of(seen) =>
         {
-            Ok(probe)
+            Ok(())
         }
-        _ => Err(changed()),
+        _ => Err("it changed while it was read".to_owned()),
     }
+}
+
+/// Reuses `cached`, what an earlier check read of `name`, only when the file found by `lstat` as `seen` is the one
+/// it was read from: the same identity, size, modification time and status change time, through the folder's handle
+/// as well as by name. Otherwise reads it again.
+fn reuse(
+    dir: &FolderDir,
+    name: &str,
+    seen: &Stat,
+    cached: Option<&(Seen, Probe)>,
+) -> (std::result::Result<Probe, String>, bool) {
+    if let Some((was, probe)) = cached
+        && *was == Seen::of(seen)
+        && let Ok(file) = dir.open_file(name)
+        && still(dir, name, &file, seen).is_ok()
+    {
+        return (Ok(probe.clone()), false);
+    }
+    (read(dir, name, seen), true)
 }
 
 /// Checks the folder `dir`, whose entries are `entries`, against `input`. Nothing in it is changed.
@@ -123,18 +164,10 @@ pub(super) fn scan(
     };
     // Reads `name`, or reuses what an earlier check read of it while it is unchanged since.
     let probe_of = |name: &str, st: &Stat, out: &mut Scan| {
-        let at = file_stat(st);
-        let cached = input
-            .cached
-            .get(name)
-            .filter(|(was, _)| *was == at)
-            .map(|(_, p)| p.clone());
-        let (probe, hashed) = match cached {
-            Some(p) => (Ok(p), false),
-            None => (read(dir, name, st), true),
-        };
+        let (probe, hashed) = reuse(dir, name, st, input.cached.get(name));
         if let Ok(p) = &probe {
-            out.probes.insert(name.to_owned(), (at, p.clone()));
+            out.probes
+                .insert(name.to_owned(), (Seen::of(st), p.clone()));
         }
         (probe, hashed)
     };
@@ -325,21 +358,23 @@ pub(super) fn selected_targets(c: &Connection, selection: i64) -> Result<HashMap
     Ok(selected)
 }
 
-pub(super) fn read_probes(
-    c: &Connection,
-    folder: i64,
-) -> Result<HashMap<String, (FileStat, Probe)>> {
-    let mut stmt =
-        c.prepare("SELECT name, size, mtime_ns, probe FROM folder_probes WHERE folder_id = ?1")?;
+pub(super) fn read_probes(c: &Connection, folder: i64) -> Result<HashMap<String, (Seen, Probe)>> {
+    let mut stmt = c.prepare(
+        "SELECT name, size, mtime_ns, dev, ino, ctime_ns, probe FROM folder_probes WHERE folder_id = ?1",
+    )?;
     let rows = stmt.query_map([folder], |r| {
         Ok((
             r.get::<_, String>(0)?,
             (
-                FileStat {
-                    size: r.get::<_, i64>(1)? as u64,
-                    mtime_ns: r.get::<_, i64>(2)? as i128,
+                Seen {
+                    file: FileStat {
+                        size: r.get::<_, i64>(1)? as u64,
+                        mtime_ns: r.get::<_, i64>(2)? as i128,
+                    },
+                    identity: Identity::from_sql(r.get(3)?, r.get(4)?),
+                    ctime_ns: r.get::<_, i64>(5)? as i128,
                 },
-                json(r, 3)?,
+                json(r, 6)?,
             ),
         ))
     })?;
@@ -375,13 +410,18 @@ pub(super) fn store_check(
         }
         tx.execute("DELETE FROM folder_probes WHERE folder_id = ?1", [folder])?;
         for (name, (at, probe)) in &scan.probes {
+            let (dev, ino) = at.identity.to_sql();
             tx.execute(
-                "INSERT INTO folder_probes (folder_id, name, size, mtime_ns, probe) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO folder_probes (folder_id, name, size, mtime_ns, dev, ino, ctime_ns, probe)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     folder,
                     name,
-                    at.size as i64,
-                    at.mtime_ns as i64,
+                    at.file.size as i64,
+                    at.file.mtime_ns as i64,
+                    dev,
+                    ino,
+                    at.ctime_ns as i64,
                     to_json(probe)
                 ],
             )?;
@@ -436,7 +476,7 @@ struct CheckInputs {
     selection: Option<i64>,
     selected: HashMap<String, String>,
     revision: (String, bool),
-    cached: HashMap<String, (FileStat, Probe)>,
+    cached: HashMap<String, (Seen, Probe)>,
 }
 
 impl Store {

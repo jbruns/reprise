@@ -13,7 +13,7 @@ use title_select_api::build::{
 };
 use title_select_api::paths::{PathTemplate, TokenValues, relative_path};
 
-use super::checks::{latest_check, latest_summary};
+use super::checks::{latest_check, latest_summary, selected_targets};
 use super::dats::split_dat;
 use super::folder_dir::{FolderDir, Identity};
 use super::plans::json;
@@ -188,7 +188,8 @@ fn record(c: &Connection, config: &Config, row: FolderRow) -> Result<ManagedFold
     })
 }
 
-/// The folder's latest Build, when it stopped before it finished and no Build has succeeded since.
+/// The folder's latest Build that stopped before it finished, unless a Build has succeeded since. Whether it is the
+/// folder's current Build does not matter: one stopped after it advanced the generation still did not finish.
 fn unfinished(c: &Connection, row: &FolderRow) -> Result<Option<UnfinishedBuild>> {
     Ok(c.query_row(
         "SELECT b.id, b.state,
@@ -196,9 +197,10 @@ fn unfinished(c: &Connection, row: &FolderRow) -> Result<Option<UnfinishedBuild>
                 (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'uncertain'),
                 (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state IN ('pending', 'failed'))
          FROM builds b
-         WHERE b.folder_id = ?1 AND b.id > ?2 AND b.state IN ('failed', 'interrupted')
-           AND b.id = (SELECT max(id) FROM builds WHERE folder_id = ?1)",
-        params![row.id, row.current_build.unwrap_or(0)],
+         WHERE b.folder_id = ?1 AND b.state IN ('failed', 'interrupted')
+           AND NOT EXISTS (SELECT 1 FROM builds s WHERE s.folder_id = ?1 AND s.id > b.id AND s.state = 'succeeded')
+         ORDER BY b.id DESC LIMIT 1",
+        params![row.id],
         |r| {
             let state: String = r.get(1)?;
             Ok(UnfinishedBuild {
@@ -214,7 +216,8 @@ fn unfinished(c: &Connection, row: &FolderRow) -> Result<Option<UnfinishedBuild>
 }
 
 /// What the folder lacks of its current Build's Selection: what the Build recorded, and the conflicts and missing
-/// files a check found since, each target once.
+/// files a check found since at that Selection's targets, each target once. Which targets are selected comes from
+/// the Build's Selection, never from the check, which may have been made for another Selection's plan.
 pub(super) fn incomplete(c: &Connection, row: &FolderRow) -> Result<Incomplete> {
     let mut out = Incomplete {
         build: row.current_build,
@@ -252,8 +255,15 @@ pub(super) fn incomplete(c: &Connection, row: &FolderRow) -> Result<Incomplete> 
                 .find(|i| i.target.eq_ignore_ascii_case(target))
                 .map(|i| (i.group.clone(), i.game.clone()))
         };
+        let selection: i64 = c.query_row(
+            "SELECT selection_id FROM builds WHERE id = ?1",
+            [build],
+            |r| r.get(0),
+        )?;
+        let selected = selected_targets(c, selection)?;
+        let is_selected = |target: &str| selected.contains_key(&target.to_lowercase());
         let mut found = Vec::new();
-        for f in check.files.iter().filter(|f| f.selected) {
+        for f in check.files.iter().filter(|f| is_selected(&f.target)) {
             let reason = match f.outcome {
                 FileOutcome::Conflict | FileOutcome::Unreadable => IncompleteReason::Conflict,
                 FileOutcome::Missing => IncompleteReason::Missing,
@@ -261,7 +271,7 @@ pub(super) fn incomplete(c: &Connection, row: &FolderRow) -> Result<Incomplete> 
             };
             found.push((reason, f.target.clone(), f.detail.clone()));
         }
-        for d in check.drift.iter().filter(|d| d.conflict) {
+        for d in check.drift.iter().filter(|d| is_selected(&d.name)) {
             found.push((
                 IncompleteReason::Conflict,
                 d.name.clone(),

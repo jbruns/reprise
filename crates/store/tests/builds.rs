@@ -1918,3 +1918,148 @@ fn an_interrupted_build_is_badged_from_the_store_and_a_new_plan_completes_the_fo
     assert_eq!(done.incomplete, None);
     assert_eq!(done.files, 4);
 }
+
+/// Replaces `path` with a new file holding `members`, with the modification time it had.
+fn replace_keeping_mtime(path: &Path, members: &[(&str, &[u8])]) {
+    let mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+    std::fs::remove_file(path).unwrap();
+    write_stored_zip(path, members);
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(mtime).unwrap();
+}
+
+#[test]
+fn a_file_replaced_with_the_same_size_and_mtime_is_read_again() {
+    let env = Env::new();
+    env.audit();
+    let id = titles(&env, &["Pong (USA)"]);
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    assert_eq!(env.build(&env.plan(&folder, id)).state, JobState::Succeeded);
+    let pong = dir.join("Pong (USA).zip");
+    write_stored_zip(&pong, &[("Pong (USA).a26", b"pung")]);
+    let edited = check(&env, &folder);
+    assert_eq!(edited.files[0].outcome, FileOutcome::Conflict);
+    let counts = |env: &Env| {
+        env.store
+            .managed_folder(&env.config, folder.id)
+            .unwrap()
+            .incomplete
+            .map(|c| c.conflict)
+    };
+    assert_eq!(counts(&env), Some(1));
+
+    // The same size and modification time, but another file: what was read of the edited one is not reused.
+    replace_keeping_mtime(&pong, &[("Pong (USA).a26", b"pong")]);
+    let fixed = check(&env, &folder);
+
+    assert_eq!(
+        (fixed.files[0].outcome, fixed.files[0].hashed),
+        (FileOutcome::Repacked, true)
+    );
+    assert_eq!(counts(&env), None);
+}
+
+#[test]
+fn planning_another_selection_keeps_the_current_builds_incomplete_badge() {
+    let env = Env::new();
+    env.audit();
+    let both = titles(&env, &["Pong (USA)", "Combat (USA)"]);
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    assert_eq!(
+        env.build(&env.plan(&folder, both)).state,
+        JobState::Succeeded
+    );
+    std::fs::remove_file(dir.join("Pong (USA).zip")).unwrap();
+
+    let without = titles(&env, &["Combat (USA)"]);
+    let plan = env.plan(&folder, without);
+    assert!(plan.check.is_some());
+
+    let folder = env.store.managed_folder(&env.config, folder.id).unwrap();
+    assert_eq!(folder.incomplete.map(|c| c.missing), Some(1));
+    let incomplete = env.store.incomplete(folder.id).unwrap();
+    assert_eq!(incomplete.items[0].target, "Pong (USA).zip");
+}
+
+#[test]
+fn an_unresolved_group_is_complete_only_when_its_built_file_still_holds_the_game() {
+    let env = Env::new();
+    env.audit();
+    let id = titles(&env, &["Pong (USA)", "Combat (USA)", "Yars (USA)"]);
+    let folder = env.folder("atari2600");
+    let dir = env.play().join("atari2600");
+    assert_eq!(env.build(&env.plan(&folder, id)).state, JobState::Succeeded);
+    std::fs::remove_file(dir.join("Combat (USA).zip")).unwrap();
+    write_stored_zip(&dir.join("Yars (USA).zip"), &[("Yars (USA).a26", b"yarz")]);
+
+    let mut unresolved = selection(
+        &env.sha256,
+        vec![
+            group("Pong (USA)"),
+            group("Combat (USA)"),
+            group("Yars (USA)"),
+        ],
+    );
+    for g in &mut unresolved.groups {
+        g.unresolved = true;
+    }
+    let id = env.record(&unresolved);
+    let plan = plan_with(
+        &env,
+        &folder,
+        id,
+        PlanChoices {
+            resolved_only: true,
+            adopt: vec![],
+        },
+    );
+    assert!(plan.approvable(), "{:?}", plan.content.blockers);
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+
+    let incomplete = env.store.incomplete(folder.id).unwrap();
+    let reasons: BTreeMap<&str, IncompleteReason> = incomplete
+        .items
+        .iter()
+        .map(|i| (i.target.as_str(), i.reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        BTreeMap::from([
+            ("Combat (USA).zip", IncompleteReason::Unresolved),
+            ("Yars (USA).zip", IncompleteReason::Unresolved),
+        ]),
+        "the missing and the changed file stay incomplete; Pong, still as built, does not"
+    );
+}
+
+#[test]
+fn a_build_stopped_after_it_advanced_the_generation_is_still_badged() {
+    for fault in [Fault::AfterFinalize, Fault::AfterMarker] {
+        let env = Env::new();
+        env.audit();
+        let id = titles(&env, &["Pong (USA)", "Combat (USA)"]);
+        let folder = env.folder("atari2600");
+        let plan = env.plan(&folder, id);
+        env.crash(&plan, fault);
+        let (env, blocked) = env.restart();
+        assert!(blocked.is_empty(), "{fault:?}: {blocked:?}");
+
+        let badged = env.store.managed_folder(&env.config, folder.id).unwrap();
+        assert_eq!(badged.generation, 1, "{fault:?}");
+        let unfinished = badged.unfinished.clone().unwrap();
+        assert_eq!(
+            (unfinished.state, unfinished.applied, unfinished.uncertain),
+            (BuildState::Interrupted, 2, 0),
+            "{fault:?}"
+        );
+        assert_eq!(Some(unfinished.build), badged.build.as_ref().map(|b| b.id));
+
+        let next = env.plan(&badged, id);
+        assert!(next.approvable(), "{fault:?}: {:?}", next.content.blockers);
+        assert_eq!(env.build(&next).state, JobState::Succeeded);
+        let done = env.store.managed_folder(&env.config, folder.id).unwrap();
+        assert_eq!(done.unfinished, None, "{fault:?}");
+    }
+}

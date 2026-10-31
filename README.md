@@ -384,7 +384,7 @@ build, and whether your settings, your choices or the DAT revision caused it.
 
 Your choices are part of the plan, and of its digest: building resolved groups only, and, for each conflict that
 holds the ROMs the DAT expects, leaving it (the default) or adopting it. To change one, plan again with it. The
-folder name `.title-select-kept` is reserved for a later build step.
+folder name `.title-select-retained` is reserved for a later build step.
 
 Planning also checks the folder, as a check job does. A check job (`POST /managed-folders/{id}/checks`) reads the
 folder and writes only to the store. It reads a built file only when its size or modification time differs from the
