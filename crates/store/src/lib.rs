@@ -9,6 +9,7 @@ mod dats;
 mod folder_dir;
 mod folders;
 mod jobs;
+mod kept;
 mod migrations;
 mod plans;
 mod profiles;
@@ -105,6 +106,12 @@ pub enum Fault {
     BeforePublish(i64),
     /// After the file of the item with this sequence number is renamed into place, before the store records it.
     AfterPublish(i64),
+    /// After the intent to keep aside the file of the item with this sequence number is committed, before it is
+    /// moved.
+    BeforeKeep(i64),
+    /// After the file of the item with this sequence number is moved into the retention area, before the store
+    /// records it kept.
+    AfterKeep(i64),
     /// After the store commits the folder's next generation, before the marker advances to it.
     AfterFinalize,
     /// After the marker advances, before the store records the Build finished.

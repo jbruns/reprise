@@ -378,13 +378,27 @@ against the selection's DAT revision:
 Each ROM's source is ranked: matched before misnamed or conflicting, payload evidence before metadata, a copyable
 archive before another, then by path. No source, conflict and blocked items are skipped and shown. A plan cannot be
 approved while the source set has no audit against the selection's DAT revision, a group is unresolved and you have
-neither confirmed a choice nor chosen to build resolved groups only, the root is not writable, the folder or its marker is wrong, or a built file would be removed
-or replaced; removing and replacing built files need a later build step. It shows what changed since the current
-build, and whether your settings, your choices or the DAT revision caused it.
+neither confirmed a choice nor chosen to build resolved groups only, the root is not writable, or the folder, its
+marker or its retention area is wrong. It shows what changed since the current build, and whether your settings,
+your choices or the DAT revision caused it.
 
-Your choices are part of the plan, and of its digest: building resolved groups only, and, for each conflict that
-holds the ROMs the DAT expects, leaving it (the default) or adopting it. To change one, plan again with it. The
-folder name `.title-select-retained` is reserved for a later build step.
+A plan never deletes a file. A built file whose game is no longer selected is a removal: the plan keeps it aside when
+a check finds it as built, forgets its record when it is gone already, and leaves it when it changed since it was
+built. A built file the plan writes again from other ROMs, as when a newer DAT revision changes the game, is a
+replacement: the old file is kept aside and the new one written in the same build. Keeping a file aside moves it, by
+one rename that never replaces anything, into `.title-select-retained/<generation>/<name>.kept` in the same folder,
+only while it is still the file the plan found. The store records each kept file with its original name, the build
+that kept it and its provenance, and holds that provenance's selection and audit from pruning. A plan never removes a
+file Title Select did not build.
+
+Your choices are part of the plan, and of its digest: building resolved groups only, and, for each conflict, leaving
+it (the default), adopting it when it holds the ROMs the DAT expects, or keeping it aside and building the game in its
+place. To change one, plan again with it. The removals are part of the digest too.
+
+Kept files stay until you delete them: list them (`GET /managed-folders/{id}/kept-files`), plan deleting some or all
+(`POST /managed-folders/{id}/kept-deletions`), review the plan's digest, and approve it. Each kept file is deleted
+only while it is still the file that was kept; anything else at its name, a symlink or a directory included, is left
+and reported. Checks and drift never report the retention area.
 
 Planning also checks the folder, as a check job does. A check job (`POST /managed-folders/{id}/checks`) reads the
 folder and writes only to the store. It reads a built file only when its size or modification time differs from the
@@ -474,10 +488,14 @@ Every body is JSON, and every error is `{"error": "...", "job": <id, when one is
 | `PATCH /api/v1/managed-folders/{id}`               | rebind it: `{"source_set"?, "profile"?}`                     |
 | `GET /api/v1/managed-folders/{id}/builds`          | its builds, newest first                                     |
 | `GET /api/v1/managed-folders/{id}/files`           | the files built into it, with their provenance               |
-| `POST /api/v1/managed-folders/{id}/plans`          | plan building a selection into it: `{"selection", "resolved_only"?, "adopt"?: [target]}`; `201` |
+| `POST /api/v1/managed-folders/{id}/plans`          | plan building a selection into it: `{"selection", "resolved_only"?, "adopt"?: [target], "keep_aside"?: [target]}`; `201` |
 | `POST /api/v1/managed-folders/{id}/checks`         | check it; `202` with the check job                           |
 | `GET /api/v1/managed-folders/{id}/check`           | its latest check: each built file and the drift; `404` when never checked |
 | `GET /api/v1/managed-folders/{id}/incomplete`      | what its current build lacks, by reason                      |
+| `GET /api/v1/managed-folders/{id}/kept-files`      | the files builds kept aside in it, newest generation first   |
+| `POST /api/v1/managed-folders/{id}/kept-deletions` | plan deleting kept files: `{"ids"?: [id], "all"?}`; `201`     |
+| `GET /api/v1/kept-deletions/{id}`                  | a plan to delete kept files, with its digest and outcomes    |
+| `POST /api/v1/kept-deletions/{id}/approval`        | approve it: `{"digest"}`; deletes them and answers with each outcome, `409` when they changed |
 | `GET /api/v1/plans/{id}`                           | a plan, with its digest, summary and changes                 |
 | `POST /api/v1/plans/{id}/approval`                 | approve it: `{"digest"}`; `202` with the build job, `409` when the plan changed |
 | `GET /api/v1/builds/{id}`                          | a build and each file it wrote                               |
@@ -590,7 +608,10 @@ The workbench is your browser interface to the Service: a Leptos app compiled to
   with the path proposed from the source set's DAT as for a source set. Opening one plans a build of a selection,
   shows the plan's files by what they do, what blocks it and what changed, approves it and follows the build live. It
   rebinds the folder, and lists its builds and the files built into it. A plan with unresolved groups offers to build
-  resolved groups only, and each conflict you can adopt has a choice to leave or adopt it. The folder shows badges
+  resolved groups only, each conflict you can adopt has a choice to leave or adopt it, and each conflict you can keep
+  aside has a choice to keep it aside and rebuild. The plan lists the built files no longer selected and what
+  happens to each. The folder lists its kept files by generation, where you pick some or all and approve deleting
+  them. The folder shows badges
   for an incomplete folder and an interrupted build, what the folder lacks, and its latest check, which you can run
   again. Each build shows every file it wrote or failed to write.
 - **Jobs** lists the latest jobs with their kind, state, progress and result, live: it follows `/api/v1/events`, applies `state`

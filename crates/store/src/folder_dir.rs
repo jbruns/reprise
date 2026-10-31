@@ -80,6 +80,24 @@ impl Identity {
     }
 }
 
+impl From<Identity> for title_select_api::build::FileIdentity {
+    fn from(id: Identity) -> Self {
+        title_select_api::build::FileIdentity {
+            dev: id.dev,
+            ino: id.ino,
+        }
+    }
+}
+
+impl From<title_select_api::build::FileIdentity> for Identity {
+    fn from(id: title_select_api::build::FileIdentity) -> Self {
+        Identity {
+            dev: id.dev,
+            ino: id.ino,
+        }
+    }
+}
+
 /// A file's status change time in nanoseconds since the Unix epoch: it moves on any change to the file's content or
 /// metadata, and cannot be set back.
 #[allow(clippy::unnecessary_cast)]

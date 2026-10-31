@@ -195,7 +195,8 @@ fn unfinished(c: &Connection, row: &FolderRow) -> Result<Option<UnfinishedBuild>
         "SELECT b.id, b.state,
                 (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'applied'),
                 (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state = 'uncertain'),
-                (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state IN ('pending', 'failed'))
+                (SELECT count(*) FROM build_items i WHERE i.build_id = b.id AND i.state IN ('pending', 'failed')),
+                (SELECT count(*) FROM kept_files k WHERE k.build_id = b.id AND k.state IN ('kept', 'deleting', 'deleted'))
          FROM builds b
          WHERE b.folder_id = ?1 AND b.state IN ('failed', 'interrupted')
            AND NOT EXISTS (SELECT 1 FROM builds s WHERE s.folder_id = ?1 AND s.id > b.id AND s.state = 'succeeded')
@@ -209,6 +210,7 @@ fn unfinished(c: &Connection, row: &FolderRow) -> Result<Option<UnfinishedBuild>
                 applied: r.get::<_, i64>(2)? as u64,
                 uncertain: r.get::<_, i64>(3)? as u64,
                 not_written: r.get::<_, i64>(4)? as u64,
+                kept: r.get::<_, i64>(5)? as u64,
             })
         },
     )
