@@ -342,7 +342,10 @@ fn check_folder(
     let mut leftovers = Vec::new();
     for (name, _) in &listing {
         if is_own(name) {
-            if name == STAGING || name == MARKER_NEW || is_dir_temp(name) {
+            // A folder Title Select was creating that was never renamed into place is recorded, and left.
+            let recorded_leftover = || matches!(dir.stat(name), Ok(Some(st)) if inputs.dirs.get(name) == Some(&Identity::of(&st)));
+            if name == STAGING || name == MARKER_NEW || (is_dir_temp(name) && !recorded_leftover())
+            {
                 leftovers.push(name.clone());
             }
             continue;

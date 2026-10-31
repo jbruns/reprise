@@ -389,7 +389,8 @@ replacement: the old file is kept aside and the new one written in the same buil
 one rename that never replaces anything, into `.title-select-retained/<generation>/<name>.kept` in the same folder,
 only while it is still the file the plan found. The retention area and each generation's folder are created under a
 temporary name the store records, made durable, renamed into place without replacing anything, and used only while
-they are still the folder made. The store records each kept file with its original name, the build
+they are still the empty folder made, owned by the service and private to it. One never renamed into place is left,
+recorded; none of these folders is ever removed, even once empty. The store records each kept file with its original name, the build
 that kept it and its provenance, and holds that provenance's selection and audit from pruning. A plan never removes a
 file Title Select did not build.
 
@@ -401,7 +402,9 @@ Kept files stay until you delete them: list them (`GET /managed-folders/{id}/kep
 (`POST /managed-folders/{id}/kept-deletions`), review the plan's digest, and approve it. Each kept file is deleted
 only while it is still the file that was kept: it is moved, without replacing anything, into the private folder
 `.title-select-retained/.deleting`, and deleted there only once what was moved is found to be that file. Anything
-else, a symlink or a directory included, is left or moved back, and reported. A kept file found already gone, with the
+else, a symlink or a directory included, is left or moved back, and reported. Until it is moved back, it stays
+recorded where it is, and the deletion stays unfinished and blocks plans for the folder; when its name is taken, you
+move what is there out of the way, and the service moves it back when it next starts. A kept file found already gone, with the
 folder's marker checked, is reported gone and no longer listed. A deletion the service stopped during is finished
 when it next starts, once the folder's root is writable and its marker shows it is this store's folder; until then
 its kept files stay recorded and plans for the folder are blocked. Checks and drift never report the retention area.

@@ -56,8 +56,8 @@ pub(super) fn deletion_active(c: &Connection, folder: i64) -> Result<Option<Stri
     Ok(found.map(|(id, error)| match error {
         None => format!("kept files of managed folder {folder} are being deleted: deletion {id}"),
         Some(error) => format!(
-            "deletion {id} of kept files of managed folder {folder} stopped and was not finished: {error}. The \
-             service finishes it when it next starts, once the folder can be shown to be this store's"
+            "deletion {id} of kept files of managed folder {folder} is not finished: {error}. The service \
+             finishes it when it next starts, once the folder can be shown to be this store's"
         ),
     }))
 }
@@ -123,9 +123,11 @@ fn is_dir(st: &rustix::fs::Stat) -> bool {
 }
 
 /// Creates the directory `name` in `parent`, which `folder_dirs` records under `key`, for this service's user only.
-/// It is made under a temporary name recorded in `folder_temps` by identity, made durable, and renamed to `name`
-/// without replacing anything; its parent is then made durable, and it is used only if what is at `name` is still
-/// the directory made, which is then recorded. Recovery removes, or adopts, one a stop left behind.
+/// It is made under a temporary name, checked through its open descriptor to be the empty, private directory just
+/// made ([`FolderDir::private`]), recorded in `folder_temps` by identity, made durable, and renamed to `name` without
+/// replacing anything; its parent is then made durable, and it is used only if what is at `name` is still the
+/// directory made, which is then recorded. Nothing is ever removed by name: a temporary folder that was not renamed
+/// into place is recorded as a leftover of this store and left. Recovery records, or adopts, one a stop left behind.
 fn create_dir(
     store: &Store,
     folder: i64,
@@ -138,14 +140,21 @@ fn create_dir(
     if let Err(e) = parent.mkdir_private(&temp) {
         return Ok(Err(e.to_string()));
     }
-    let made = match parent
-        .sub(&temp)
-        .and_then(|made| Ok((made.identity()?, made)))
-    {
+    store.fault_point(Fault::MadeDir);
+    let made = match parent.sub(&temp) {
         Ok(made) => made,
         Err(e) => return Ok(Err(e.to_string())),
     };
-    let (id, made) = made;
+    let id = match made.private(true) {
+        Ok(Ok(id)) => id,
+        Ok(Err(why)) => {
+            return Ok(Err(format!(
+                "{}/{temp} is not the folder Title Select just created there: {why}; it was left as it is",
+                parent.path().display()
+            )));
+        }
+        Err(e) => return Ok(Err(e.to_string())),
+    };
     record_temp(store, folder, &temp_key, id)?;
     made.sync().map_err(|e| Error::Io(e.to_string()))?;
     drop(made);
@@ -153,7 +162,9 @@ fn create_dir(
     if let Err(e) = parent.rename_new(&temp, parent, name) {
         let ours =
             matches!(parent.stat(&temp), Ok(Some(st)) if is_dir(&st) && Identity::of(&st) == id);
-        if ours && parent.rmdir(&temp).and_then(|()| parent.sync()).is_ok() {
+        if ours {
+            record_leftover(store, folder, &temp_key, id)?;
+        } else {
             forget_temp(store, folder, &temp_key)?;
         }
         return Ok(Err(match e.kind() {
@@ -166,8 +177,8 @@ fn create_dir(
         Ok(dir) => dir,
         Err(e) => return Ok(Err(e.to_string())),
     };
-    match dir.identity() {
-        Ok(found) if found == id => {}
+    match dir.private(true) {
+        Ok(Ok(found)) if found == id => {}
         Ok(_) => {
             forget_temp(store, folder, &temp_key)?;
             return Ok(Err(not_ours(parent, name)));
@@ -199,8 +210,26 @@ fn forget_temp(store: &Store, folder: i64, key: &str) -> Result<()> {
     })
 }
 
+/// Records the temporary folder `key`, made as `id` and never renamed into place, as this store's leftover: it is
+/// left where it is, and never reported as something no build of this store made.
+fn record_leftover(store: &Store, folder: i64, key: &str, id: Identity) -> Result<()> {
+    let (dev, ino) = id.to_sql();
+    store.write(|tx| {
+        tx.execute(
+            "INSERT OR REPLACE INTO folder_dirs (folder_id, name, dev, ino) VALUES (?1, ?2, ?3, ?4)",
+            params![folder, key, dev, ino],
+        )?;
+        tx.execute(
+            "DELETE FROM folder_temps WHERE folder_id = ?1 AND name = ?2",
+            params![folder, key],
+        )?;
+        Ok(())
+    })
+}
+
 /// Opens the directory `name` in `parent`, which `folder_dirs` records under `key`, and checks it is the directory
-/// recorded. When nothing is there and `create` is set, creates it with [`create_dir`]; otherwise returns `None`.
+/// recorded, still private to this service's user ([`FolderDir::private`]). When nothing is there and `create` is
+/// set, creates it with [`create_dir`]; otherwise returns `None`.
 fn own_dir(
     store: &Store,
     folder: i64,
@@ -225,9 +254,13 @@ fn own_dir(
                 Ok(dir) => dir,
                 Err(e) => return Ok(Err(e.to_string())),
             };
-            match dir.identity() {
-                Ok(id) if Some(id) == recorded => Ok(Ok(Some(dir))),
-                Ok(_) => Ok(Err(not_ours(parent, name))),
+            match dir.private(false) {
+                Ok(Ok(id)) if Some(id) == recorded => Ok(Ok(Some(dir))),
+                Ok(Ok(_)) => Ok(Err(not_ours(parent, name))),
+                Ok(Err(why)) => Ok(Err(format!(
+                    "{}/{name} is no longer private to this service: {why}; it was left as it is",
+                    parent.path().display()
+                ))),
                 Err(e) => Ok(Err(e.to_string())),
             }
         }
@@ -251,43 +284,11 @@ fn open_deleting(
     )
 }
 
-/// Removes the directory `name` in `parent`, recorded under `key`, if it is empty and still the directory recorded.
-fn remove_if_empty(
-    store: &Store,
-    folder: i64,
-    parent: &FolderDir,
-    name: &str,
-    key: &str,
-) -> Result<()> {
-    let Ok(Some(dir)) = own_dir(store, folder, parent, name, key, false)? else {
-        return Ok(());
-    };
-    if !dir.entries().is_ok_and(|entries| entries.is_empty()) {
-        return Ok(());
-    }
-    drop(dir);
-    let own = store.read(|c| folder_dirs(c, folder))?.get(key).copied();
-    let still = matches!(
-        parent.stat(name),
-        Ok(Some(st)) if is_dir(&st) && Some(Identity::of(&st)) == own
-    );
-    if still && parent.rmdir(name).is_ok() {
-        parent.sync().map_err(|e| Error::Io(e.to_string()))?;
-        store.write(|tx| {
-            tx.execute(
-                "DELETE FROM folder_dirs WHERE folder_id = ?1 AND name = ?2",
-                params![folder, key],
-            )?;
-            Ok(())
-        })?;
-    }
-    Ok(())
-}
-
 /// Settles each directory Title Select was creating in Managed Folder `folder`, opened as `dir`, when it stopped:
-/// one still under its recorded temporary name is removed, and one already renamed into place, still the directory
-/// made, is recorded. Anything else at either name is left as it is. Run only once the folder's marker shows it is
-/// the store's. Returns why the folder could not be read, if it could not.
+/// one still under its recorded temporary name is recorded as this store's leftover and left, and one already
+/// renamed into place, still the directory made, is recorded. Anything else at either name is left as it is, and
+/// nothing is removed. Run only once the folder's marker shows it is the store's. Returns why the folder could not be
+/// read, if it could not.
 pub(super) fn settle_dir_temps(
     store: &Store,
     folder: i64,
@@ -334,13 +335,10 @@ pub(super) fn settle_dir_temps(
         let dest_key = sibling(&key, dest);
         match parent.stat(last) {
             Err(e) => return Ok(Err(e.to_string())),
+            // Never renamed into place: left as this store's leftover, never removed by name.
             Ok(Some(st)) if is_dir(&st) && Identity::of(&st) == id => {
-                if let Err(e) = parent.rmdir(last).and_then(|()| parent.sync()) {
-                    return Ok(Err(format!(
-                        "{}/{last} could not be removed ({e}); it was left as it is",
-                        parent.path().display()
-                    )));
-                }
+                record_leftover(store, folder, &key, id)?;
+                continue;
             }
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -770,14 +768,8 @@ impl Store {
             )?;
             Ok(())
         })?;
-        match self.delete_kept(config, id, content) {
-            Ok(outcomes) => self.write(|tx| {
-                tx.execute(
-                    "UPDATE kept_deletions SET finished_at = ?2, outcomes = ?3 WHERE id = ?1",
-                    params![id, now(), to_json(&outcomes)],
-                )?;
-                deletion_by_id(tx, id)
-            }),
+        let outcomes = match self.delete_kept(config, id, content) {
+            Ok(outcomes) => outcomes,
             // A kept file may have been mid-deletion: the deletion stays unfinished, and recovery settles it.
             Err(err) => {
                 self.write(|tx| {
@@ -787,9 +779,24 @@ impl Store {
                     )?;
                     Ok(())
                 })?;
-                Err(err)
+                return Err(err);
             }
-        }
+        };
+        let pending = self.read(|c| unresolved(c, id, &outcomes))?;
+        self.write(|tx| {
+            match &pending {
+                None => tx.execute(
+                    "UPDATE kept_deletions SET finished_at = ?2, outcomes = ?3, recovery_error = NULL WHERE id = ?1",
+                    params![id, now(), to_json(&outcomes)],
+                )?,
+                // Not finished while what was moved aside is not back where it was found.
+                Some(reason) => tx.execute(
+                    "UPDATE kept_deletions SET outcomes = ?2, recovery_error = ?3 WHERE id = ?1",
+                    params![id, to_json(&outcomes), reason],
+                )?,
+            };
+            deletion_by_id(tx, id)
+        })
     }
 
     fn delete_kept(
@@ -816,32 +823,29 @@ impl Store {
             generation: row.generation,
         };
         let mut outcomes = Vec::new();
-        let mut emptied = BTreeSet::new();
         for file in &content.files {
             if let Err(reason) = check_marker(&dir, &expected) {
                 outcomes.push(left(file, reason));
                 continue;
             }
-            let outcome = match open_retention(self, folder, &dir, file.generation, false)? {
-                Ok(Some(retention)) => self.delete_one(&retention, file, deletion)?,
-                Ok(None) => self.gone(file, deletion)?,
-                Err(reason) => left(file, reason),
-            };
-            if outcome.deleted {
-                emptied.insert(file.generation);
-            }
-            outcomes.push(outcome);
+            outcomes.push(
+                match open_retention(self, folder, &dir, file.generation, false)? {
+                    Ok(Some(retention)) => self.delete_one(&dir, &retention, file, deletion)?,
+                    Ok(None) => self.gone(&dir, file, deletion)?,
+                    Err(reason) => left(file, reason),
+                },
+            );
         }
-        self.remove_emptied(folder, &dir, emptied)?;
         Ok(outcomes)
     }
 
     /// Deletes kept file `file` from `retention`, for deletion `deletion`: only while its kept entry is the file that
     /// was kept. The intent is committed first; the file is then moved, by one rename that never replaces anything,
     /// into the private folder kept files are deleted from, and deleted there only once what was moved is found to be
-    /// the file. Anything else moved is put back.
+    /// the file. Anything else moved is recorded where it is, then put back.
     fn delete_one(
         &self,
+        dir: &FolderDir,
         retention: &Retention,
         file: &KeptFile,
         deletion: i64,
@@ -850,7 +854,7 @@ impl Store {
         let (gen_dir, kept) = (&retention.generation, file.kept_name.as_str());
         match gen_dir.stat(kept) {
             Err(e) => return Ok(left(file, e.to_string())),
-            Ok(None) => return self.gone(file, deletion),
+            Ok(None) => return self.gone(dir, file, deletion),
             Ok(Some(_)) if !is_kept_file(gen_dir, kept, id, Some(&file.file)) => {
                 return Ok(left(file, NOT_THE_FILE.into()));
             }
@@ -862,6 +866,11 @@ impl Store {
             Err(reason) => return Ok(left(file, reason)),
         };
         let slot = file.id.to_string();
+        match deleting.stat(&slot) {
+            Ok(None) => {}
+            Ok(Some(_)) => return Ok(left(file, slot_taken(&slot))),
+            Err(e) => return Ok(left(file, e.to_string())),
+        }
         self.write(|tx| {
             tx.execute(
                 "UPDATE kept_files SET state = 'deleting', deletion_id = ?2 WHERE id = ?1 AND state = 'kept'",
@@ -888,12 +897,12 @@ impl Store {
             .map_err(|e| Error::Io(e.to_string()))?;
         self.fault_point(Fault::AfterDeleteMove(file.id));
         if !is_kept_file(&deleting, &slot, id, Some(&file.file)) {
-            let back = put_back(gen_dir, &deleting, &slot, kept);
-            return keep(format!("{MOVED_NOT_THE_FILE}; {back}"));
+            let note = self.quarantine(Some(gen_dir), &deleting, file)?;
+            return Ok(left(file, format!("{MOVED_NOT_THE_FILE}; {note}")));
         }
         if let Err(e) = deleting.unlink(&slot) {
-            let back = put_back(gen_dir, &deleting, &slot, kept);
-            return keep(format!("it could not be deleted ({e}); {back}"));
+            let note = self.quarantine(Some(gen_dir), &deleting, file)?;
+            return Ok(left(file, format!("it could not be deleted ({e}); {note}")));
         }
         deleting.sync().map_err(|e| Error::Io(e.to_string()))?;
         self.fault_point(Fault::AfterUnlink(file.id));
@@ -901,8 +910,109 @@ impl Store {
         Ok(deleted_outcome(file))
     }
 
-    /// Records kept file `file`, found gone when deletion `deletion` was carried out, no longer kept.
-    fn gone(&self, file: &KeptFile, deletion: i64) -> Result<KeptDeletionOutcome> {
+    /// Records what is at `.deleting/<id>` for kept file `file`, which is not to be deleted, by its identity, keeping
+    /// the file's deletion; then moves it back to the file's kept entry. Until that move is made durable, the record
+    /// says where the entry is, and the deletion is not finished. Returns where the entry is.
+    fn quarantine(
+        &self,
+        generation: Option<&FolderDir>,
+        deleting: &FolderDir,
+        file: &KeptFile,
+    ) -> Result<String> {
+        let slot = file.id.to_string();
+        let moved = match deleting.stat(&slot) {
+            Ok(Some(st)) => Identity::of(&st),
+            Ok(None) => {
+                self.write(|tx| still_kept(tx, file.id))?;
+                return Ok("what was moved aside to be deleted is gone".into());
+            }
+            Err(e) => return Ok(format!("it is at {RETENTION}/{DELETING}/{slot} ({e})")),
+        };
+        let (dev, ino) = moved.to_sql();
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE kept_files SET state = 'quarantined', quarantine_dev = ?2, quarantine_ino = ?3
+                 WHERE id = ?1 AND state IN ('deleting', 'quarantined')",
+                params![file.id, dev, ino],
+            )?;
+            Ok(())
+        })?;
+        self.fault_point(Fault::Quarantined(file.id));
+        self.put_back(generation, deleting, file, moved)
+    }
+
+    /// Moves what is recorded at `.deleting/<id>` for kept file `file`, as `moved`, back to the file's kept entry in
+    /// `generation`, without replacing anything, and records the file kept once that is durable. Returns where it is.
+    fn put_back(
+        &self,
+        generation: Option<&FolderDir>,
+        deleting: &FolderDir,
+        file: &KeptFile,
+        moved: Identity,
+    ) -> Result<String> {
+        let slot = file.id.to_string();
+        let kept = file.kept_name.as_str();
+        let at = format!("{RETENTION}/{DELETING}/{slot}");
+        let back = format!("{RETENTION}/{}/{kept}", file.generation);
+        let found = match deleting.stat(&slot) {
+            Ok(found) => found,
+            Err(e) => return Ok(format!("it is at {at} ({e})")),
+        };
+        let Some(st) = found else {
+            // Moved back before the service stopped, or gone: nothing is held aside any more.
+            let note = match generation.map(|g| g.stat(kept)) {
+                Some(Ok(Some(st))) if Identity::of(&st) == moved => {
+                    format!("it was moved back to {back}")
+                }
+                _ => format!("what was moved aside to be deleted is no longer at {at}"),
+            };
+            self.write(|tx| still_kept(tx, file.id))?;
+            return Ok(note);
+        };
+        if Identity::of(&st) != moved {
+            return Ok(format!(
+                "{at} now holds something else again; it is left there until it can be moved back to {back}"
+            ));
+        }
+        let Some(generation) = generation else {
+            return Ok(format!(
+                "it is at {at}, and {back} is gone; it is left there until it can be moved back"
+            ));
+        };
+        match deleting
+            .rename_new(&slot, generation, kept)
+            .and_then(|()| generation.sync())
+            .and_then(|()| deleting.sync())
+        {
+            Ok(()) => {
+                self.write(|tx| still_kept(tx, file.id))?;
+                Ok(format!("it was moved back to {back}"))
+            }
+            Err(e) => Ok(format!(
+                "it is at {at}, and could not be moved back to {back} ({e}); move what is at {back} out of the way, \
+                 and the service moves it back when it next starts"
+            )),
+        }
+    }
+
+    /// Records kept file `file`, found gone when deletion `deletion` was carried out, no longer kept; but only while
+    /// nothing moved aside for it is held in the private folder kept files are deleted from.
+    fn gone(&self, dir: &FolderDir, file: &KeptFile, deletion: i64) -> Result<KeptDeletionOutcome> {
+        let area = match own_dir(self, file.folder, dir, RETENTION, RETENTION, false)? {
+            Ok(area) => area,
+            Err(reason) => return Ok(left(file, reason)),
+        };
+        if let Some(area) = area {
+            match open_deleting(self, file.folder, &area, false)? {
+                Ok(None) => {}
+                Ok(Some(deleting)) => match deleting.stat(&file.id.to_string()) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => return Ok(left(file, slot_taken(&file.id.to_string()))),
+                    Err(e) => return Ok(left(file, e.to_string())),
+                },
+                Err(reason) => return Ok(left(file, reason)),
+            }
+        }
         self.write(|tx| {
             tx.execute(
                 "UPDATE kept_files SET state = 'gone', deletion_id = ?2, deleted_at = ?3, error = ?4
@@ -919,41 +1029,11 @@ impl Store {
         Ok(gone_outcome(file))
     }
 
-    /// Removes the private folder kept files are deleted from, and each folder of `generations`, of Managed Folder
-    /// `folder`, opened as `dir`, that is left empty.
-    fn remove_emptied(
-        &self,
-        folder: i64,
-        dir: &FolderDir,
-        generations: BTreeSet<u64>,
-    ) -> Result<()> {
-        let Ok(Some(area)) = own_dir(self, folder, dir, RETENTION, RETENTION, false)? else {
-            return Ok(());
-        };
-        remove_if_empty(
-            self,
-            folder,
-            &area,
-            DELETING,
-            &format!("{RETENTION}/{DELETING}"),
-        )?;
-        for generation in generations {
-            remove_if_empty(
-                self,
-                folder,
-                &area,
-                &generation.to_string(),
-                &generation_dir(generation),
-            )?;
-        }
-        Ok(())
-    }
-
     /// Run when the service starts, after [`Store::recover_builds`]: finishes each approved deletion of kept files
-    /// the service stopped while carrying out, settling each kept file it was deleting from where that file is now.
-    /// Nothing is settled unless the folder's root is writable and its marker shows it is the store's folder; a
-    /// deletion left so keeps its kept files recorded and its folder's plans blocked until the next start. Returns,
-    /// for each, the deletion and why.
+    /// the service stopped while carrying out, or could not finish, settling each kept file it was deleting from where
+    /// that file is now, and moving back what was moved aside. Nothing is settled unless the folder's root is writable
+    /// and its marker shows it is the store's folder; a deletion left so keeps its kept files recorded and its
+    /// folder's plans blocked until the next start. Returns, for each, the deletion and why.
     pub fn recover_kept_deletions(&self, config: &Config) -> Result<Vec<(i64, String)>> {
         let unfinished: Vec<(i64, i64)> = self.read(|c| {
             let mut stmt = c.prepare(
@@ -1002,25 +1082,26 @@ impl Store {
         if let Err(reason) = settle_dir_temps(self, folder, &dir)? {
             return Ok(Err(reason));
         }
-        let deleting: Vec<KeptFile> = self
-            .read(|c| kept_where(c, "k.deletion_id = ?1 AND k.state = 'deleting'", [deletion]))?;
+        let unsettled: Vec<KeptFile> = self.read(|c| {
+            kept_where(
+                c,
+                "k.deletion_id = ?1 AND k.state IN ('deleting', 'quarantined')",
+                [deletion],
+            )
+        })?;
         let mut notes = HashMap::new();
-        let mut emptied = BTreeSet::new();
-        for file in deleting {
+        for file in unsettled {
             if let Err(reason) = check_marker(&dir, &expected) {
                 return Ok(Err(reason));
             }
             match self.settle_deleting(&dir, &file)? {
-                Ok(note) => {
-                    if let Some(note) = note {
-                        notes.insert(file.id, note);
-                    }
-                    emptied.insert(file.generation);
+                Ok(Some(note)) => {
+                    notes.insert(file.id, note);
                 }
+                Ok(None) => {}
                 Err(reason) => return Ok(Err(reason)),
             }
         }
-        self.remove_emptied(folder, &dir, emptied)?;
         let states: BTreeMap<i64, String> = self.read(|c| {
             let mut stmt = c.prepare("SELECT id, state FROM kept_files WHERE deletion_id = ?1")?;
             let rows = stmt.query_map([deletion], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -1041,6 +1122,16 @@ impl Store {
                 ),
             })
             .collect();
+        if let Some(reason) = self.read(|c| unresolved(c, deletion, &outcomes))? {
+            self.write(|tx| {
+                tx.execute(
+                    "UPDATE kept_deletions SET outcomes = ?2 WHERE id = ?1",
+                    params![deletion, to_json(&outcomes)],
+                )?;
+                Ok(())
+            })?;
+            return Ok(Err(reason));
+        }
         self.write(|tx| {
             tx.execute(
                 "UPDATE kept_deletions SET finished_at = ?2, outcomes = ?3 WHERE id = ?1",
@@ -1051,10 +1142,11 @@ impl Store {
         Ok(Ok(()))
     }
 
-    /// Settles kept file `file`, which a deletion was deleting when the service stopped, in its folder opened as `dir`:
-    /// deleted once it is found in the private folder it is deleted from, or gone from its kept entry; still kept
-    /// when it is at its kept entry. Anything else is never deleted. Returns a note for its outcome, if it is still
-    /// kept, or why the folder could not be read.
+    /// Settles kept file `file`, which a deletion was deleting, or had moved something aside for, when the service
+    /// stopped, in its folder opened as `dir`: deleted once it is found in the private folder it is deleted from, or
+    /// gone from its kept entry; still kept when it is at its kept entry. Anything else moved aside is recorded where
+    /// it is and moved back; it is never deleted. Returns a note for its outcome, if it is not deleted, or why the
+    /// folder could not be read.
     fn settle_deleting(
         &self,
         dir: &FolderDir,
@@ -1063,8 +1155,22 @@ impl Store {
         let folder = file.folder;
         let id = Identity::from(file.identity);
         let slot = file.id.to_string();
+        let quarantined: Option<Identity> = self.read(|c| {
+            Ok(c.query_row(
+                "SELECT quarantine_dev, quarantine_ino FROM kept_files WHERE id = ?1 AND state = 'quarantined'",
+                [file.id],
+                |r| Ok(Identity::from_sql(r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+        })?;
         let area = match own_dir(self, folder, dir, RETENTION, RETENTION, false)? {
             Ok(Some(area)) => area,
+            Ok(None) if quarantined.is_some() => {
+                return Ok(Err(format!(
+                    "{RETENTION} is gone, and with it what was moved aside while deleting {}",
+                    file.kept_name
+                )));
+            }
             Ok(None) => {
                 self.write(|tx| deleted(tx, file.id))?;
                 return Ok(Ok(None));
@@ -1087,6 +1193,16 @@ impl Store {
             Ok(generation) => generation,
             Err(reason) => return Ok(Err(reason)),
         };
+        if let Some(moved) = quarantined {
+            let Some(deleting) = &deleting else {
+                self.write(|tx| still_kept(tx, file.id))?;
+                return Ok(Ok(Some(format!(
+                    "{MOVED_NOT_THE_FILE}; it is no longer at {RETENTION}/{DELETING}/{slot}"
+                ))));
+            };
+            let note = self.put_back(generation.as_ref(), deleting, file, moved)?;
+            return Ok(Ok(Some(format!("{MOVED_NOT_THE_FILE}; {note}"))));
+        }
         let kept = |note: &str| -> Result<std::result::Result<Option<String>, String>> {
             self.write(|tx| still_kept(tx, file.id))?;
             Ok(Ok(Some(note.to_owned())))
@@ -1105,11 +1221,8 @@ impl Store {
                     return Ok(Ok(None));
                 }
                 Ok(Some(_)) => {
-                    let back = match &generation {
-                        Some(generation) => put_back(generation, deleting, &slot, &file.kept_name),
-                        None => format!("it is at {RETENTION}/{DELETING}/{slot}"),
-                    };
-                    return kept(&format!("{MOVED_NOT_THE_FILE}; {back}"));
+                    let note = self.quarantine(generation.as_ref(), deleting, file)?;
+                    return Ok(Ok(Some(format!("{MOVED_NOT_THE_FILE}; {note}"))));
                 }
                 Ok(None) => {}
             }
@@ -1137,23 +1250,49 @@ const NOT_THE_FILE: &str =
 const MOVED_NOT_THE_FILE: &str =
     "what was moved to be deleted is not the file that was kept, so it is never deleted";
 
-/// Moves `slot` in the private folder `deleting` back to `kept` in `generation`, without replacing anything, and
-/// says where it is.
-fn put_back(generation: &FolderDir, deleting: &FolderDir, slot: &str, kept: &str) -> String {
-    match deleting
-        .rename_new(slot, generation, kept)
-        .and_then(|()| generation.sync())
-        .and_then(|()| deleting.sync())
-    {
-        Ok(()) => format!("it was moved back to {kept}"),
-        Err(_) => format!("it is at {RETENTION}/{DELETING}/{slot}"),
+fn slot_taken(slot: &str) -> String {
+    format!(
+        "something is at {RETENTION}/{DELETING}/{slot}, where it would be moved to be deleted, so it is never deleted"
+    )
+}
+
+/// Why deletion `deletion`, whose outcomes are `outcomes`, is not finished: a kept file it was deleting, or held
+/// something aside for, that is not yet settled.
+fn unresolved(
+    c: &Connection,
+    deletion: i64,
+    outcomes: &[KeptDeletionOutcome],
+) -> Result<Option<String>> {
+    let mut stmt = c.prepare(
+        "SELECT id FROM kept_files WHERE deletion_id = ?1 AND state IN ('deleting', 'quarantined') ORDER BY id",
+    )?;
+    let ids: Vec<i64> = stmt
+        .query_map([deletion], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    if ids.is_empty() {
+        return Ok(None);
     }
+    Ok(Some(
+        ids.iter()
+            .map(|id| match outcomes.iter().find(|o| o.id == *id) {
+                Some(o) => format!(
+                    "{RETENTION}/{}/{}: {}",
+                    o.generation,
+                    o.kept_name,
+                    o.detail.as_deref().unwrap_or("it was being deleted")
+                ),
+                None => format!("kept file {id} was being deleted"),
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    ))
 }
 
 /// Records kept file `id`, which was being deleted, still kept.
 fn still_kept(tx: &Transaction, id: i64) -> Result<()> {
     tx.execute(
-        "UPDATE kept_files SET state = 'kept', deletion_id = NULL WHERE id = ?1",
+        "UPDATE kept_files SET state = 'kept', deletion_id = NULL, quarantine_dev = NULL, quarantine_ino = NULL
+         WHERE id = ?1",
         [id],
     )?;
     Ok(())
