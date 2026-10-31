@@ -95,7 +95,7 @@ pub async fn run(
             let ended = {
                 let (store, jobs) = (store.clone(), jobs.clone());
                 tokio::task::spawn_blocking(move || match kind {
-                    JobKind::Audit | JobKind::Build => {
+                    JobKind::Audit | JobKind::Build | JobKind::Check => {
                         run_one(&store, &config, &jobs, kind, id, version)
                     }
                     JobKind::Selection => run_selection(&store, &config, engine.as_deref(), id),
@@ -123,7 +123,7 @@ pub async fn run(
     }
 }
 
-/// Runs one claimed Audit or Build Job, publishing its progress, and returns the Job as it ended.
+/// Runs one claimed Audit, Build or Check Job, publishing its progress, and returns the Job as it ended.
 fn run_one(
     store: &Store,
     config: &Config,
@@ -148,6 +148,7 @@ fn run_one(
     };
     let ran = match kind {
         JobKind::Build => store.run_build_job(config, id, Some(&progress)),
+        JobKind::Check => store.run_check_job(config, id, Some(&progress)),
         _ => store.run_audit_job(config, id, Some(&progress)),
     };
     match ran {

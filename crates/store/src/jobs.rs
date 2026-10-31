@@ -14,6 +14,8 @@ const INTERRUPTED: &str = "the service stopped while the job was running";
 /// Why a restart Interrupted a Build Job, which is never queued again: its plan may no longer hold.
 const BUILD_INTERRUPTED: &str = "the service stopped while the build was running; the files it applied stay, \
      and a new plan builds the rest";
+/// Why a restart Interrupted a Check Job, which is never queued again: nothing depends on it.
+const CHECK_INTERRUPTED: &str = "the service stopped while the check was running; nothing in the folder was changed. Check it again";
 /// Why a restart Failed a Job that was already queued again once.
 const INTERRUPTED_AGAIN: &str =
     "the service stopped while the job was running, after it had already been queued again once";
@@ -304,8 +306,8 @@ impl Store {
     /// Run when the Service starts: every Job still Running was cut off by a stop. Its Audit was already discarded
     /// when the store opened. A first attempt becomes Interrupted and a fresh Job is queued for it with `workers`; a
     /// Job that was itself queued again becomes Failed. A Build Job becomes Interrupted and is not queued again, since
-    /// its plan may no longer hold; [`Store::recover_builds`] then cleans up its folder. Each Job's change is one
-    /// transaction.
+    /// its plan may no longer hold; [`Store::recover_builds`] then cleans up its folder. A Check Job becomes
+    /// Interrupted too. Each Job's change is one transaction.
     pub fn recover_jobs(&self, workers: Workers) -> Result<Vec<Interruption>> {
         let running: Vec<(i64, u32, String)> = self.read(|c| {
             let mut stmt = c.prepare(
@@ -325,6 +327,13 @@ impl Store {
                              WHERE job_id = ?1 AND state = 'running'",
                             params![id, now()],
                         )?;
+                        return Ok(Interruption {
+                            job: job_by_id(tx, id)?,
+                            requeued: None,
+                        });
+                    }
+                    if kind == JobKind::Check.as_str() {
+                        finish_running(tx, id, JobState::Interrupted, Some(CHECK_INTERRUPTED))?;
                         return Ok(Interruption {
                             job: job_by_id(tx, id)?,
                             requeued: None,

@@ -1,0 +1,604 @@
+//! Checks of Managed Folders: what is in a folder now against the store's record of what Builds put there. A check
+//! only reads the folder, through the handle it was opened by and without following a symlink; what it finds is
+//! written to the store alone. A built file is read only when its size or modification time differ from its record,
+//! and every entry Title Select did not build is classified as Drift, read once and then only when it changes.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rustix::fs::{FileType, Stat};
+use title_select_api::build::{
+    CheckSummary, CheckedFile, DriftEntry, DriftKind, FileOutcome, FileStat, FolderCheck,
+};
+use title_select_api::{Job, JobKind, JobState};
+use title_select_engine::Progress;
+use title_select_engine::build::{GameIndex, Probe, holds, probe};
+use title_select_engine::dat::Dat;
+
+use super::audits::choose_revision;
+use super::dats::revision_by_id;
+use super::folder_dir::{FolderDir, Identity, file_stat};
+use super::folders::{folder_by_id, is_own, marker_problem, open_folder, store_id};
+use super::jobs::{finish_running, job_by_id};
+use super::plans::{Built, json, read_built, to_json};
+use super::sets::set_by_id;
+use super::{Error, Result, Store, now};
+use crate::config::Config;
+
+/// A built file's record to bring up to date: only while it is still as the check read it.
+pub(super) struct Update {
+    target: String,
+    build: i64,
+    was: FileStat,
+    now: FileStat,
+    sha256: String,
+    torrentzip: bool,
+}
+
+/// What a check found, before it is stored.
+pub(super) struct Scan {
+    pub files: Vec<CheckedFile>,
+    pub drift: Vec<DriftEntry>,
+    updates: Vec<Update>,
+    /// What was read of each entry, by name, with the size and modification time it was read at.
+    pub probes: HashMap<String, (FileStat, Probe)>,
+}
+
+/// What a check compares the folder with.
+pub(super) struct ScanInput<'a> {
+    pub built: &'a BTreeMap<String, Built>,
+    /// The selected Games, by their target's lowercased name.
+    pub selected: &'a HashMap<String, String>,
+    pub dat: Option<&'a Dat>,
+    /// What earlier checks read, by name.
+    pub cached: &'a HashMap<String, (FileStat, Probe)>,
+}
+
+/// The names in a folder other than Title Select's own entries, sorted.
+pub(super) fn listing(dir: &FolderDir) -> std::io::Result<Vec<String>> {
+    let mut names: Vec<String> = dir
+        .entries()?
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| !is_own(name))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Reads the regular file `name`, found by `lstat` as `seen`, through `dir`: opened without following a symlink, and
+/// only trusted when it is the same file, the same size and modification time, before and after it is read.
+fn read(dir: &FolderDir, name: &str, seen: &Stat) -> std::result::Result<Probe, String> {
+    let changed = || "it changed while it was read".to_owned();
+    let file: File = dir.open_file(name).map_err(|e| e.to_string())?;
+    let before = rustix::fs::fstat(&file).map_err(|e| e.to_string())?;
+    if Identity::of(&before) != Identity::of(seen) || file_stat(&before) != file_stat(seen) {
+        return Err(changed());
+    }
+    let probe = probe(&file).map_err(|e| e.to_string())?;
+    let after = rustix::fs::fstat(&file).map_err(|e| e.to_string())?;
+    if file_stat(&after) != file_stat(&before) {
+        return Err(changed());
+    }
+    match dir.stat(name) {
+        Ok(Some(st))
+            if FolderDir::kind(&st) == FileType::RegularFile
+                && Identity::of(&st) == Identity::of(&before)
+                && file_stat(&st) == file_stat(&before) =>
+        {
+            Ok(probe)
+        }
+        _ => Err(changed()),
+    }
+}
+
+/// Checks the folder `dir`, whose entries are `entries`, against `input`. Nothing in it is changed.
+pub(super) fn scan(
+    dir: &FolderDir,
+    entries: &[String],
+    input: &ScanInput,
+    progress: Option<&(dyn Fn(Progress) + Sync)>,
+) -> Scan {
+    let mut out = Scan {
+        files: Vec::new(),
+        drift: Vec::new(),
+        updates: Vec::new(),
+        probes: HashMap::new(),
+    };
+    let by_lower: HashMap<String, &str> = entries
+        .iter()
+        .map(|name| (name.to_lowercase(), name.as_str()))
+        .collect();
+    let total = input.built.len() + entries.len();
+    let mut done = 0;
+    let mut tick = || {
+        done += 1;
+        if let Some(progress) = progress {
+            progress(Progress {
+                files_done: done,
+                files_total: total,
+            });
+        }
+    };
+    // Reads `name`, or reuses what an earlier check read of it while it is unchanged since.
+    let probe_of = |name: &str, st: &Stat, out: &mut Scan| {
+        let at = file_stat(st);
+        let cached = input
+            .cached
+            .get(name)
+            .filter(|(was, _)| *was == at)
+            .map(|(_, p)| p.clone());
+        let (probe, hashed) = match cached {
+            Some(p) => (Ok(p), false),
+            None => (read(dir, name, st), true),
+        };
+        if let Ok(p) = &probe {
+            out.probes.insert(name.to_owned(), (at, p.clone()));
+        }
+        (probe, hashed)
+    };
+
+    let mut consumed = HashSet::new();
+    for (target, built) in input.built {
+        let mut file = CheckedFile {
+            target: target.clone(),
+            game: built.game.clone(),
+            outcome: FileOutcome::Unchanged,
+            hashed: false,
+            torrentzip: built.torrentzip,
+            selected: input.selected.contains_key(&target.to_lowercase()),
+            detail: None,
+        };
+        let found = by_lower.get(&target.to_lowercase()).copied();
+        if let Some(name) = found {
+            consumed.insert(name.to_owned());
+        }
+        let st = match found {
+            None => None,
+            Some(name) if name != target => {
+                file.outcome = FileOutcome::Conflict;
+                file.detail = Some(format!("it is now named {name}"));
+                None
+            }
+            Some(_) => match dir.stat(target) {
+                Ok(st) => st,
+                Err(e) => {
+                    file.outcome = FileOutcome::Unreadable;
+                    file.detail = Some(e.to_string());
+                    None
+                }
+            },
+        };
+        match st {
+            None if found.is_none() => file.outcome = FileOutcome::Missing,
+            None => {}
+            Some(st) if FolderDir::kind(&st) != FileType::RegularFile => {
+                file.outcome = FileOutcome::Conflict;
+                file.detail = Some("it is no longer a regular file".into());
+            }
+            Some(st) if file_stat(&st) == built.file => {}
+            Some(st) => {
+                let (probe, hashed) = probe_of(target, &st, &mut out);
+                file.hashed = hashed;
+                let now = file_stat(&st);
+                match probe {
+                    Err(e) => {
+                        file.outcome = FileOutcome::Unreadable;
+                        file.detail = Some(e);
+                    }
+                    Ok(p) if built.sha256.as_deref() == Some(p.sha256.as_str()) => {
+                        file.outcome = FileOutcome::Refreshed;
+                        out.updates.push(Update {
+                            target: target.clone(),
+                            build: built.build,
+                            was: built.file.clone(),
+                            now,
+                            sha256: p.sha256,
+                            torrentzip: built.torrentzip,
+                        });
+                    }
+                    Ok(p) if holds(&p, &built.roms) => {
+                        file.outcome = FileOutcome::Repacked;
+                        file.torrentzip = p.torrentzip;
+                        if !p.torrentzip {
+                            file.detail = Some("not TorrentZip".into());
+                        }
+                        out.updates.push(Update {
+                            target: target.clone(),
+                            build: built.build,
+                            was: built.file.clone(),
+                            now,
+                            sha256: p.sha256,
+                            torrentzip: p.torrentzip,
+                        });
+                    }
+                    Ok(_) => {
+                        file.outcome = FileOutcome::Conflict;
+                        file.detail = Some(
+                            "it changed since it was built and no longer holds the ROMs the DAT expects there"
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
+        out.files.push(file);
+        tick();
+    }
+
+    let index = input.dat.map(GameIndex::new);
+    for name in entries {
+        if consumed.contains(name) {
+            tick();
+            continue;
+        }
+        let lower = name.to_lowercase();
+        let mut entry = DriftEntry {
+            name: name.clone(),
+            kind: DriftKind::Unknown,
+            game: None,
+            conflict: input.selected.contains_key(&lower),
+            hashed: false,
+            detail: None,
+        };
+        match dir.stat(name) {
+            Ok(None) => {
+                tick();
+                continue;
+            }
+            Err(e) => entry.detail = Some(e.to_string()),
+            Ok(Some(st)) => match FolderDir::kind(&st) {
+                FileType::Directory => entry.kind = DriftKind::Directory,
+                FileType::RegularFile => {
+                    let (probe, hashed) = probe_of(name, &st, &mut out);
+                    entry.hashed = hashed;
+                    match probe {
+                        Err(e) => entry.detail = Some(format!("it cannot be read: {e}")),
+                        Ok(p) => match &index {
+                            None => {
+                                entry.detail = Some(
+                                    "the DAT revision is no longer kept, so it was not compared"
+                                        .into(),
+                                );
+                            }
+                            Some(index) => {
+                                if let Some(game) = index.game_of(&p) {
+                                    entry.game = Some(game.to_owned());
+                                    entry.kind = if *name != format!("{game}.zip") {
+                                        DriftKind::Renamed
+                                    } else if input.selected.contains_key(&lower) {
+                                        DriftKind::Selected
+                                    } else {
+                                        DriftKind::Unselected
+                                    };
+                                }
+                            }
+                        },
+                    }
+                }
+                _ => {
+                    entry.detail = Some("it is not a regular file, so it was not opened".into());
+                }
+            },
+        }
+        out.drift.push(entry);
+        tick();
+    }
+    out
+}
+
+impl Scan {
+    pub fn summary(&self) -> CheckSummary {
+        let mut s = CheckSummary::default();
+        for f in &self.files {
+            *match f.outcome {
+                FileOutcome::Unchanged => &mut s.unchanged,
+                FileOutcome::Refreshed => &mut s.refreshed,
+                FileOutcome::Repacked => &mut s.repacked,
+                FileOutcome::Conflict => &mut s.conflict,
+                FileOutcome::Missing => &mut s.missing,
+                FileOutcome::Unreadable => &mut s.unreadable,
+            } += 1;
+            s.hashed += f.hashed as u64;
+        }
+        for d in &self.drift {
+            s.conflict += d.conflict as u64;
+            s.hashed += d.hashed as u64;
+        }
+        s.drift = self.drift.len() as u64;
+        s
+    }
+}
+
+/// The selected Games of Selection `selection`, by their target's lowercased name.
+pub(super) fn selected_targets(c: &Connection, selection: i64) -> Result<HashMap<String, String>> {
+    let mut stmt = c.prepare(
+        "SELECT title FROM selection_releases WHERE selection_id = ?1 AND role = 'winner'",
+    )?;
+    let rows = stmt.query_map([selection], |r| r.get::<_, String>(0))?;
+    let mut selected = HashMap::new();
+    for title in rows {
+        let title = title?;
+        selected.insert(format!("{title}.zip").to_lowercase(), title);
+    }
+    Ok(selected)
+}
+
+pub(super) fn read_probes(
+    c: &Connection,
+    folder: i64,
+) -> Result<HashMap<String, (FileStat, Probe)>> {
+    let mut stmt =
+        c.prepare("SELECT name, size, mtime_ns, probe FROM folder_probes WHERE folder_id = ?1")?;
+    let rows = stmt.query_map([folder], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            (
+                FileStat {
+                    size: r.get::<_, i64>(1)? as u64,
+                    mtime_ns: r.get::<_, i64>(2)? as i128,
+                },
+                json(r, 3)?,
+            ),
+        ))
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Stores a check of Managed Folder `folder`: brings up to date each built file's record that is still as the check
+/// read it, keeps what it read for the next check, and records the report. Returns the stored check.
+pub(super) fn store_check(
+    tx: &Transaction,
+    folder: i64,
+    job: Option<i64>,
+    scan: Option<&Scan>,
+    mut check: FolderCheck,
+) -> Result<FolderCheck> {
+    if let Some(scan) = scan {
+        for u in &scan.updates {
+            tx.execute(
+                "UPDATE built_files SET size = ?6, mtime_ns = ?7, sha256 = ?8, torrentzip = ?9
+                 WHERE folder_id = ?1 AND target = ?2 AND build_id = ?3 AND size = ?4 AND mtime_ns = ?5",
+                params![
+                    folder,
+                    u.target,
+                    u.build,
+                    u.was.size as i64,
+                    u.was.mtime_ns as i64,
+                    u.now.size as i64,
+                    u.now.mtime_ns as i64,
+                    u.sha256,
+                    u.torrentzip
+                ],
+            )?;
+        }
+        tx.execute("DELETE FROM folder_probes WHERE folder_id = ?1", [folder])?;
+        for (name, (at, probe)) in &scan.probes {
+            tx.execute(
+                "INSERT INTO folder_probes (folder_id, name, size, mtime_ns, probe) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    folder,
+                    name,
+                    at.size as i64,
+                    at.mtime_ns as i64,
+                    to_json(probe)
+                ],
+            )?;
+        }
+    }
+    check.summary.job = job;
+    check.summary.at = now();
+    tx.execute(
+        "INSERT INTO folder_checks (folder_id, job_id, generation, created_at, summary, report)
+         VALUES (?1, ?2, ?3, ?4, '', '')",
+        params![folder, job, check.generation as i64, check.summary.at],
+    )?;
+    let id = tx.last_insert_rowid();
+    check.summary.id = id;
+    tx.execute(
+        "UPDATE folder_checks SET summary = ?2, report = ?3 WHERE id = ?1",
+        params![id, to_json(&check.summary), to_json(&check)],
+    )?;
+    tx.execute(
+        "DELETE FROM folder_checks WHERE folder_id = ?1 AND id < ?2
+         AND id NOT IN (SELECT check_id FROM plans WHERE check_id IS NOT NULL)",
+        params![folder, id],
+    )?;
+    Ok(check)
+}
+
+/// The latest check of Managed Folder `folder`.
+pub(super) fn latest_check(c: &Connection, folder: i64) -> Result<Option<FolderCheck>> {
+    Ok(c.query_row(
+        "SELECT report FROM folder_checks WHERE folder_id = ?1 ORDER BY id DESC LIMIT 1",
+        [folder],
+        |r| json(r, 0),
+    )
+    .optional()?)
+}
+
+/// The summary of the latest check of Managed Folder `folder`.
+pub(super) fn latest_summary(c: &Connection, folder: i64) -> Result<Option<CheckSummary>> {
+    Ok(c.query_row(
+        "SELECT summary FROM folder_checks WHERE folder_id = ?1 ORDER BY id DESC LIMIT 1",
+        [folder],
+        |r| json(r, 0),
+    )
+    .optional()?)
+}
+
+/// What a Check Job reads from the store, in one transaction.
+struct CheckInputs {
+    folder: super::folders::FolderRow,
+    store: String,
+    built: BTreeMap<String, Built>,
+    selection: Option<i64>,
+    selected: HashMap<String, String>,
+    revision: (String, bool),
+    cached: HashMap<String, (FileStat, Probe)>,
+}
+
+impl Store {
+    /// Queues a read-only Check of Managed Folder `folder`, started by `actor`. Refused while the folder has a Build
+    /// or a Check queued or running.
+    pub fn enqueue_check(&self, folder: i64, actor: &str) -> Result<Job> {
+        self.write(|tx| {
+            let row = folder_by_id(tx, folder)?;
+            if let Some(job) = row.active_job {
+                return Err(Error::Conflict(format!(
+                    "managed folder {folder} already has a build or check queued or running: job {job}"
+                )));
+            }
+            let revision: i64 = match row.current_build {
+                Some(build) => tx.query_row(
+                    "SELECT dat_revision_id FROM builds WHERE id = ?1",
+                    [build],
+                    |r| r.get(0),
+                )?,
+                None => choose_revision(tx, &set_by_id(tx, row.source_set_id)?, None)?.0,
+            };
+            tx.execute(
+                "INSERT INTO jobs (state, kind, source_set_id, dat_revision_id, actor, readers, hashers, created_at,
+                                   managed_folder_id)
+                 VALUES ('queued', 'check', ?1, ?2, ?3, 1, 1, ?4, ?5)",
+                params![row.source_set_id, revision, actor, now(), folder],
+            )?;
+            job_by_id(tx, tx.last_insert_rowid())
+        })
+    }
+
+    /// Runs the Running Check Job `id`: checks its folder against the store's record, calling `progress` as entries
+    /// are checked, and stores what it found. Nothing in the folder is changed. A folder that cannot be opened fails
+    /// the Job. Returns the Job as it ends.
+    pub fn run_check_job(
+        &self,
+        config: &Config,
+        id: i64,
+        progress: Option<&(dyn Fn(Progress) + Sync)>,
+    ) -> Result<Job> {
+        let job = self.job(id)?;
+        if job.kind != JobKind::Check {
+            return Err(Error::Refused(format!("job {id} is not a check")));
+        }
+        if job.state != JobState::Running {
+            return Err(Error::Refused(format!(
+                "job {id} is {}, not running",
+                job.state.as_str()
+            )));
+        }
+        let folder = job
+            .managed_folder
+            .ok_or_else(|| Error::Io(format!("check job {id} has no managed folder")))?;
+        let outcome = self.check_folder(config, id, folder, progress);
+        if let Err(err) = outcome {
+            let message = err.to_string();
+            self.write(
+                |tx| match finish_running(tx, id, JobState::Failed, Some(&message)) {
+                    Err(Error::Io(_)) | Ok(()) => Ok(()),
+                    Err(err) => Err(err),
+                },
+            )?;
+        }
+        self.job(id)
+    }
+
+    fn check_folder(
+        &self,
+        config: &Config,
+        job: i64,
+        folder: i64,
+        progress: Option<&(dyn Fn(Progress) + Sync)>,
+    ) -> Result<()> {
+        let inputs = self.read(|c| {
+            let tx = c.unchecked_transaction()?;
+            let folder = folder_by_id(&tx, folder)?;
+            let selection: Option<i64> = match folder.current_build {
+                Some(build) => Some(tx.query_row(
+                    "SELECT selection_id FROM builds WHERE id = ?1",
+                    [build],
+                    |r| r.get(0),
+                )?),
+                None => None,
+            };
+            let selected = match selection {
+                Some(s) => selected_targets(&tx, s)?,
+                None => HashMap::new(),
+            };
+            let revision_id: i64 = tx.query_row(
+                "SELECT dat_revision_id FROM jobs WHERE id = ?1",
+                [job],
+                |r| r.get(0),
+            )?;
+            let (_, record) = revision_by_id(&tx, revision_id)?;
+            let revision = (record.sha256, record.blob_present);
+            Ok(CheckInputs {
+                store: store_id(&tx)?,
+                built: read_built(&tx, folder.id)?,
+                cached: read_probes(&tx, folder.id)?,
+                folder,
+                selection,
+                selected,
+                revision,
+            })
+        })?;
+        let dir = open_folder(config, &inputs.folder.root, &inputs.folder.path)
+            .map_err(|e| Error::Refused(format!("the managed folder cannot be opened: {e}")))?;
+        let entries = listing(&dir).map_err(|e| Error::Io(e.to_string()))?;
+        let dat = match inputs.revision.1 {
+            true => Some(Dat::read(&self.blob_path(&inputs.revision.0))?),
+            false => None,
+        };
+        let mut check = FolderCheck {
+            folder,
+            summary: CheckSummary::default(),
+            generation: inputs.folder.generation,
+            selection: inputs.selection,
+            dat_revision: Some(inputs.revision.0.clone()),
+            files: Vec::new(),
+            drift: Vec::new(),
+        };
+        let problem = marker_problem(
+            &dir,
+            &inputs.store,
+            folder,
+            inputs.folder.generation,
+            entries.is_empty(),
+        );
+        let scan = match problem {
+            Some(problem) => {
+                check.summary.marker = Some(problem);
+                None
+            }
+            None => {
+                let scan = scan(
+                    &dir,
+                    &entries,
+                    &ScanInput {
+                        built: &inputs.built,
+                        selected: &inputs.selected,
+                        dat: dat.as_ref(),
+                        cached: &inputs.cached,
+                    },
+                    progress,
+                );
+                check.summary = scan.summary();
+                check.files = scan.files.clone();
+                check.drift = scan.drift.clone();
+                Some(scan)
+            }
+        };
+        self.write(|tx| {
+            store_check(tx, folder, Some(job), scan.as_ref(), check.clone())?;
+            finish_running(tx, job, JobState::Succeeded, None)
+        })
+    }
+
+    /// The latest check of Managed Folder `folder`.
+    pub fn latest_check(&self, folder: i64) -> Result<Option<FolderCheck>> {
+        self.read(|c| {
+            folder_by_id(c, folder)?;
+            latest_check(c, folder)
+        })
+    }
+}

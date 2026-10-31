@@ -3,6 +3,7 @@
 mod audits;
 mod blobs;
 mod builds;
+mod checks;
 pub mod config;
 mod dats;
 mod folder_dir;

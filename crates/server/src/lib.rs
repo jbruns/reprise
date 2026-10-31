@@ -92,6 +92,10 @@ fn prepare(settings: Settings) -> Result<Prepared, StartError> {
                 "title-select: build job {} was interrupted by a stop; plan again to build the rest",
                 job.id
             ),
+            None if job.kind == JobKind::Check => eprintln!(
+                "title-select: check job {} was interrupted by a stop; check the folder again",
+                job.id
+            ),
             None => eprintln!(
                 "title-select: job {} was interrupted by a stop again; it failed",
                 job.id

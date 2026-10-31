@@ -7,8 +7,9 @@ use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 use leptos_struct_table::ColumnSort;
 use title_select_api::build::{
-    AddManagedFolder, ApprovePlan, BuildDetail, BuildItem, BuildSummary, BuiltFile,
-    ChangeManagedFolder, ItemKind, ManagedFolder, Plan, PlanBuild, PlanItem, PlanSummary,
+    AddManagedFolder, ApprovePlan, BlockerKind, BuildDetail, BuildItem, BuildSummary, BuiltFile,
+    ChangeManagedFolder, FileOutcome, FolderCheck, Incomplete, ItemKind, ManagedFolder, Plan,
+    PlanBuild, PlanChoices, PlanItem, PlanSummary,
 };
 use title_select_api::{
     Dat, Job, PathTemplateDefaults, ProfileRecord, Root, SelectionRecord, SourceSetRecord,
@@ -17,8 +18,9 @@ use title_select_api::{
 use crate::api;
 use crate::app::{Loading, Problem, navigator};
 use crate::build_model::{
-    blocker_label, build_state_label, by_kind, cause_label, folders_for, group_href,
-    item_kind_label, item_kind_note, item_state_label,
+    blocker_label, build_state_label, by_kind, cause_label, drift_kind_label, file_outcome_label,
+    folders_for, group_href, incomplete_counts, incomplete_reason_label, item_kind_label,
+    item_kind_note, item_state_label, unfinished_label, with_adopt,
 };
 use crate::events::use_live;
 use crate::model::{short_sha, when};
@@ -45,6 +47,19 @@ fn current_build(build: &Option<BuildSummary>) -> AnyView {
     }
 }
 
+/// The folder's badges: incomplete, with its counts by reason, and a build that stopped before it finished.
+fn badges(folder: &ManagedFolder) -> AnyView {
+    let incomplete = folder.incomplete.as_ref().map(|counts| {
+        let text = format!("Incomplete: {}", incomplete_counts(counts));
+        view! { <span class="state review">{text}</span> " " }
+    });
+    let unfinished = folder.unfinished.as_ref().map(|u| {
+        let text = unfinished_label(u);
+        view! { <span class="state review">{text}</span> }
+    });
+    view! { {incomplete} {unfinished} }.into_any()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum FolderCol {
     Location,
@@ -53,6 +68,7 @@ enum FolderCol {
     Profile,
     Build,
     Files,
+    Status,
 }
 
 #[derive(Clone, PartialEq)]
@@ -67,6 +83,7 @@ impl Grid for FolderItem {
         FolderCol::Profile,
         FolderCol::Build,
         FolderCol::Files,
+        FolderCol::Status,
     ];
 
     fn header(col: FolderCol) -> &'static str {
@@ -77,6 +94,7 @@ impl Grid for FolderItem {
             FolderCol::Profile => "Selection profile",
             FolderCol::Build => "Current build",
             FolderCol::Files => "Files",
+            FolderCol::Status => "Status",
         }
     }
 
@@ -107,6 +125,7 @@ impl Grid for FolderItem {
             FolderCol::Profile => f.profile.clone().into_any(),
             FolderCol::Build => current_build(&f.build),
             FolderCol::Files => f.files.to_string().into_any(),
+            FolderCol::Status => badges(f),
         }
     }
 }
@@ -445,6 +464,7 @@ fn FolderView(folder: ManagedFolder, refresh: RwSignal<u64>) -> impl IntoView {
     );
     view! {
         <h1>{title}</h1>
+        <p>{badges(&folder)}</p>
         <dl class="facts">
             <dt>"System"</dt>
             <dd>{system}</dd>
@@ -471,6 +491,8 @@ fn FolderView(folder: ManagedFolder, refresh: RwSignal<u64>) -> impl IntoView {
             <dd>{when(&folder.created_at)}</dd>
         </dl>
         {active_job.map(|job| view! { <BuildProgress job /> })}
+        {folder.incomplete.is_some().then(|| view! { <IncompleteItems folder=id /> })}
+        <CheckPanel folder=id busy=active_job.is_some() refresh />
         <PlanForm folder=folder.clone() refresh />
         {folder.latest_plan.map(|plan| view! { <PlanPanel plan refresh /> })}
         <ChangeBinding folder=folder.clone() refresh />
@@ -479,13 +501,179 @@ fn FolderView(folder: ManagedFolder, refresh: RwSignal<u64>) -> impl IntoView {
     }
 }
 
-/// A build job's progress, live.
+/// What the folder lacks of its current build's selection, and why.
+#[component]
+fn IncompleteItems(folder: i64) -> impl IntoView {
+    let live = use_live();
+    let loaded = LocalResource::new(move || {
+        live.settled.track();
+        async move { api::get::<Incomplete>(&format!("/managed-folders/{folder}/incomplete")).await }
+    });
+    view! {
+        <section aria-labelledby="incomplete-title">
+            <h2 id="incomplete-title">"Incomplete"</h2>
+            <p class="lede">
+                "The folder lacks these selected games. Fix what stops them, then plan again; failed files are \
+                listed with their errors."
+            </p>
+            {move || match loaded.get() {
+                None => view! { <Loading what="what the folder lacks" /> }.into_any(),
+                Some(Err(message)) => view! { <Problem message /> }.into_any(),
+                Some(Ok(incomplete)) => view! {
+                    <ul class="plain">
+                        {incomplete
+                            .items
+                            .into_iter()
+                            .map(|i| {
+                                let class = if i.reason == title_select_api::build::IncompleteReason::Failed {
+                                    "failed"
+                                } else {
+                                    ""
+                                };
+                                view! {
+                                    <li>
+                                        <code>{i.target}</code>
+                                        {format!(": {}", incomplete_reason_label(i.reason))}
+                                        {i.detail.map(|d| view! { <span class=class>{format!(": {d}")}</span> })}
+                                    </li>
+                                }
+                            })
+                            .collect_view()}
+                    </ul>
+                }
+                .into_any(),
+            }}
+        </section>
+    }
+}
+
+/// Starts a read-only check of the folder, and shows the latest one.
+#[component]
+fn CheckPanel(folder: i64, busy: bool, refresh: RwSignal<u64>) -> impl IntoView {
+    let live = use_live();
+    let loaded = LocalResource::new(move || {
+        live.settled.track();
+        refresh.track();
+        async move {
+            api::get::<FolderCheck>(&format!("/managed-folders/{folder}/check"))
+                .await
+                .ok()
+        }
+    });
+    let problem = RwSignal::new(None::<String>);
+    let start = move |_| {
+        problem.set(None);
+        leptos::task::spawn_local(async move {
+            match api::post::<_, Job>(&format!("/managed-folders/{folder}/checks"), &()).await {
+                Ok(_) => refresh.update(|n| *n += 1),
+                Err(message) => problem.set(Some(message)),
+            }
+        });
+    };
+    view! {
+        <section aria-labelledby="check-title">
+            <h2 id="check-title">"Check the folder"</h2>
+            <p class="lede">
+                "A check compares the folder with what was built into it, and lists everything else in it. It reads \
+                only the files whose size or modification time changed, and never changes the folder."
+            </p>
+            <div class="form">
+                <button type="button" disabled=busy on:click=start>"Check the folder"</button>
+            </div>
+            {move || problem.get().map(|message| view! { <Problem message /> })}
+            {move || loaded.get().flatten().map(check_view)}
+        </section>
+    }
+}
+
+fn check_view(check: FolderCheck) -> impl IntoView {
+    let s = &check.summary;
+    let by = match s.job {
+        Some(job) => format!("Checked by job #{job} · {}", when(&s.at)),
+        None => format!("Checked with a plan · {}", when(&s.at)),
+    };
+    let counts = [
+        ("Unchanged", s.unchanged + s.refreshed, "count verified"),
+        ("Same ROMs, another ZIP", s.repacked, "count"),
+        ("Conflict", s.conflict, "count review"),
+        ("Missing", s.missing, "count review"),
+        ("Unreadable", s.unreadable, "count review"),
+        ("Not built here", s.drift, "count"),
+        ("Read", s.hashed, "count"),
+    ];
+    let marker = s.marker.clone();
+    let files: Vec<_> = check
+        .files
+        .iter()
+        .filter(|f| f.outcome != FileOutcome::Unchanged || !f.torrentzip)
+        .cloned()
+        .collect();
+    view! {
+        <p class="note">{by}</p>
+        {marker.map(|m| view! { <div class="notice" role="status"><p>{format!("The marker does not match: {m}")}</p></div> })}
+        <ul class="counts">
+            {counts
+                .into_iter()
+                .map(|(what, n, class)| view! {
+                    <li class=class><span class="n">{n}</span><span class="what">{what}</span></li>
+                })
+                .collect_view()}
+        </ul>
+        {(!files.is_empty()).then(|| view! {
+            <h3>"Built files that changed"</h3>
+            <ul class="plain">
+                {files
+                    .into_iter()
+                    .map(|f| {
+                        let flag = (!f.torrentzip).then_some(", not TorrentZip");
+                        view! {
+                            <li>
+                                <code>{f.target}</code>
+                                {format!(": {}", file_outcome_label(f.outcome))}
+                                {flag}
+                                {f.detail.filter(|d| d != "not TorrentZip").map(|d| format!(": {d}"))}
+                            </li>
+                        }
+                    })
+                    .collect_view()}
+            </ul>
+        })}
+        {(!check.drift.is_empty()).then(|| view! {
+            <h3>"Not built here"</h3>
+            <p class="note small">
+                "Entries Title Select did not build. They are left as they are; only one at a selected game's file \
+                makes the folder incomplete."
+            </p>
+            <ul class="plain">
+                {check
+                    .drift
+                    .into_iter()
+                    .map(|d| {
+                        let game = d.game.map(|g| format!(" ({g})"));
+                        let conflict = d.conflict.then_some(", at a selected game's file");
+                        view! {
+                            <li>
+                                <code>{d.name}</code>
+                                {format!(": {}", drift_kind_label(d.kind))}
+                                {game}
+                                {conflict}
+                                {d.detail.map(|x| format!(": {x}"))}
+                            </li>
+                        }
+                    })
+                    .collect_view()}
+            </ul>
+        })}
+    }
+}
+
+/// A job's progress on the folder, live.
 #[component]
 fn BuildProgress(job: i64) -> impl IntoView {
     let live = use_live();
     view! {
         <p class="notice" role="status">
-            {format!("Build job #{job} ")}
+            {format!("Job #{job} ")}
             {move || match live.book.with(|b| b.get(job).cloned()) {
                 Some(l) if l.job.state.is_final() => {
                     let outcome = match &l.job.error {
@@ -494,7 +682,7 @@ fn BuildProgress(job: i64) -> impl IntoView {
                     };
                     view! { <span>{outcome}</span> }.into_any()
                 }
-                Some(l) => view! { <span>"is building. "</span> {progress_view(&l)} }.into_any(),
+                Some(l) => view! { <span>"is running. "</span> {progress_view(&l)} }.into_any(),
                 None => view! { <A href="/jobs">"Follow it on the Jobs screen"</A> }.into_any(),
             }}
         </p>
@@ -540,7 +728,7 @@ fn PlanForm(folder: ManagedFolder, refresh: RwSignal<u64>) -> impl IntoView {
         leptos::task::spawn_local(async move {
             let planned = api::post::<_, Plan>(
                 &format!("/managed-folders/{id}/plans"),
-                &PlanBuild { selection },
+                &PlanBuild::new(selection),
             )
             .await;
             busy.set(false);
@@ -602,9 +790,11 @@ fn summary_view(s: &PlanSummary) -> AnyView {
     let counts = [
         ("Copy", s.copy, "count verified"),
         ("Repack", s.repack, "count verified"),
+        ("Adopt", s.adopt, "count verified"),
         ("Unchanged", s.unchanged, "count"),
         ("No source", s.no_source, "count review"),
         ("Conflict", s.conflict, "count review"),
+        ("Unresolved", s.unresolved, "count review"),
         ("Blocked", s.blocked, "count review"),
     ];
     view! {
@@ -758,6 +948,84 @@ fn PlanView(plan: Plan, refresh: RwSignal<u64>) -> impl IntoView {
     };
     let approvable = plan.approvable() && plan.approval.is_none();
     let writes = plan.summary.copy + plan.summary.repack;
+    // Your choices are part of the plan: changing one plans again, and you review the new plan.
+    let (folder, choices) = (plan.content.folder, plan.content.choices.clone());
+    let replan = move |choices: PlanChoices| {
+        busy.set(true);
+        let request = PlanBuild { selection, choices };
+        leptos::task::spawn_local(async move {
+            let planned =
+                api::post::<_, Plan>(&format!("/managed-folders/{folder}/plans"), &request).await;
+            busy.set(false);
+            match planned {
+                Ok(_) => refresh.update(|n| *n += 1),
+                Err(message) => outcome.set(Some(Err(message))),
+            }
+        });
+    };
+    let open = plan.approval.is_none();
+    let unresolved = plan
+        .content
+        .blockers
+        .iter()
+        .any(|b| b.kind == BlockerKind::Unresolved);
+    let partial = {
+        let choices = choices.clone();
+        (open && (unresolved || choices.resolved_only)).then(|| {
+            let on = !choices.resolved_only;
+            let next = PlanChoices {
+                resolved_only: on,
+                ..choices.clone()
+            };
+            let label = if on {
+                "Build resolved groups only"
+            } else {
+                "Plan every group again"
+            };
+            view! {
+                <div class="form">
+                    <button type="button" disabled=busy on:click=move |_| replan(next.clone())>{label}</button>
+                </div>
+            }
+        })
+    };
+    let conflicts: Vec<PlanItem> = plan
+        .content
+        .items
+        .iter()
+        .filter(|i| i.adoptable || i.kind == ItemKind::Adopt)
+        .cloned()
+        .collect();
+    let adopt_choices = (open && !conflicts.is_empty()).then(|| {
+        view! {
+            <h3>"Conflicts you can adopt"</h3>
+            <p class="note small">
+                "Each of these files holds the ROMs the DAT expects at its name. Leave it, and it is skipped and the \
+                folder is incomplete; adopt it, and it is recorded as built without writing anything."
+            </p>
+            <ul class="plain">
+                {conflicts
+                    .into_iter()
+                    .map(|i| {
+                        let adopted = i.kind == ItemKind::Adopt;
+                        let next = with_adopt(&choices, &i.target, !adopted);
+                        let (now, label) = if adopted {
+                            ("adopted", "Leave it")
+                        } else {
+                            ("left as it is", "Adopt it")
+                        };
+                        view! {
+                            <li>
+                                <code>{i.target.clone()}</code>
+                                {format!(": {now} ")}
+                                <button type="button" disabled=busy on:click=move |_| replan(next.clone())>{label}</button>
+                            </li>
+                        }
+                    })
+                    .collect_view()}
+            </ul>
+        }
+    });
 
     view! {
         <section aria-labelledby="latest-plan-title">
@@ -827,6 +1095,8 @@ fn PlanView(plan: Plan, refresh: RwSignal<u64>) -> impl IntoView {
                         </div>
                     }
                 })}
+            {partial}
+            {adopt_choices}
             {approvable
                 .then(|| {
                     view! {
@@ -1242,7 +1512,7 @@ pub fn PlanABuild(selection: SelectionRecord) -> impl IntoView {
         leptos::task::spawn_local(async move {
             let planned = api::post::<_, Plan>(
                 &format!("/managed-folders/{folder}/plans"),
-                &PlanBuild { selection: id },
+                &PlanBuild::new(id),
             )
             .await;
             match planned {

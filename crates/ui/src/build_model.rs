@@ -3,7 +3,8 @@
 
 use title_select_api::SelectionRecord;
 use title_select_api::build::{
-    BlockerKind, BuildState, Cause, ItemKind, ItemState, ManagedFolder, PlanItem,
+    BlockerKind, BuildState, Cause, DriftKind, FileOutcome, IncompleteCounts, IncompleteReason,
+    ItemKind, ItemState, ManagedFolder, PlanChoices, PlanItem, UnfinishedBuild,
 };
 
 pub fn item_kind_label(kind: ItemKind) -> &'static str {
@@ -14,6 +15,8 @@ pub fn item_kind_label(kind: ItemKind) -> &'static str {
         ItemKind::NoSource => "No source",
         ItemKind::Conflict => "Conflict",
         ItemKind::Blocked => "Blocked",
+        ItemKind::Adopt => "Adopt",
+        ItemKind::Unresolved => "Unresolved",
     }
 }
 
@@ -29,7 +32,80 @@ pub fn item_kind_note(kind: ItemKind) -> &'static str {
              overwritten, so these are skipped."
         }
         ItemKind::Blocked => "These cannot be built as planned, so they are skipped.",
+        ItemKind::Adopt => {
+            "Files already in the folder that hold the ROMs the DAT expects. You chose to adopt them: they are \
+             recorded as built, and nothing is written."
+        }
+        ItemKind::Unresolved => {
+            "Their groups are unresolved, and you build the resolved groups only. Whatever is at their targets is \
+             left untouched."
+        }
     }
+}
+
+pub fn incomplete_reason_label(reason: IncompleteReason) -> &'static str {
+    match reason {
+        IncompleteReason::Unresolved => "unresolved",
+        IncompleteReason::NoSource => "no source",
+        IncompleteReason::Failed => "failed",
+        IncompleteReason::Conflict => "conflict",
+        IncompleteReason::Blocked => "blocked",
+        IncompleteReason::Missing => "missing",
+    }
+}
+
+/// The counts behind an incomplete badge, such as `2 conflict, 1 failed`, leaving out reasons with none.
+pub fn incomplete_counts(counts: &IncompleteCounts) -> String {
+    IncompleteReason::ALL
+        .into_iter()
+        .filter(|r| counts.get(*r) > 0)
+        .map(|r| format!("{} {}", counts.get(r), incomplete_reason_label(r)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The interrupted-build badge's text, from the store's record of the build.
+pub fn unfinished_label(unfinished: &UnfinishedBuild) -> String {
+    let what = match unfinished.state {
+        BuildState::Failed => "Failed build",
+        _ => "Interrupted build",
+    };
+    format!(
+        "{what}: {} applied, {} uncertain",
+        unfinished.applied, unfinished.uncertain
+    )
+}
+
+pub fn file_outcome_label(outcome: FileOutcome) -> &'static str {
+    match outcome {
+        FileOutcome::Unchanged => "Unchanged",
+        FileOutcome::Refreshed => "Unchanged, record refreshed",
+        FileOutcome::Repacked => "Same ROMs, another ZIP",
+        FileOutcome::Conflict => "Conflict",
+        FileOutcome::Missing => "Missing",
+        FileOutcome::Unreadable => "Unreadable",
+    }
+}
+
+pub fn drift_kind_label(kind: DriftKind) -> &'static str {
+    match kind {
+        DriftKind::Unselected => "Known title, not selected",
+        DriftKind::Selected => "Selected title, not built here",
+        DriftKind::Renamed => "Known title under another name",
+        DriftKind::Unknown => "Unknown file",
+        DriftKind::Directory => "Directory, never opened",
+    }
+}
+
+/// The choices of a plan made again with `adopt` for `target` set to `on`, keeping the rest.
+pub fn with_adopt(choices: &PlanChoices, target: &str, on: bool) -> PlanChoices {
+    let mut next = choices.clone();
+    next.adopt.retain(|t| t != target);
+    if on {
+        next.adopt.push(target.to_owned());
+        next.adopt.sort();
+    }
+    next
 }
 
 pub fn cause_label(cause: Cause) -> &'static str {
@@ -127,6 +203,7 @@ mod tests {
             sources: Vec::new(),
             reason: None,
             existing: None,
+            adoptable: false,
         }
     }
 
@@ -145,6 +222,9 @@ mod tests {
             files: 0,
             active_job: None,
             latest_plan: None,
+            incomplete: None,
+            unfinished: None,
+            check: None,
         }
     }
 
@@ -206,6 +286,32 @@ mod tests {
             .collect();
 
         assert_eq!(ids, [1, 4]);
+    }
+
+    #[test]
+    fn an_incomplete_badge_counts_only_the_reasons_it_has() {
+        let counts = IncompleteCounts {
+            conflict: 2,
+            failed: 1,
+            ..IncompleteCounts::default()
+        };
+
+        assert_eq!(incomplete_counts(&counts), "1 failed, 2 conflict");
+    }
+
+    #[test]
+    fn choosing_to_adopt_a_conflict_keeps_the_other_choices() {
+        let choices = PlanChoices {
+            resolved_only: true,
+            adopt: vec!["Pong.zip".into()],
+        };
+
+        let both = with_adopt(&choices, "Combat.zip", true);
+        let left = with_adopt(&both, "Pong.zip", false);
+
+        assert_eq!(both.adopt, ["Combat.zip", "Pong.zip"]);
+        assert_eq!(left.adopt, ["Combat.zip"]);
+        assert!(left.resolved_only);
     }
 
     #[test]

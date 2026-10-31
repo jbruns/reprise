@@ -17,8 +17,8 @@ use std::time::SystemTime;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 use title_select_api::build::{
-    BuildDetail, BuildItem, BuildSummary, BuiltFile, ExpectedRom, FileStat, ItemKind, ItemState,
-    Marker, PlanItem, STAGING,
+    BuildDetail, BuildItem, BuildSummary, BuiltFile, ExpectedRom, FileStat, IncompleteReason,
+    ItemKind, ItemState, Marker, PlanItem, STAGING,
 };
 use title_select_api::{Job, JobKind, JobState};
 use title_select_engine::Progress;
@@ -235,6 +235,7 @@ fn record_applied(
     seq: i64,
     item: &PlanItem,
     found: &Stat,
+    torrentzip: bool,
 ) -> Result<bool> {
     let (dev, ino): (Option<i64>, Option<i64>) = tx.query_row(
         "SELECT dev, ino FROM build_items WHERE build_id = ?1 AND seq = ?2",
@@ -264,14 +265,15 @@ fn record_applied(
     )?;
     tx.execute(
         "INSERT INTO built_files (folder_id, target, game, kind, build_id, selection_id, audit_id, dat_revision_id,
-                                  roms, sources, size, mtime_ns)
-         SELECT ?1, ?2, ?3, ?4, b.id, b.selection_id, b.audit_id, b.dat_revision_id, ?5, ?6, ?7, ?8
-         FROM builds b WHERE b.id = ?9
+                                  roms, sources, size, mtime_ns, sha256, torrentzip)
+         SELECT ?1, ?2, ?3, ?4, b.id, b.selection_id, b.audit_id, b.dat_revision_id, ?5, ?6, ?7, ?8, i.sha256, ?11
+         FROM builds b JOIN build_items i ON i.build_id = b.id AND i.seq = ?10 WHERE b.id = ?9
          ON CONFLICT (folder_id, target) DO UPDATE SET
              game = excluded.game, kind = excluded.kind, build_id = excluded.build_id,
              selection_id = excluded.selection_id, audit_id = excluded.audit_id,
              dat_revision_id = excluded.dat_revision_id, roms = excluded.roms, sources = excluded.sources,
-             size = excluded.size, mtime_ns = excluded.mtime_ns",
+             size = excluded.size, mtime_ns = excluded.mtime_ns, sha256 = excluded.sha256,
+             torrentzip = excluded.torrentzip",
         params![
             folder,
             item.target,
@@ -281,7 +283,9 @@ fn record_applied(
             to_json(&item.sources),
             file.size as i64,
             file.mtime_ns as i64,
-            build
+            build,
+            seq,
+            torrentzip
         ],
     )?;
     Ok(true)
@@ -325,6 +329,102 @@ fn end_failed(tx: &Transaction, job: i64, build: Option<i64>, error: &str) -> Re
         Err(Error::Io(_)) | Ok(()) => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+/// Checks, through `dir`, that the file at `item`'s target holds exactly the ROMs the DAT expects there, and is the
+/// same file, unchanged, from before it is read until after. Nothing is written. Returns its SHA-256, its `lstat`,
+/// and whether it is TorrentZip; or why it cannot be adopted, leaving it as it is.
+fn adopt(dir: &FolderDir, item: &PlanItem) -> std::result::Result<(String, Stat, bool), String> {
+    let left = |why: &str| {
+        format!(
+            "{} cannot be adopted: {why}; it was left as it is",
+            item.target
+        )
+    };
+    let seen = dir
+        .stat(&item.target)
+        .map_err(|e| left(&e.to_string()))?
+        .ok_or_else(|| left("it is gone"))?;
+    if item.existing.as_ref() != Some(&file_stat(&seen)) {
+        return Err(left("it changed since you approved the plan"));
+    }
+    let file = dir
+        .open_file(&item.target)
+        .map_err(|e| left(&e.to_string()))?;
+    let before = rustix::fs::fstat(&file).map_err(|e| left(&e.to_string()))?;
+    if Identity::of(&before) != Identity::of(&seen) || file_stat(&before) != file_stat(&seen) {
+        return Err(left("it changed while it was read"));
+    }
+    let probe = title_select_engine::build::probe(&file).map_err(|e| left(&e.to_string()))?;
+    if !title_select_engine::build::holds(&probe, &item.roms) {
+        return Err(left(
+            "it does not hold exactly the ROMs the DAT expects there",
+        ));
+    }
+    let after = rustix::fs::fstat(&file).map_err(|e| left(&e.to_string()))?;
+    match dir.stat(&item.target) {
+        Ok(Some(st))
+            if FolderDir::kind(&st) == rustix::fs::FileType::RegularFile
+                && Identity::of(&st) == Identity::of(&before)
+                && file_stat(&st) == file_stat(&before)
+                && file_stat(&after) == file_stat(&before) =>
+        {
+            Ok((probe.sha256, st, probe.torrentzip))
+        }
+        _ => Err(left("it changed while it was read")),
+    }
+}
+
+/// Records what the Build `build` left Managed Folder `folder` lacking of its Selection: each item of its plan that
+/// was skipped, other than an unresolved one whose file is built here, and each item that failed.
+fn record_incomplete(tx: &Transaction, build: i64, folder: i64, items: &[PlanItem]) -> Result<()> {
+    let failed: HashMap<String, Option<String>> = {
+        let mut stmt = tx.prepare(
+            "SELECT target, error FROM build_items WHERE build_id = ?1 AND state IN ('failed', 'uncertain', 'pending')",
+        )?;
+        let rows = stmt.query_map([build], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut seq = 0;
+    for item in items {
+        let reason = match item.kind {
+            _ if failed.contains_key(&item.target) => IncompleteReason::Failed,
+            ItemKind::Unresolved => {
+                let built: bool = tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM built_files WHERE folder_id = ?1 AND target = ?2)",
+                    params![folder, item.target],
+                    |r| r.get(0),
+                )?;
+                if built {
+                    continue;
+                }
+                IncompleteReason::Unresolved
+            }
+            ItemKind::NoSource => IncompleteReason::NoSource,
+            ItemKind::Conflict => IncompleteReason::Conflict,
+            ItemKind::Blocked => IncompleteReason::Blocked,
+            _ => continue,
+        };
+        let detail = match reason {
+            IncompleteReason::Failed => failed[&item.target].clone(),
+            _ => item.reason.clone(),
+        };
+        tx.execute(
+            "INSERT INTO build_incomplete (build_id, seq, reason, grp, game, target, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                build,
+                seq,
+                reason.as_str(),
+                item.group,
+                item.game,
+                item.target,
+                detail
+            ],
+        )?;
+        seq += 1;
+    }
+    Ok(())
 }
 
 /// An item that was being renamed into place when its Build stopped.
@@ -408,9 +508,10 @@ impl Store {
             .as_ref()
             .ok_or_else(|| Error::Io(format!("plan {plan_id} is not approved")))?;
         let content = &plan.content;
-        let again = self.compute_plan(config, content.folder, content.selection)?;
+        let again =
+            self.compute_plan(config, content.folder, content.selection, &content.choices)?;
         if digest(&again.content) != approved.digest {
-            let newer = self.write(|tx| super::plans::insert_plan(tx, &again))?;
+            let newer = self.write(|tx| super::plans::insert_plan(tx, &again, None))?;
             return Err(Error::Conflict(format!(
                 "the plan changed since you approved it; nothing was written. Review plan {} instead",
                 newer.id
@@ -442,16 +543,22 @@ impl Store {
             }
         }
         let (set_dir, set_root) = self.set_folder(config, folder_row.source_set_id)?;
-        let work: Vec<Work> = content
+        // The files to write, then the files to adopt, which are only recorded.
+        let (writes, adopts): (Vec<&PlanItem>, Vec<&PlanItem>) = content
             .items
             .iter()
-            .filter(|i| i.kind.writes())
+            .filter(|i| i.kind.writes() || i.kind == ItemKind::Adopt)
+            .partition(|i| i.kind.writes());
+        let all: Vec<Work> = writes
+            .into_iter()
+            .chain(adopts)
             .enumerate()
             .map(|(seq, item)| Work {
                 seq: seq as i64,
                 item,
             })
             .collect();
+        let (work, adopts) = all.split_at(all.iter().take_while(|w| w.item.kind.writes()).count());
         let generation = content.generation + 1;
         let id = self.write(|tx| {
             let revision: i64 = tx.query_row(
@@ -475,7 +582,7 @@ impl Store {
                 ],
             )?;
             let id = tx.last_insert_rowid();
-            for w in &work {
+            for w in &all {
                 tx.execute(
                     "INSERT INTO build_items (build_id, seq, target, game, kind, state)
                      VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
@@ -494,7 +601,7 @@ impl Store {
         record_temp(self, folder, STAGING, staging_id)?;
         let mut staged_ids = HashMap::new();
         let built_at = SystemTime::now();
-        let total = work.len();
+        let total = all.len();
         if let Some(progress) = progress {
             progress(Progress {
                 files_done: 0,
@@ -581,9 +688,8 @@ impl Store {
                     self.fault_point(Fault::AfterPublish(w.seq));
                     let found = dir.stat(target).map_err(folder_io)?;
                     let applied = match &found {
-                        Some(st) => {
-                            self.write(|tx| record_applied(tx, id, folder, w.seq, w.item, st))?
-                        }
+                        Some(st) => self
+                            .write(|tx| record_applied(tx, id, folder, w.seq, w.item, st, true))?,
                         None => {
                             fail(
                                 ItemState::Uncertain,
@@ -610,6 +716,31 @@ impl Store {
         }
         clear_staging(&dir, &staging, staging_id, &staged_ids).map_err(Error::Refused)?;
         drop(staging);
+        for (done, w) in adopts.iter().enumerate() {
+            check_marker(&dir, &expected).map_err(Error::Refused)?;
+            match adopt(&dir, w.item) {
+                Ok((sha256, st, torrentzip)) => {
+                    let (dev, ino) = Identity::of(&st).to_sql();
+                    self.write(|tx| {
+                        tx.execute(
+                            "UPDATE build_items SET sha256 = ?3, size = ?4, dev = ?5, ino = ?6
+                             WHERE build_id = ?1 AND seq = ?2",
+                            params![id, w.seq, sha256, st.st_size, dev, ino],
+                        )?;
+                        record_applied(tx, id, folder, w.seq, w.item, &st, torrentzip).map(|_| ())
+                    })?;
+                }
+                Err(error) => {
+                    self.write(|tx| set_item(tx, id, w.seq, ItemState::Failed, &error))?
+                }
+            }
+            if let Some(progress) = progress {
+                progress(Progress {
+                    files_done: work.len() + done + 1,
+                    files_total: total,
+                });
+            }
+        }
 
         // The store decides the next generation first, and the marker follows it; recovery moves a marker that did
         // not follow forward, and never back.
@@ -630,6 +761,7 @@ impl Store {
                 "UPDATE builds SET finalizing_at = ?2 WHERE id = ?1",
                 params![id, now()],
             )?;
+            record_incomplete(tx, id, folder, &content.items)?;
             tx.execute("DELETE FROM audit_citations WHERE cited_by = ?1", [&key])?;
             tx.execute(
                 "INSERT INTO audit_citations (audit_id, cited_by) VALUES (?1, ?2)",
@@ -816,7 +948,7 @@ impl Store {
                     Some(Ok(((sha256, size), st)))
                         if Some(&sha256) == p.sha256.as_ref() && Some(size as i64) == p.size =>
                     {
-                        record_applied(tx, build, folder.id, p.seq, item, &st).map(|_| ())
+                        record_applied(tx, build, folder.id, p.seq, item, &st, true).map(|_| ())
                     }
                     Some(Ok(_)) => set_item(
                         tx,
@@ -928,7 +1060,7 @@ impl Store {
             folder_by_id(c, folder)?;
             let mut stmt = c.prepare(
                 "SELECT f.target, f.game, f.kind, f.build_id, f.selection_id, f.audit_id, r.sha256, f.sources,
-                        f.roms, f.size, f.mtime_ns
+                        f.roms, f.size, f.mtime_ns, f.sha256, f.torrentzip
                  FROM built_files f JOIN dat_revisions r ON r.id = f.dat_revision_id
                  WHERE f.folder_id = ?1 ORDER BY f.target",
             )?;
@@ -948,6 +1080,8 @@ impl Store {
                         size: r.get::<_, i64>(9)? as u64,
                         mtime_ns: r.get::<_, i64>(10)? as i128,
                     },
+                    sha256: r.get(11)?,
+                    torrentzip: r.get(12)?,
                 })
             })?;
             Ok(rows.collect::<Result<_, _>>()?)

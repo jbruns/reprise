@@ -1,7 +1,6 @@
 //! Change Plans: what building a Selection into a Managed Folder would do, computed from the store and a stat of the
 //! folder and of the sources, and stored with the SHA-256 of its canonical JSON, which an approval binds to.
 
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::Metadata;
 use std::path::PathBuf;
@@ -10,20 +9,22 @@ use std::time::UNIX_EPOCH;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use sha2::{Digest, Sha256};
 use title_select_api::build::{
-    Approval, Blocker, BlockerKind, Cause, ExpectedRom, FileStat, ItemKind, Plan, PlanChange,
-    PlanContent, PlanItem, PlanSource, STAGING, invalid_name,
+    Approval, Blocker, BlockerKind, Cause, CheckSummary, ExpectedRom, FileOutcome, FileStat,
+    FolderCheck, ItemKind, Plan, PlanBuild, PlanChange, PlanChoices, PlanContent, PlanItem,
+    PlanSource, STAGING, invalid_name,
 };
 use title_select_api::report::{Entry, EvidenceLevel, Finding};
 use title_select_api::selection::{ReleaseRow, Role, Selection, diff_rows};
 use title_select_api::{DatRevisionRecord, Job, Workers};
-use title_select_engine::build::is_torrentzip;
+use title_select_engine::build::{Probe, holds, is_torrentzip};
 use title_select_engine::dat::Dat;
 
 use super::audits::{ENTRY_COLUMNS, entry_from_row};
+use super::checks::{Scan, ScanInput, read_probes, scan, store_check};
 use super::dats::revision_by_id;
 use super::folder_dir::{FolderDir, file_stat};
 use super::folders::{
-    FolderRow, MARKER_NEW, MarkerState, folder_by_id, is_own, open_folder, read_marker, store_id,
+    FolderRow, MARKER_NEW, folder_by_id, is_own, marker_problem, open_folder, store_id,
 };
 use super::jobs::{build_hold, job_by_id};
 use super::selections::{read_rows, read_selection, record_by_id};
@@ -37,11 +38,16 @@ pub(super) struct Built {
     pub game: String,
     pub roms: Vec<ExpectedRom>,
     pub file: FileStat,
+    /// The Build that recorded it.
+    pub build: i64,
+    pub sha256: Option<String>,
+    pub torrentzip: bool,
 }
 
 pub(super) fn read_built(c: &Connection, folder: i64) -> Result<BTreeMap<String, Built>> {
     let mut stmt = c.prepare(
-        "SELECT target, game, roms, size, mtime_ns FROM built_files WHERE folder_id = ?1",
+        "SELECT target, game, roms, size, mtime_ns, build_id, sha256, torrentzip FROM built_files
+         WHERE folder_id = ?1",
     )?;
     let rows = stmt.query_map([folder], |r| {
         Ok((
@@ -53,6 +59,9 @@ pub(super) fn read_built(c: &Connection, folder: i64) -> Result<BTreeMap<String,
                     size: r.get::<_, i64>(3)? as u64,
                     mtime_ns: r.get::<_, i64>(4)? as i128,
                 },
+                build: r.get(5)?,
+                sha256: r.get(6)?,
+                torrentzip: r.get(7)?,
             },
         ))
     })?;
@@ -125,9 +134,19 @@ struct Inputs {
     previous: Option<Previous>,
     /// The folder's earliest Build that ended without its folder being cleaned up, and why recovery left it.
     unrecovered: Option<(i64, Option<String>)>,
+    choices: PlanChoices,
+    /// The selected Games, by their target's lowercased name.
+    selected: HashMap<String, String>,
+    /// What earlier checks of the folder read, by name.
+    cached: HashMap<String, (FileStat, Probe)>,
 }
 
-fn load(c: &Connection, folder_id: i64, selection_id: i64) -> Result<Inputs> {
+fn load(
+    c: &Connection,
+    folder_id: i64,
+    selection_id: i64,
+    choices: &PlanChoices,
+) -> Result<Inputs> {
     let folder = folder_by_id(c, folder_id)?;
     let (set_id, revision_id, profile_version, profile_id, pruned): (i64, i64, i64, i64, bool) = c
         .query_row(
@@ -206,8 +225,20 @@ fn load(c: &Connection, folder_id: i64, selection_id: i64) -> Result<Inputs> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
+    let mut selected = HashMap::new();
+    for group in &selection.groups {
+        for winner in &group.winners {
+            selected.insert(
+                format!("{}.zip", winner.title).to_lowercase(),
+                winner.title.clone(),
+            );
+        }
+    }
     Ok(Inputs {
         unrecovered,
+        choices: choices.clone(),
+        selected,
+        cached: read_probes(c, folder.id)?,
         store: store_id(c)?,
         built: read_built(c, folder.id)?,
         folder,
@@ -230,6 +261,9 @@ pub(super) struct Planned {
     pub content: PlanContent,
     pub previous: Option<i64>,
     pub changes: Vec<PlanChange>,
+    /// The check of the folder the plan was made with, when the folder could be opened.
+    pub check: Option<FolderCheck>,
+    scan: Option<Scan>,
 }
 
 fn blocker(kind: BlockerKind, message: impl Into<String>) -> Blocker {
@@ -244,9 +278,23 @@ fn blocker(kind: BlockerKind, message: impl Into<String>) -> Blocker {
 /// The files in a Managed Folder, other than its own, by lowercased name: the name as it is, and its stat.
 type Files = HashMap<String, (String, FileStat)>;
 
-/// The folder's state, from a stat of it and its marker: its files by lowercased name, or why it cannot be built
-/// into.
-fn check_folder(config: &Config, inputs: &Inputs, blockers: &mut Vec<Blocker>) -> Option<Files> {
+/// The folder as a plan found it.
+struct Folder {
+    files: Files,
+    /// The check of its entries, made when its marker shows it is this store's folder.
+    scan: Option<Scan>,
+    /// Why its marker does not.
+    marker: Option<String>,
+}
+
+/// The folder's state, from a stat of it and its marker and a check of its entries: its files by lowercased name, or
+/// why it cannot be built into.
+fn check_folder(
+    config: &Config,
+    inputs: &Inputs,
+    dat: Option<&Dat>,
+    blockers: &mut Vec<Blocker>,
+) -> Option<Folder> {
     let folder = &inputs.folder;
     if !config.root(&folder.root).is_some_and(|r| r.writable) {
         blockers.push(blocker(
@@ -276,56 +324,56 @@ fn check_folder(config: &Config, inputs: &Inputs, blockers: &mut Vec<Blocker>) -
     };
     let mut files = HashMap::new();
     let mut leftovers = Vec::new();
-    for (name, _) in listing {
-        if is_own(&name) {
+    for (name, _) in &listing {
+        if is_own(name) {
             if name == STAGING || name == MARKER_NEW {
-                leftovers.push(name);
+                leftovers.push(name.clone());
             }
             continue;
         }
-        let Ok(Some(st)) = dir.stat(&name) else {
+        let Ok(Some(st)) = dir.stat(name) else {
             continue;
         };
-        files.insert(name.to_lowercase(), (name, file_stat(&st)));
+        files.insert(name.to_lowercase(), (name.clone(), file_stat(&st)));
     }
     check_recovery(inputs, &dir, &leftovers, blockers);
-    let generation = folder.generation;
-    let problem = match read_marker(&dir) {
-        MarkerState::Absent if files.is_empty() && generation == 0 => None,
-        MarkerState::Absent if files.is_empty() => Some(format!(
-            "the folder is empty and has no marker, though {generation} builds went into it; is its share mounted?"
-        )),
-        MarkerState::Absent => Some(
-            "the folder has files but no .title-select marker; is this the right folder, or the right mount?"
-                .to_owned(),
-        ),
-        MarkerState::Unreadable(e) => Some(format!("its .title-select marker cannot be read: {e}")),
-        MarkerState::Present(marker) if marker.store != inputs.store => Some(
-            "its .title-select marker is from another store; is this a restored store, or the wrong mount?"
-                .to_owned(),
-        ),
-        MarkerState::Present(marker) if marker.folder != folder.id => Some(format!(
-            "its .title-select marker is for managed folder {}, not {}; is this the right mount?",
-            marker.folder, folder.id
-        )),
-        MarkerState::Present(marker) => match marker.generation.cmp(&generation) {
-            Ordering::Equal => None,
-            Ordering::Greater => Some(format!(
-                "its marker is at build generation {}, newer than the store's {generation}; was the store restored \
-                 from a backup?",
-                marker.generation
-            )),
-            Ordering::Less => Some(format!(
-                "its marker is at build generation {}, older than the store's {generation}; was the folder restored \
-                 from a backup, or is this the wrong mount?",
-                marker.generation
-            )),
-        },
+    let problem = marker_problem(
+        &dir,
+        &inputs.store,
+        folder.id,
+        folder.generation,
+        files.is_empty(),
+    );
+    let scan = match &problem {
+        Some(problem) => {
+            blockers.push(blocker(BlockerKind::Marker, problem.clone()));
+            None
+        }
+        None => {
+            let mut entries: Vec<String> = listing
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| !is_own(name))
+                .collect();
+            entries.sort();
+            Some(scan(
+                &dir,
+                &entries,
+                &ScanInput {
+                    built: &inputs.built,
+                    selected: &inputs.selected,
+                    dat,
+                    cached: &inputs.cached,
+                },
+                None,
+            ))
+        }
     };
-    if let Some(problem) = problem {
-        blockers.push(blocker(BlockerKind::Marker, problem));
-    }
-    Some(files)
+    Some(Folder {
+        files,
+        scan,
+        marker: problem,
+    })
 }
 
 /// Blocks on an earlier Build whose folder recovery has not cleaned up, or on a staging directory or half-written
@@ -543,12 +591,29 @@ fn compute(config: &Config, inputs: &Inputs, dat: Option<&Dat>) -> Planned {
         }
         Some((id, _, _)) => Some(*id),
     };
+    // Building the resolved groups only leaves every release of an unresolved group untouched: its winner is not
+    // built, and a file built for any of its releases is neither replaced nor removed.
+    let mut unresolved = BTreeSet::new();
+    let mut untouched = BTreeSet::new();
     for group in &inputs.selection.groups {
-        if group.unresolved {
+        if !group.unresolved {
+            continue;
+        }
+        if inputs.choices.resolved_only {
+            unresolved.insert(group.group.as_str());
+            let titles = group
+                .winners
+                .iter()
+                .map(|w| &w.title)
+                .chain(group.alternatives.iter().map(|a| &a.title))
+                .chain(group.exclusions.iter().map(|e| &e.title));
+            untouched.extend(titles.map(|t| format!("{t}.zip")));
+        } else {
             blockers.push(Blocker {
                 kind: BlockerKind::Unresolved,
                 message: format!(
-                    "the group {} is unresolved; confirm a choice for it in the selection",
+                    "the group {} is unresolved; confirm a choice for it in the selection, or build the resolved \
+                     groups only",
                     group.group
                 ),
                 group: Some(group.group.clone()),
@@ -556,17 +621,23 @@ fn compute(config: &Config, inputs: &Inputs, dat: Option<&Dat>) -> Planned {
             });
         }
     }
-    let folder = check_folder(config, inputs, &mut blockers);
-    let files = folder.as_ref();
+    let folder = check_folder(config, inputs, dat, &mut blockers);
 
     let mut items = Vec::new();
     if let (Some(dat), Some(_)) = (dat, usable_audit) {
-        items = plan_items(config, inputs, dat, files, &mut blockers);
+        items = plan_items(
+            config,
+            inputs,
+            dat,
+            folder.as_ref(),
+            &unresolved,
+            &mut blockers,
+        );
     }
     let targets: BTreeSet<&str> = items.iter().map(|i: &PlanItem| i.target.as_str()).collect();
     if usable_audit.is_some() {
         for target in inputs.built.keys() {
-            if !targets.contains(target.as_str()) {
+            if !targets.contains(target.as_str()) && !untouched.contains(target) {
                 blockers.push(Blocker {
                     kind: BlockerKind::Removal,
                     message: format!(
@@ -582,6 +653,29 @@ fn compute(config: &Config, inputs: &Inputs, dat: Option<&Dat>) -> Planned {
         Some(previous) => (Some(previous.selection), changes(inputs, previous)),
         None => (None, Vec::new()),
     };
+    let (check, scan) = match folder {
+        Some(folder) => {
+            let mut check = FolderCheck {
+                folder: inputs.folder.id,
+                summary: CheckSummary {
+                    marker: folder.marker,
+                    ..CheckSummary::default()
+                },
+                generation: inputs.folder.generation,
+                selection: Some(inputs.selection_id),
+                dat_revision: Some(inputs.revision.sha256.clone()),
+                files: Vec::new(),
+                drift: Vec::new(),
+            };
+            if let Some(scan) = &folder.scan {
+                check.summary = scan.summary();
+                check.files = scan.files.clone();
+                check.drift = scan.drift.clone();
+            }
+            (Some(check), folder.scan)
+        }
+        None => (None, None),
+    };
     Planned {
         content: PlanContent {
             folder: inputs.folder.id,
@@ -589,11 +683,14 @@ fn compute(config: &Config, inputs: &Inputs, dat: Option<&Dat>) -> Planned {
             selection: inputs.selection_id,
             audit: usable_audit,
             dat_revision: inputs.revision.sha256.clone(),
+            choices: inputs.choices.clone(),
             items,
             blockers,
         },
         previous,
         changes,
+        check,
+        scan,
     }
 }
 
@@ -605,9 +702,12 @@ fn plan_items(
     config: &Config,
     inputs: &Inputs,
     dat: &Dat,
-    files: Option<&Files>,
+    folder: Option<&Folder>,
+    unresolved: &BTreeSet<&str>,
     blockers: &mut Vec<Blocker>,
 ) -> Vec<PlanItem> {
+    let files = folder.map(|f| &f.files);
+    let scan = folder.and_then(|f| f.scan.as_ref());
     let games: HashMap<&str, usize> = dat
         .games
         .iter()
@@ -658,7 +758,17 @@ fn plan_items(
             sources: Vec::new(),
             reason: None,
             existing: existing.map(|(_, file)| file.clone()),
+            adoptable: false,
         };
+        if unresolved.contains(group) {
+            item.kind = ItemKind::Unresolved;
+            item.reason = Some(format!(
+                "the group {group} is unresolved, and you build the resolved groups only; whatever is at {target} \
+                 is left untouched"
+            ));
+            items.push(item);
+            continue;
+        }
         let duplicate = {
             let mut names = BTreeSet::new();
             item.roms
@@ -705,8 +815,19 @@ fn plan_items(
                 items.push(item);
                 continue;
             }
+            // The check read a file whose size or modification time changed: it is as built while it is still the
+            // file the build wrote, or holds the same ROMs.
+            let as_built = |file: &FileStat| match scan
+                .and_then(|s| s.files.iter().find(|f| f.target == target))
+            {
+                Some(checked) => matches!(
+                    checked.outcome,
+                    FileOutcome::Unchanged | FileOutcome::Refreshed | FileOutcome::Repacked
+                ),
+                None => *file == built.file,
+            };
             match existing {
-                Some((name, file)) if *name == target && *file == built.file => {
+                Some((name, file)) if *name == target && as_built(file) => {
                     item.kind = ItemKind::Unchanged;
                     items.push(item);
                     continue;
@@ -723,10 +844,38 @@ fn plan_items(
                 None => {}
             }
         } else if let Some((name, _)) = existing {
-            item.kind = ItemKind::Conflict;
-            item.reason = Some(format!(
-                "{name} is in the folder and was not built by Title Select; it is never overwritten"
-            ));
+            item.adoptable = *name == target
+                && !item.roms.is_empty()
+                && scan
+                    .and_then(|s| s.probes.get(name))
+                    .is_some_and(|(at, probe)| {
+                        Some(at) == item.existing.as_ref() && holds(probe, &item.roms)
+                    });
+            let chosen = inputs.choices.adopt.contains(&target);
+            if item.adoptable && chosen {
+                item.kind = ItemKind::Adopt;
+                item.reason = Some(format!(
+                    "you adopt {name}: it holds the ROMs the DAT expects there, so it is recorded as built and \
+                     nothing is written"
+                ));
+            } else {
+                item.kind = ItemKind::Conflict;
+                item.reason = Some(if chosen {
+                    format!(
+                        "you chose to adopt {name}, but it does not hold exactly the ROMs the DAT expects there; it \
+                         is left as it is"
+                    )
+                } else if item.adoptable {
+                    format!(
+                        "{name} is in the folder and was not built by Title Select, but holds the ROMs the DAT \
+                         expects there; leave it, or adopt it as built"
+                    )
+                } else {
+                    format!(
+                        "{name} is in the folder and was not built by Title Select; it is never overwritten"
+                    )
+                });
+            }
             items.push(item);
             continue;
         }
@@ -810,7 +959,7 @@ fn changes(inputs: &Inputs, previous: &Previous) -> Vec<PlanChange> {
 
 const PLAN_QUERY: &str =
     "SELECT p.id, p.digest, p.created_at, p.content, p.previous_selection_id, p.changes,
-            a.digest, a.actor, a.approved_at, (SELECT max(j.id) FROM jobs j WHERE j.plan_id = p.id)
+            a.digest, a.actor, a.approved_at, (SELECT max(j.id) FROM jobs j WHERE j.plan_id = p.id), p.check_id
      FROM plans p LEFT JOIN plan_approvals a ON a.plan_id = p.id";
 
 fn plan_from_row(r: &Row) -> rusqlite::Result<Plan> {
@@ -833,6 +982,7 @@ fn plan_from_row(r: &Row) -> rusqlite::Result<Plan> {
         changes: json(r, 5)?,
         approval,
         job: r.get(9)?,
+        check: r.get(10)?,
     })
 }
 
@@ -846,12 +996,12 @@ pub(super) fn plan_by_id(c: &Connection, id: i64) -> Result<Plan> {
     .ok_or_else(|| Error::NotFound(format!("no plan {id}")))
 }
 
-pub(super) fn insert_plan(tx: &Transaction, planned: &Planned) -> Result<Plan> {
+pub(super) fn insert_plan(tx: &Transaction, planned: &Planned, check: Option<i64>) -> Result<Plan> {
     let content = &planned.content;
     tx.execute(
         "INSERT INTO plans (folder_id, selection_id, audit_id, generation, content, digest, previous_selection_id,
-                            changes, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                            changes, created_at, check_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             content.folder,
             content.selection,
@@ -861,23 +1011,25 @@ pub(super) fn insert_plan(tx: &Transaction, planned: &Planned) -> Result<Plan> {
             digest(content),
             planned.previous,
             to_json(&planned.changes),
-            now()
+            now(),
+            check
         ],
     )?;
     plan_by_id(tx, tx.last_insert_rowid())
 }
 
 impl Store {
-    /// Computes what building `selection` into the Managed Folder would do.
+    /// Computes what building `selection` into the Managed Folder would do, with your `choices`.
     pub(super) fn compute_plan(
         &self,
         config: &Config,
         folder: i64,
         selection: i64,
+        choices: &PlanChoices,
     ) -> Result<Planned> {
         let inputs = self.read(|c| {
             let tx = c.unchecked_transaction()?;
-            load(&tx, folder, selection)
+            load(&tx, folder, selection, choices)
         })?;
         let dat = if inputs.revision.blob_present {
             let blob = self.blob_path(&inputs.revision.sha256);
@@ -901,8 +1053,34 @@ impl Store {
 
     /// Plans building `selection` into Managed Folder `folder`, and stores the plan for review.
     pub fn plan_build(&self, config: &Config, folder: i64, selection: i64) -> Result<Plan> {
-        let planned = self.compute_plan(config, folder, selection)?;
-        self.write(|tx| insert_plan(tx, &planned))
+        self.plan_build_with(config, folder, &PlanBuild::new(selection))
+    }
+
+    /// Plans building `request.selection` into Managed Folder `folder` with your choices, and stores the plan for
+    /// review with the check of the folder it was made with. While a Build or Check of the folder is queued or
+    /// running, the check is not stored and nothing it found is recorded.
+    pub fn plan_build_with(
+        &self,
+        config: &Config,
+        folder: i64,
+        request: &PlanBuild,
+    ) -> Result<Plan> {
+        let mut choices = request.choices.clone();
+        choices.adopt.sort();
+        choices.adopt.dedup();
+        let planned = self.compute_plan(config, folder, request.selection, &choices)?;
+        self.write(|tx| {
+            let active = folder_by_id(tx, folder)?.active_job;
+            let check = match (&planned.check, active) {
+                (Some(check), None) => Some(
+                    store_check(tx, folder, None, planned.scan.as_ref(), check.clone())?
+                        .summary
+                        .id,
+                ),
+                _ => None,
+            };
+            insert_plan(tx, &planned, check)
+        })
     }
 
     pub fn plan(&self, id: i64) -> Result<Plan> {
@@ -935,9 +1113,10 @@ impl Store {
             )));
         }
         let content = &plan.content;
-        let again = self.compute_plan(config, content.folder, content.selection)?;
+        let again =
+            self.compute_plan(config, content.folder, content.selection, &content.choices)?;
         if digest(&again.content) != plan.digest {
-            let newer = self.write(|tx| insert_plan(tx, &again))?;
+            let newer = self.write(|tx| insert_plan(tx, &again, None))?;
             return Err(Error::Conflict(format!(
                 "the plan changed since you reviewed it; review plan {}",
                 newer.id
@@ -946,7 +1125,7 @@ impl Store {
         self.write(|tx| {
             let active: Option<i64> = tx
                 .query_row(
-                    "SELECT id FROM jobs WHERE managed_folder_id = ?1 AND kind = 'build'
+                    "SELECT id FROM jobs WHERE managed_folder_id = ?1 AND kind IN ('build', 'check')
                      AND state IN ('queued', 'running')",
                     [content.folder],
                     |r| r.get(0),
@@ -954,7 +1133,7 @@ impl Store {
                 .optional()?;
             if let Some(job) = active {
                 return Err(Error::Conflict(format!(
-                    "managed folder {} already has a build running: job {job}",
+                    "managed folder {} already has a build or check queued or running: job {job}",
                     content.folder
                 )));
             }
