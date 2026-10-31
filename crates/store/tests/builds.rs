@@ -2035,6 +2035,64 @@ fn an_unresolved_group_is_complete_only_when_its_built_file_still_holds_the_game
 }
 
 #[test]
+fn an_unresolved_group_whose_roms_the_newer_dat_revision_changed_is_incomplete() {
+    let env = Env::new();
+    env.audit();
+    let id = titles(&env, &["Pong (USA)", "Combat (USA)"]);
+    let folder = env.folder("atari2600");
+    assert_eq!(env.build(&env.plan(&folder, id)).state, JobState::Succeeded);
+
+    // The newer revision keeps Pong's title but lists another ROM for it.
+    let mut newer = games();
+    newer
+        .iter_mut()
+        .find(|(game, _)| *game == "Pong (USA)")
+        .unwrap()
+        .1 = vec![rom("Pong (USA).a26", b"pong, revised")];
+    let dat = write_dat_version(
+        &env.tmp.path().join("in"),
+        "Test - System (2).dat",
+        "20260102-000000",
+        &newer,
+    );
+    let (revision, _) = env.store.import_dat(&dat, "No-Intro", None).unwrap();
+    env.store
+        .audit_source_set(&env.config, SET, Some(&revision.sha256))
+        .unwrap();
+    let mut unresolved = selection(
+        &revision.sha256,
+        vec![group("Pong (USA)"), group("Combat (USA)")],
+    );
+    unresolved.groups[0].unresolved = true;
+    let id = env.record(&unresolved);
+    let plan = plan_with(
+        &env,
+        &folder,
+        id,
+        PlanChoices {
+            resolved_only: true,
+            adopt: vec![],
+        },
+    );
+    assert!(plan.approvable(), "{:?}", plan.content.blockers);
+    assert_eq!(env.build(&plan).state, JobState::Succeeded);
+
+    let incomplete = env.store.incomplete(folder.id).unwrap();
+    let reasons: Vec<(&str, IncompleteReason)> = incomplete
+        .items
+        .iter()
+        .map(|i| (i.target.as_str(), i.reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![("Pong (USA).zip", IncompleteReason::Unresolved)],
+        "Pong's built file holds the ROM of the earlier revision, not the one the selection expects"
+    );
+    let folder = env.store.managed_folder(&env.config, folder.id).unwrap();
+    assert_eq!(folder.incomplete.map(|c| c.unresolved), Some(1));
+}
+
+#[test]
 fn a_build_stopped_after_it_advanced_the_generation_is_still_badged() {
     for fault in [Fault::AfterFinalize, Fault::AfterMarker] {
         let env = Env::new();

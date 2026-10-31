@@ -8,7 +8,7 @@
 //! recovery moves a marker that did not follow forward, never back. Recovery changes a folder only for a Build the
 //! store records as unfinished, only in a writable Root, and only once the folder's marker shows it is that folder.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -17,8 +17,8 @@ use std::time::SystemTime;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 use title_select_api::build::{
-    BuildDetail, BuildItem, BuildSummary, BuiltFile, ExpectedRom, FileOutcome, FileStat,
-    IncompleteReason, ItemKind, ItemState, Marker, PlanItem, STAGING,
+    BuildDetail, BuildItem, BuildSummary, BuiltFile, ExpectedRom, FileStat, IncompleteReason,
+    ItemKind, ItemState, Marker, PlanItem, STAGING,
 };
 use title_select_api::{Job, JobKind, JobState};
 use title_select_engine::Progress;
@@ -376,13 +376,13 @@ fn adopt(dir: &FolderDir, item: &PlanItem) -> std::result::Result<(String, Stat,
 }
 
 /// Records what the Build `build` left its Managed Folder lacking of its Selection: each item of its plan that was
-/// skipped, other than an unresolved one whose earlier built file the build's check found `retained` (target to
-/// game) for the same game, and each item that failed.
+/// skipped, other than an unresolved one whose target is `retained` (its earlier built file still holds the ROMs the
+/// item now expects), and each item that failed.
 fn record_incomplete(
     tx: &Transaction,
     build: i64,
     items: &[PlanItem],
-    retained: &HashMap<String, String>,
+    retained: &HashSet<String>,
 ) -> Result<()> {
     let failed: HashMap<String, Option<String>> = {
         let mut stmt = tx.prepare(
@@ -395,8 +395,8 @@ fn record_incomplete(
     for item in items {
         let reason = match item.kind {
             _ if failed.contains_key(&item.target) => IncompleteReason::Failed,
-            // Left out, but only complete when the build's check found the file built before still holds the game.
-            ItemKind::Unresolved if retained.get(&item.target) == Some(&item.game) => continue,
+            // Left out, but only complete when the file built before still holds the ROMs the item now expects.
+            ItemKind::Unresolved if retained.contains(&item.target) => continue,
             ItemKind::Unresolved => IncompleteReason::Unresolved,
             ItemKind::NoSource => IncompleteReason::NoSource,
             ItemKind::Conflict => IncompleteReason::Conflict,
@@ -508,19 +508,6 @@ impl Store {
         let content = &plan.content;
         let again =
             self.compute_plan(config, content.folder, content.selection, &content.choices)?;
-        // The built files this build's own check found still hold their games, by target.
-        let retained: HashMap<String, String> = again
-            .check
-            .iter()
-            .flat_map(|check| &check.files)
-            .filter(|f| {
-                matches!(
-                    f.outcome,
-                    FileOutcome::Unchanged | FileOutcome::Refreshed | FileOutcome::Repacked
-                )
-            })
-            .map(|f| (f.target.clone(), f.game.clone()))
-            .collect();
         if digest(&again.content) != approved.digest {
             let newer = self.write(|tx| super::plans::insert_plan(tx, &again, None))?;
             return Err(Error::Conflict(format!(
@@ -772,7 +759,7 @@ impl Store {
                 "UPDATE builds SET finalizing_at = ?2 WHERE id = ?1",
                 params![id, now()],
             )?;
-            record_incomplete(tx, id, &content.items, &retained)?;
+            record_incomplete(tx, id, &content.items, &again.retained)?;
             tx.execute("DELETE FROM audit_citations WHERE cited_by = ?1", [&key])?;
             tx.execute(
                 "INSERT INTO audit_citations (audit_id, cited_by) VALUES (?1, ?2)",

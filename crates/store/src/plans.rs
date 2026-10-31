@@ -1,7 +1,7 @@
 //! Change Plans: what building a Selection into a Managed Folder would do, computed from the store and a stat of the
 //! folder and of the sources, and stored with the SHA-256 of its canonical JSON, which an approval binds to.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::Metadata;
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
@@ -263,6 +263,9 @@ pub(super) struct Planned {
     pub changes: Vec<PlanChange>,
     /// The check of the folder the plan was made with, when the folder could be opened.
     pub check: Option<FolderCheck>,
+    /// The targets of unresolved items whose earlier built file the check found still holds the ROMs the DAT
+    /// revision now expects for the item's game.
+    pub retained: HashSet<String>,
     scan: Option<Scan>,
 }
 
@@ -676,6 +679,7 @@ fn compute(config: &Config, inputs: &Inputs, dat: Option<&Dat>) -> Planned {
         }
         None => (None, None),
     };
+    let retained = retained(inputs, &items, check.as_ref());
     Planned {
         content: PlanContent {
             folder: inputs.folder.id,
@@ -690,8 +694,37 @@ fn compute(config: &Config, inputs: &Inputs, dat: Option<&Dat>) -> Planned {
         previous,
         changes,
         check,
+        retained,
         scan,
     }
+}
+
+/// The targets of the unresolved `items` the folder still satisfies: `check` found the file built there unchanged,
+/// or holding the same ROMs, and it was built for the item's game with the ROMs the item now expects.
+fn retained(inputs: &Inputs, items: &[PlanItem], check: Option<&FolderCheck>) -> HashSet<String> {
+    let intact: HashSet<&str> = check
+        .iter()
+        .flat_map(|c| &c.files)
+        .filter(|f| {
+            matches!(
+                f.outcome,
+                FileOutcome::Unchanged | FileOutcome::Refreshed | FileOutcome::Repacked
+            )
+        })
+        .map(|f| f.target.as_str())
+        .collect();
+    items
+        .iter()
+        .filter(|item| item.kind == ItemKind::Unresolved && !item.roms.is_empty())
+        .filter(|item| intact.contains(item.target.as_str()))
+        .filter(|item| {
+            inputs
+                .built
+                .get(&item.target)
+                .is_some_and(|b| b.game == item.game && b.roms == item.roms)
+        })
+        .map(|item| item.target.clone())
+        .collect()
 }
 
 fn short(sha256: &str) -> &str {
